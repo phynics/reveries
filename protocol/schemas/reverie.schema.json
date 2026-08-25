@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reveries.dev/protocol/v1/schemas/reverie.schema.json",
+  "title": "Reveries V1 reverie",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "id", "driving_event", "decision", "impact", "recurrence_control", "alternatives", "sources", "supersedes", "author_email", "session", "created_at"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": { "const": "reverie" },
+    "id": { "$ref": "#/$defs/reverieId" },
+    "driving_event": { "$ref": "#/$defs/nonemptyString" },
+    "decision": { "$ref": "#/$defs/nonemptyString" },
+    "impact": { "$ref": "#/$defs/nonemptyString" },
+    "recurrence_control": { "type": ["string", "null"], "minLength": 1 },
+    "alternatives": { "type": "array", "items": { "$ref": "#/$defs/nonemptyString" }, "uniqueItems": true },
+    "sources": { "type": "array", "items": { "$ref": "#/$defs/source" }, "uniqueItems": true },
+    "supersedes": { "type": "array", "items": { "$ref": "#/$defs/reverieId" }, "uniqueItems": true },
+    "author_email": { "type": "string", "format": "email", "minLength": 1 },
+    "session": { "type": ["string", "null"], "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "$defs": {
+    "nonemptyString": { "type": "string", "minLength": 1, "pattern": "^(?=.*\\S).*$" },
+    "objectId": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "reverieId": { "type": "string", "pattern": "^rv:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relation", "kind", "ref"],
+      "properties": {
+        "relation": { "enum": ["caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by"] },
+        "kind": { "enum": ["commit", "blob", "path", "note", "git-email", "issue"] },
+        "ref": { "type": "string", "minLength": 1 },
+        "at": { "$ref": "#/$defs/objectId" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "path" } }, "required": ["kind"] }, "then": { "required": ["at"] } },
+        { "if": { "properties": { "kind": { "const": "commit" } }, "required": ["kind"] }, "then": { "properties": { "ref": { "$ref": "#/$defs/objectId" } } } },
+        { "if": { "properties": { "kind": { "const": "blob" } }, "required": ["kind"] }, "then": { "properties": { "ref": { "$ref": "#/$defs/objectId" } } } },
+        { "if": { "properties": { "kind": { "const": "note" } }, "required": ["kind"] }, "then": { "properties": { "ref": { "$ref": "#/$defs/reverieId" } } } }
+      ]
+    }
+  }
+}

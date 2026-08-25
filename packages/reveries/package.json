@@ -1,0 +1,28 @@
+{
+  "name": "@reveries/cli",
+  "version": "0.1.0",
+  "description": "Git-notes engineering memory for immutable blobs and commits",
+  "type": "module",
+  "bin": {
+    "reveries": "dist/src/main.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "node --experimental-transform-types --test test/**/*.test.ts",
+    "test:full": "node --experimental-transform-types --test test/**/*.test.ts test/**/*.integration.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "license": "MIT"
+}

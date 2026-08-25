@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reveries Setup"
+  short_description: "Set up and repair Reveries Git-notes memory."
+  default_prompt: "Use $reveries-git-notes-init to configure Reveries in this Git repository."

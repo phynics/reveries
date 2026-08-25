@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reveries Search"
+  short_description: "Find current and historical engineering rationale."
+  default_prompt: "Use $reveries-git-notes-search to trace why this code or decision exists."

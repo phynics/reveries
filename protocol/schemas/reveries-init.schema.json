@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reveries.dev/protocol/v1/schemas/reveries-init.schema.json",
+  "title": "Reveries V1 initialization record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "protocol", "notes_ref", "publishing_remotes", "hosts", "author_email", "created_at"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": { "const": "reveries-init" },
+    "protocol": { "const": 1 },
+    "notes_ref": { "const": "refs/notes/reveries" },
+    "publishing_remotes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "hosts": { "type": "array", "items": { "enum": ["pi", "claude", "opencode", "codex", "gemini"] }, "uniqueItems": true },
+    "author_email": { "type": "string", "format": "email", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  }
+}

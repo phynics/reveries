@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reveries Maintenance"
+  short_description: "Maintain causal Git-notes decisions safely."
+  default_prompt: "Use $reveries-git-notes-use to inspect and reconcile Reveries for this change."

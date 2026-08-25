@@ -1,0 +1,23 @@
+{
+  "name": "reveries-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @reveries/cli",
+    "conformance": "npm run build && node scripts/conformance.mjs",
+    "test": "npm run test --workspace @reveries/cli",
+    "test:full": "npm run test:full --workspace @reveries/cli",
+    "typecheck": "npm run typecheck --workspace @reveries/cli",
+    "verify": "npm run typecheck && npm run test:full && npm run conformance"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "typescript": "^7.0.2"
+  }
+}
