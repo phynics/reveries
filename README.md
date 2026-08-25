@@ -72,6 +72,7 @@ The Skills include safe writing, synchronization, and recovery commands.
 
 ## Protocol documentation
 
+- [Approved V1 design](DESIGN.md)
 - [V1 protocol](protocol/v1.md)
 - [Reverie schema](protocol/schemas/reverie.schema.json)
 - [Session-summary schema](protocol/schemas/session-summary.schema.json)
