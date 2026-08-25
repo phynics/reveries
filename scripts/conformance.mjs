@@ -22,6 +22,9 @@ async function run(command, args, options = {}) {
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.on("error", reject);
+    child.stdin.on("error", (error) => {
+      if (error.code !== "EPIPE") reject(error);
+    });
     child.on("close", (code) => {
       const result = {
         code: code ?? 128,

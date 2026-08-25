@@ -43,6 +43,15 @@ npm run build
 node packages/reveries/dist/src/main.js --help
 ```
 
+Run the sandbox-safe release evaluation:
+
+```bash
+npm run evaluate:local
+```
+
+The [local evaluation guide](EVALUATION.md) explains coverage statuses and checks that require
+native hosts or external access.
+
 The helper implements `init`, `doctor`, `show`, `record`, `summarize`, `check`, `search`,
 `history`, `sync`, `push`, and the hook entrypoints. Inspection and check commands accept
 `--json` for stable machine output.
