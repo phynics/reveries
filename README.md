@@ -1,5 +1,7 @@
 # Reveries
 
+[![CI](https://github.com/phynics/reveries/actions/workflows/ci.yml/badge.svg)](https://github.com/phynics/reveries/actions/workflows/ci.yml)
+
 Reveries preserves the causal engineering record that source control usually loses. It stores
 immutable decisions as Git notes attached to exact blobs and attaches one causal session summary
 to each published post-adoption commit.
@@ -25,15 +27,16 @@ Install the Skills, then explicitly initialize a repository with
 configure. It does not create the adoption commit or push.
 
 ```bash
-npx skills add OWNER/reveries --global \
+npx skills add https://github.com/phynics/reveries --global \
   --agent pi --agent claude-code --agent opencode --agent codex --agent gemini-cli \
   --skill reveries-git-notes-init \
-  --skill reveries-git-notes-use \
+  --skill using-reveries \
   --skill reveries-git-notes-search
 ```
 
-Replace `OWNER/reveries` with the published Skills repository. The Skills and direct Git fallback
-do not require the helper.
+The initializer asks how future agents should obtain `using-reveries`: rely on an existing
+installation, pull it from this repository when missing, or commit a vendored copy with the
+project. The Skills and direct Git fallback do not require the helper.
 
 Build and run the helper from this repository:
 
@@ -56,7 +59,7 @@ The helper implements `init`, `doctor`, `show`, `record`, `summarize`, `check`, 
 `history`, `sync`, `push`, and the hook entrypoints. Inspection and check commands accept
 `--json` for stable machine output.
 
-For day-to-day changes, use `reveries-git-notes-use`:
+For day-to-day changes, use `using-reveries`:
 
 ```text
 inspect blob evidence → edit → stage → reconcile continuity → commit

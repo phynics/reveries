@@ -40,6 +40,7 @@ test("initialization is explicit and idempotent", async () => {
     hosts: ["codex", "claude", "gemini"] as const,
     publishingRemotes: ["origin"],
     directiveEmail: "user@example.com",
+    skillSetup: { kind: "reminder" } as const,
   };
 
   const first = await initializeRepository(directory, options);
@@ -51,6 +52,8 @@ test("initialization is explicit and idempotent", async () => {
   assert.match(agents, /# Existing guidance/);
   assert.match(agents, /Keep this paragraph\./);
   assert.equal(agents.match(/<!-- reveries:begin -->/g)?.length, 1);
+  assert.match(agents, /use `using-reveries`/);
+  assert.doesNotMatch(agents, /npx skills add/);
   assert.match(await readFile(join(directory, "CLAUDE.md"), "utf8"), /@AGENTS\.md/);
   assert.match(await readFile(join(directory, "GEMINI.md"), "utf8"), /@\.\/AGENTS\.md/);
   assert.equal(await git(directory, "config", "notes.reveries.mergeStrategy"), "cat_sort_uniq");
@@ -62,6 +65,41 @@ test("initialization is explicit and idempotent", async () => {
   assert.match(pushValues, /refs\/notes\/reveries:refs\/notes\/reveries/);
 });
 
+test("initialization can direct agents to pull using-reveries from a named repository", async () => {
+  const directory = await createRepository();
+
+  await initializeRepository(directory, {
+    hosts: ["codex"],
+    publishingRemotes: ["origin"],
+    directiveEmail: "user@example.com",
+    skillSetup: {
+      kind: "pull",
+      repository: "https://github.com/phynics/reveries",
+    },
+  });
+
+  const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
+  assert.match(agents, /use `using-reveries`/);
+  assert.match(agents, /https:\/\/github\.com\/phynics\/reveries/);
+  assert.match(agents, /npx skills add/);
+});
+
+test("initialization can point agents at a vendored using-reveries skill", async () => {
+  const directory = await createRepository();
+
+  await initializeRepository(directory, {
+    hosts: ["pi", "codex"],
+    publishingRemotes: ["origin"],
+    directiveEmail: "user@example.com",
+    skillSetup: { kind: "vendored" },
+  });
+
+  const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
+  assert.match(agents, /use `using-reveries`/);
+  assert.match(agents, /\.agents\/skills\/using-reveries\/SKILL\.md/);
+  assert.doesNotMatch(agents, /npx skills add/);
+});
+
 test("unknown hooks are preserved and reported as partial enforcement", async () => {
   const directory = await createRepository();
   const hook = join(directory, ".git", "hooks", "pre-push");
@@ -71,6 +109,7 @@ test("unknown hooks are preserved and reported as partial enforcement", async ()
     hosts: ["codex"],
     publishingRemotes: ["origin"],
     directiveEmail: "user@example.com",
+    skillSetup: { kind: "reminder" },
   });
 
   assert.equal(result.enforcement, "partial");
@@ -84,6 +123,7 @@ test("doctor reads the prepared worktree marker before the adoption commit", asy
     hosts: ["codex"],
     publishingRemotes: ["origin"],
     directiveEmail: "user@example.com",
+    skillSetup: { kind: "reminder" },
   });
 
   const result = await (await Reveries.open(directory)).doctor();
@@ -106,6 +146,7 @@ test("malformed or duplicated owned markers are refused", async () => {
       hosts: ["codex"],
       publishingRemotes: ["origin"],
       directiveEmail: "user@example.com",
+      skillSetup: { kind: "reminder" },
     }),
     /marker/i,
   );
@@ -118,6 +159,7 @@ test("removal keeps the notes ref and unknown prose", async () => {
     hosts: ["codex", "gemini"],
     publishingRemotes: ["origin"],
     directiveEmail: "user@example.com",
+    skillSetup: { kind: "reminder" },
   });
   await git(directory, "notes", "--ref=refs/notes/reveries", "add", "-m", "evidence", "HEAD");
   const notesTip = await git(directory, "rev-parse", "refs/notes/reveries");

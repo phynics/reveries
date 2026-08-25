@@ -8,24 +8,65 @@ const END = "<!-- reveries:end -->";
 const HOOK_BEGIN = "# reveries:begin";
 const HOOK_END = "# reveries:end";
 
-const AGENTS_BLOCK = `${BEGIN}
-## Reveries
+const AGENTS_INTRO = `## Reveries
 
 This repository stores engineering decisions in Git notes at
-\`refs/notes/reveries\`.
+\`refs/notes/reveries\`.`;
 
-Before interpreting or changing tracked code, use \`reveries-git-notes-use\`.
-For rationale and history questions, use \`reveries-git-notes-search\`.
-
-Automatic note delivery is best-effort. When needed, inspect a file directly:
+const AGENTS_OUTRO = `Automatic note delivery is best-effort. When needed, inspect a file directly:
 
     git notes --ref=refs/notes/reveries show \\
       "$(git rev-parse 'HEAD:path/to/file')"
 
 Before publishing:
 - every changed annotated blob must continue, supersede, or retire its prior reveries;
-- every post-initialization commit must have exactly one valid session summary.
+- every post-initialization commit must have exactly one valid session summary.`;
+
+const REMINDER_SETUP = `Before interpreting or changing tracked code, use \`using-reveries\`.
+For rationale and history questions, use \`reveries-git-notes-search\`.`;
+
+const VENDORED_SETUP = `${REMINDER_SETUP}
+
+This repository vendors \`using-reveries\` at
+\`.agents/skills/using-reveries/SKILL.md\`. If the host did not load the Skill,
+read that file before continuing.`;
+
+function pullSetup(repository: string): string {
+  return `${REMINDER_SETUP}
+
+If \`using-reveries\` is unavailable, install it from
+\`${repository}\` before continuing:
+
+    npx skills add ${repository} --skill using-reveries --yes
+
+Restart the agent host after installation so that it discovers the Skill.`;
+}
+
+function agentsBlock(skillSetup: SkillSetup): string {
+  let setup: string;
+  switch (skillSetup.kind) {
+    case "reminder":
+      setup = REMINDER_SETUP;
+      break;
+    case "pull":
+      setup = pullSetup(skillSetup.repository);
+      break;
+    case "vendored":
+      setup = VENDORED_SETUP;
+      break;
+    default: {
+      const exhaustive: never = skillSetup;
+      throw new Error(`Unsupported Skill setup: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+  return `${BEGIN}
+${AGENTS_INTRO}
+
+${setup}
+
+${AGENTS_OUTRO}
 ${END}`;
+}
 
 const CLAUDE_BLOCK = `${BEGIN}
 @AGENTS.md
@@ -37,10 +78,16 @@ ${END}`;
 
 export type SupportedHost = "pi" | "claude" | "opencode" | "codex" | "gemini";
 
+export type SkillSetup =
+  | { readonly kind: "reminder" }
+  | { readonly kind: "pull"; readonly repository: string }
+  | { readonly kind: "vendored" };
+
 export interface InitializeOptions {
   readonly hosts: readonly SupportedHost[];
   readonly publishingRemotes: readonly string[];
   readonly directiveEmail: string;
+  readonly skillSetup: SkillSetup;
 }
 
 export interface InitializationResult {
@@ -136,6 +183,23 @@ function validateRemote(remote: string): void {
   }
 }
 
+function validateSkillSetup(skillSetup: SkillSetup): void {
+  switch (skillSetup.kind) {
+    case "reminder":
+    case "vendored":
+      return;
+    case "pull":
+      if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(skillSetup.repository)) {
+        throw new Error("skillSetup.repository must be an HTTPS GitHub repository URL");
+      }
+      return;
+    default: {
+      const exhaustive: never = skillSetup;
+      throw new Error(`Unsupported Skill setup: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
 async function configValues(repository: GitRepository, key: string): Promise<readonly string[]> {
   const result = await repository.run(["config", "--get-all", key], { allowExitCodes: [0, 1] });
   return result.exitCode === 0 ? result.stdout.trimEnd().split("\n") : [];
@@ -209,6 +273,7 @@ export async function initializeRepository(
   options: InitializeOptions,
 ): Promise<InitializationResult> {
   validateEmail(options.directiveEmail);
+  validateSkillSetup(options.skillSetup);
   if (options.hosts.length === 0) {
     throw new Error("At least one supported host must be selected explicitly");
   }
@@ -228,7 +293,7 @@ export async function initializeRepository(
 
   const changedFiles: string[] = [];
   const agentsPath = join(repository.root, "AGENTS.md");
-  if ((await setOwnedBlock(agentsPath, AGENTS_BLOCK)).changed) {
+  if ((await setOwnedBlock(agentsPath, agentsBlock(options.skillSetup))).changed) {
     changedFiles.push(relative(repository.root, agentsPath));
   }
   if (options.hosts.includes("claude")) {

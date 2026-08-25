@@ -97,7 +97,7 @@ async function run(command, args) {
 async function validateSkills() {
   const names = [
     "reveries-git-notes-init",
-    "reveries-git-notes-use",
+    "using-reveries",
     "reveries-git-notes-search",
   ];
   const failures = [];
@@ -111,7 +111,7 @@ async function validateSkills() {
     if (!frontmatter?.[1].includes("description:")) failures.push(`${name}: missing description`);
     if (content.split("\n").length > 120) failures.push(`${name}: main Skill exceeds 120 lines`);
   }
-  await readFile(join(workspace, "skills", "reveries-git-notes-use", "references", "direct-git.md"), "utf8");
+  await readFile(join(workspace, "skills", "using-reveries", "references", "direct-git.md"), "utf8");
   return failures;
 }
 

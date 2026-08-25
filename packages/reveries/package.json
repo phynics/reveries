@@ -2,6 +2,20 @@
   "name": "@reveries/cli",
   "version": "0.1.0",
   "description": "Git-notes engineering memory for immutable blobs and commits",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phynics/reveries.git",
+    "directory": "packages/reveries"
+  },
+  "homepage": "https://github.com/phynics/reveries#readme",
+  "bugs": {
+    "url": "https://github.com/phynics/reveries/issues"
+  },
+  "keywords": [
+    "git-notes",
+    "engineering-decisions",
+    "agent-skills"
+  ],
   "type": "module",
   "bin": {
     "reveries": "dist/src/main.js"

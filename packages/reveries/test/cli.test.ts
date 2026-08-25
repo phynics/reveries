@@ -127,6 +127,29 @@ test("semantic failures use exit code 1 and usage errors use exit code 3", async
   assert.match(usage.stderr(), /usage/i);
 });
 
+test("init requires a complete Skill setup choice", async () => {
+  const directory = await createRepository();
+
+  const missing = captureIo(directory);
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--remote", "origin",
+    "--directive-email", "user@example.com",
+  ], missing.io), 3);
+  assert.match(missing.stderr(), /skill-setup/i);
+
+  const incompletePull = captureIo(directory);
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--remote", "origin",
+    "--directive-email", "user@example.com",
+    "--skill-setup", "pull",
+  ], incompletePull.io), 3);
+  assert.match(incompletePull.stderr(), /skill-repository/i);
+});
+
 test("pre-push validates every pushed branch tip rather than HEAD", async () => {
   const directory = await createRepository();
   const adoption = await adopt(directory);

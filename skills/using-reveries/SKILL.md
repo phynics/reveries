@@ -1,5 +1,5 @@
 ---
-name: reveries-git-notes-use
+name: using-reveries
 description: Read and maintain Reveries engineering decisions while interpreting or changing tracked code, recording a durable decision, reconciling an annotated blob, citing a material user directive, or committing work in a Reveries-enabled repository. Use before editing tracked code and whenever a post-initialization commit needs its required session summary. Use direct Git fallback when the helper is unavailable.
 ---
 

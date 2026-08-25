@@ -10,10 +10,12 @@ and remains untouched by normal removal.
 
 1. Confirm the repository is a Git worktree and inspect the marker, notes ref, hooks,
    remotes, and current protocol state.
-2. Ask which hosts to support, which remote or remotes publish Reveries, and which
-   Git email identifies material user directives. Never infer any of these choices.
+2. Ask how agents should obtain `using-reveries`, which hosts to support, which remote
+   or remotes publish Reveries, and which Git email identifies material user directives.
+   Never infer any of these choices.
 3. Present the intended tracked-file, Git-config, and hook changes before changing them.
-4. Add only the owned marker blocks; preserve other instruction prose and unknown hooks.
+4. Apply the selected Skill setup, then add only the owned marker blocks. Preserve other
+   instruction prose and unknown hooks.
 5. Configure the notes merge strategy and selected remote refspecs, then run `doctor`.
 6. Leave initialization changes uncommitted. Print the commands for the adoption commit,
    its session summary, initialization record, strict check, and first atomic push.

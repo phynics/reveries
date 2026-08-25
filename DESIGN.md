@@ -9,7 +9,7 @@
 **Skills:**
 
 * `reveries-git-notes-init`
-* `reveries-git-notes-use`
+* `using-reveries`
 * `reveries-git-notes-search`
 
 ---
@@ -1305,7 +1305,7 @@ The authoritative block is intentionally short:
 This repository stores engineering decisions in Git notes at
 `refs/notes/reveries`.
 
-Before interpreting or changing tracked code, use `reveries-git-notes-use`.
+Before interpreting or changing tracked code, use `using-reveries`.
 For rationale/history questions, use `reveries-git-notes-search`.
 
 Automatic note delivery is best-effort. When needed, inspect a file directly:
@@ -1319,7 +1319,17 @@ Before publishing:
 <!-- reveries:end -->
 ```
 
-The fuller writing discipline lives in `reveries-git-notes-use`.
+The fuller writing discipline lives in `using-reveries`.
+
+During initialization, the user chooses how new agents obtain that Skill:
+
+* reminder only, for hosts where the Skill is already installed;
+* an `AGENTS.md` pull instruction that names an approved HTTPS GitHub repository;
+* reminder plus a pinned project-local copy committed with the repository.
+
+The vendored choice keeps one canonical copy under `.agents/skills/using-reveries` and adds
+host-specific project copies or links where required. Agent startup never downloads or updates a
+Skill silently.
 
 ### 20.1 Host-specific instruction files
 
@@ -1575,6 +1585,7 @@ Responsibilities:
 * confirm Git worktree;
 * detect existing installation;
 * inspect protocol;
+* ask how new agents obtain `using-reveries`;
 * ask supported hosts;
 * ask publishing remote or remotes;
 * ask directive Git email;
@@ -1596,7 +1607,7 @@ It does not silently:
 * install a global npm package;
 * replace an unknown hook.
 
-### 24.2 `reveries-git-notes-use`
+### 24.2 `using-reveries`
 
 **Invocation:** may activate implicitly
 
@@ -1604,7 +1615,7 @@ Suggested frontmatter:
 
 ```yaml
 ---
-name: reveries-git-notes-use
+name: using-reveries
 description: Read and maintain Reveries engineering decisions while interpreting files, changing code, recording user directives, reconciling annotated blobs, and committing work. Use in a Reveries-enabled repository before editing tracked code, when a durable engineering decision must be recorded, when an old decision must continue, be superseded, or be retired, or when a commit needs its required session summary.
 compatibility: Requires Git. Uses the optional Reveries helper when available and direct Git commands otherwise.
 metadata:
@@ -1683,7 +1694,7 @@ reveries/
 │   │       ├── initialization.md
 │   │       ├── git-config.md
 │   │       └── troubleshooting.md
-│   ├── reveries-git-notes-use/
+│   ├── using-reveries/
 │   │   ├── SKILL.md
 │   │   └── references/
 │   │       ├── protocol-v1.md
@@ -1717,10 +1728,10 @@ Each main `SKILL.md` stays under the progressive-disclosure guidance; detailed p
 
 ## 26. Skill installation
 
-Recommended global installation:
+Global installation is available for machines that provision Skills centrally:
 
 ```bash
-npx skills add OWNER/reveries \
+npx skills add https://github.com/phynics/reveries \
   --global \
   --agent pi \
   --agent claude-code \
@@ -1728,22 +1739,26 @@ npx skills add OWNER/reveries \
   --agent codex \
   --agent gemini-cli \
   --skill reveries-git-notes-init \
-  --skill reveries-git-notes-use \
+  --skill using-reveries \
   --skill reveries-git-notes-search
 ```
 
 The current `skills` CLI supports global and project installs, targeted agents, specific Skills, symlink-based installation, copy fallback, listing, updating, and removal. Its supported-agent catalog includes Claude Code, OpenCode, Codex, Pi, and Gemini CLI. ([GitHub][8])
 
+For a shared repository, initialization also supports reminder-only setup, an explicit pull
+instruction in `AGENTS.md`, or a pinned vendored copy. The initializer asks the user to choose.
+It does not infer a source repository or download Skills during agent startup.
+
 The optional helper is installed separately:
 
 ```bash
-npm install --global @scope/reveries
+npm install --global @reveries/cli
 ```
 
 or used without permanent installation:
 
 ```bash
-npx @scope/reveries check --staged
+npx @reveries/cli check --staged
 ```
 
 Skills never require the helper for raw storage access.
@@ -2192,24 +2207,25 @@ Rules:
    * healthy;
    * damaged;
    * older protocol.
-4. Ask which hosts to support.
-5. Ask which remote or remotes publish Reveries.
-6. Ask which Git email identifies user directives.
-7. Detect helper and adapters.
-8. Show a dry-run plan.
-9. Edit the owned AGENTS block.
-10. Add host-specific instruction adapters.
-11. Configure notes merge strategy:
+4. Ask how new agents obtain `using-reveries`: reminder only, pull when missing, or vendored.
+5. Ask which hosts to support.
+6. Ask which remote or remotes publish Reveries.
+7. Ask which Git email identifies user directives.
+8. Detect helper and adapters.
+9. Show a dry-run plan.
+10. Apply the selected Skill setup and edit the owned AGENTS block.
+11. Add host-specific instruction adapters.
+12. Configure notes merge strategy:
 
     ```bash
     git config notes.reveries.mergeStrategy cat_sort_uniq
     ```
-12. Configure remote fetch refspecs.
-13. Configure approved default push refspecs.
-14. Install or compose post-commit and pre-push hooks.
-15. Run doctor.
-16. Leave tracked files uncommitted.
-17. Print:
+13. Configure remote fetch refspecs.
+14. Configure approved default push refspecs.
+15. Install or compose post-commit and pre-push hooks.
+16. Run doctor.
+17. Leave tracked files uncommitted.
+18. Print:
 
     * commit command;
     * session-summary command;

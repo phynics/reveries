@@ -88,6 +88,7 @@ try {
     "--hosts", "codex,claude,gemini",
     "--remote", "origin",
     "--directive-email", "user@example.com",
+    "--skill-setup", "reminder",
     "--json",
   );
   assert.notEqual(initializationResult.stdout.trim(), "", initializationResult.stderr);

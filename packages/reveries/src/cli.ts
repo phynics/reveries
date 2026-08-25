@@ -2,7 +2,12 @@
 
 import { readFile } from "node:fs/promises";
 
-import { initializeRepository, removeIntegration, type SupportedHost } from "./install.ts";
+import {
+  initializeRepository,
+  removeIntegration,
+  type SkillSetup,
+  type SupportedHost,
+} from "./install.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
 import { Reveries, type PushUpdate } from "./operations.ts";
 import {
@@ -65,6 +70,9 @@ Commands:
   push       Atomically push HEAD and refs/notes/reveries
   hook       Handle one host-neutral adapter event from standard input
   remove     Remove owned integration without deleting evidence
+
+Init requires --skill-setup reminder|pull|vendored. Pull setup also requires
+--skill-repository with an HTTPS GitHub repository URL.
 
 Use --json on inspection and check commands for stable machine output.
 `;
@@ -255,6 +263,20 @@ function splitList(values: readonly string[]): string[] {
   return [...new Set(values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean))];
 }
 
+function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
+  const kind = one(parsed, "--skill-setup", true);
+  const repository = one(parsed, "--skill-repository");
+  if (kind === "reminder" || kind === "vendored") {
+    if (repository !== undefined) throw new UsageError("--skill-repository requires --skill-setup pull");
+    return { kind };
+  }
+  if (kind === "pull") {
+    if (repository === undefined) throw new UsageError("--skill-setup pull requires --skill-repository");
+    return { kind, repository };
+  }
+  throw new UsageError("--skill-setup must be reminder, pull, or vendored");
+}
+
 export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): Promise<ExitCode> {
   const json = argv.includes("--json");
   const command = argv[0];
@@ -268,13 +290,18 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       return 0;
     }
     if (command === "init") {
-      const parsed = parseArguments(argv.slice(1), ["--hosts", "--remote", "--directive-email"], ["--json"]);
+      const parsed = parseArguments(
+        argv.slice(1),
+        ["--hosts", "--remote", "--directive-email", "--skill-setup", "--skill-repository"],
+        ["--json"],
+      );
       const hosts = splitList(parsed.values.get("--hosts") ?? []);
       if (!hosts.every((host) => HOSTS.has(host as SupportedHost))) throw new UsageError("--hosts contains an unsupported host");
       const result = await initializeRepository(io.cwd, {
         hosts: hosts as SupportedHost[],
         publishingRemotes: splitList(parsed.values.get("--remote") ?? []),
         directiveEmail: one(parsed, "--directive-email", true) ?? "",
+        skillSetup: parseSkillSetup(parsed),
       });
       emit(io, json, command, result);
       return 0;

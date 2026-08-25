@@ -13,3 +13,6 @@ always be inspected or maintained with Git and standard text-processing tools.
 
 See the repository README and V1 protocol documentation for initialization, continuity, trust,
 and publishing rules.
+
+- [Repository README](https://github.com/phynics/reveries#readme)
+- [V1 protocol](https://github.com/phynics/reveries/blob/main/protocol/v1.md)

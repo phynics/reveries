@@ -1,6 +1,16 @@
 {
   "name": "reveries-workspace",
   "private": true,
+  "description": "Git-notes engineering memory for immutable blobs and commits",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phynics/reveries.git"
+  },
+  "homepage": "https://github.com/phynics/reveries#readme",
+  "bugs": {
+    "url": "https://github.com/phynics/reveries/issues"
+  },
   "type": "module",
   "workspaces": [
     "packages/*"
