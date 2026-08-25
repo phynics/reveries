@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-25T18:50:52.573Z",
+  "host": {
+    "name": "pi",
+    "version": "0.84.1"
+  },
+  "model": {
+    "provider": "openai-codex",
+    "model": "gpt-5.4-mini"
+  },
+  "skill_sha256": {
+    "reveries-git-notes-init": "05c5043cc3b1a58cd9fb07c8b52ab9d58ffefd0a37046265556937665e1a77a8",
+    "using-reveries": "91e7b08b66f4dad7a11a551f86fa36ee38c64f525b5dd952acea7b5b11fdedac",
+    "reveries-git-notes-search": "b106e79430c35aace1bfbc57c2d29015762e65257f0bf8193414209b1cd64274"
+  },
+  "cases": {
+    "init": {
+      "prompt": "A user explicitly asks: \"Initialize Reveries in this Git repository.\" Use the installed Skill that applies, including reading its instructions before answering. Do not change files. Return exactly one compact JSON object with keys selected_skill, setup_modes, required_user_choices, and mutation_before_answers. setup_modes must name every supported way a new agent can obtain the everyday Reveries Skill. required_user_choices must name every choice that must be asked before setup. mutation_before_answers must be a boolean.",
+      "output": {
+        "selected_skill": "reveries-git-notes-init",
+        "setup_modes": ["Reminder only", "Pull when missing", "Vendored Skill"],
+        "required_user_choices": [
+          "How should new agents obtain using-reveries?",
+          "Which supported host adapters should this repository configure?",
+          "Which remote or remotes publish Reveries?",
+          "Which Git email should identify material user directives?"
+        ],
+        "mutation_before_answers": false
+      }
+    },
+    "ordinary": {
+      "prompt": "A user asks to review package.json in a repository that has no Reveries marker. Evaluate installed Reveries Skill routing only. Do not run tools or change files. Return exactly one compact JSON object with keys selected_skill and init_activated. Use null when no Reveries Skill applies.",
+      "output": {
+        "selected_skill": null,
+        "init_activated": false
+      }
+    },
+    "use": {
+      "prompt": "A Reveries-enabled repository has an annotated tracked file, and the user says: \"Edit that file and commit the change.\" Use the installed Skill that applies, reading it before answering. Do not change files. Return exactly one compact JSON object with keys selected_skill and reason.",
+      "output": {
+        "selected_skill": "using-reveries",
+        "reason": "The task involves a Reveries-enabled repository and asks to edit a tracked annotated file and commit the change, which requires reading and maintaining Reveries decisions before code changes and commit-related session summary handling."
+      }
+    },
+    "search": {
+      "prompt": "In this Reveries-enabled repository, explain why state.txt contains its current implementation. Use the installed Skill that applies and inspect the repository evidence. Do not change repository state. Return exactly one compact JSON object with keys selected_skill, mutates_repository, reverie_id, and decision.",
+      "output": {
+        "selected_skill": "reveries-git-notes-search",
+        "mutates_repository": false,
+        "reverie_id": "rv:9fae28ba2542e998876945b70f43ddf0e9ee0588",
+        "decision": "state.txt contains 'single guarded transition owner' because the active Reveries note for the current blob says two transition mechanisms could conflict, so the chosen design is one guarded owner to keep validity under a single authority; the note also says stale predecessors are rejected by a concurrency test, with the alternative of reconciling histories after writes rejected."
+      }
+    }
+  },
+  "search_audit": {
+    "expected_reverie_id": "rv:9fae28ba2542e998876945b70f43ddf0e9ee0588",
+    "expected_decision": "Use one guarded transition owner because validity must have a single authority.",
+    "before": {
+      "status": "",
+      "refs": "refs/heads/main 2529e9d43428d27a692b630c5120f6bcca6775ae\nrefs/notes/reveries a9dbf4887967b72c22f2d2e1b9a7470da7401d1f",
+      "config": "file:.git/config\tcore.repositoryformatversion=0\nfile:.git/config\tcore.filemode=true\nfile:.git/config\tcore.bare=false\nfile:.git/config\tcore.logallrefupdates=true\nfile:.git/config\tuser.name=Reveries Conformance\nfile:.git/config\tuser.email=conformance@example.com",
+      "worktree_sha256": "35377c5ea84b49ed76a0c5c6f270a175576ca9596161cd88509a9eaf3bad3001"
+    },
+    "after": {
+      "status": "",
+      "refs": "refs/heads/main 2529e9d43428d27a692b630c5120f6bcca6775ae\nrefs/notes/reveries a9dbf4887967b72c22f2d2e1b9a7470da7401d1f",
+      "config": "file:.git/config\tcore.repositoryformatversion=0\nfile:.git/config\tcore.filemode=true\nfile:.git/config\tcore.bare=false\nfile:.git/config\tcore.logallrefupdates=true\nfile:.git/config\tuser.name=Reveries Conformance\nfile:.git/config\tuser.email=conformance@example.com",
+      "worktree_sha256": "35377c5ea84b49ed76a0c5c6f270a175576ca9596161cd88509a9eaf3bad3001"
+    }
+  }
+}

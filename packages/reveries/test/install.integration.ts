@@ -65,6 +65,28 @@ test("initialization is explicit and idempotent", async () => {
   assert.match(pushValues, /refs\/notes\/reveries:refs\/notes\/reveries/);
 });
 
+test("initialization configures every selected remote and leaves unselected host files absent", async () => {
+  const directory = await createRepository();
+  await git(directory, "remote", "add", "mirror", "https://example.invalid/mirror.git");
+
+  await initializeRepository(directory, {
+    hosts: ["pi", "opencode", "codex"],
+    publishingRemotes: ["origin", "mirror"],
+    directiveEmail: "user@example.com",
+    skillSetup: { kind: "reminder" },
+  });
+
+  for (const remote of ["origin", "mirror"]) {
+    const fetchValues = await git(directory, "config", "--get-all", `remote.${remote}.fetch`);
+    const pushValues = await git(directory, "config", "--get-all", `remote.${remote}.push`);
+    assert.match(fetchValues, new RegExp(`refs/notes/remotes/${remote}/reveries`));
+    assert.match(pushValues, /^HEAD$/m);
+    assert.match(pushValues, /refs\/notes\/reveries:refs\/notes\/reveries/);
+  }
+  await assert.rejects(readFile(join(directory, "CLAUDE.md"), "utf8"), { code: "ENOENT" });
+  await assert.rejects(readFile(join(directory, "GEMINI.md"), "utf8"), { code: "ENOENT" });
+});
+
 test("initialization can direct agents to pull using-reveries from a named repository", async () => {
   const directory = await createRepository();
 

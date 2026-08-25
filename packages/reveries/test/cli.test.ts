@@ -150,6 +150,19 @@ test("init requires a complete Skill setup choice", async () => {
   assert.match(incompletePull.stderr(), /skill-repository/i);
 });
 
+test("init refuses to invent a directive email", async () => {
+  const directory = await createRepository();
+  const missing = captureIo(directory);
+
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--remote", "origin",
+    "--skill-setup", "reminder",
+  ], missing.io), 3);
+  assert.match(missing.stderr(), /directive-email/i);
+});
+
 test("pre-push validates every pushed branch tip rather than HEAD", async () => {
   const directory = await createRepository();
   const adoption = await adopt(directory);

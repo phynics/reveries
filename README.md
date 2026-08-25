@@ -46,14 +46,14 @@ npm run build
 node packages/reveries/dist/src/main.js --help
 ```
 
-Run the sandbox-safe release evaluation:
+Run the strict release evaluation:
 
 ```bash
-npm run evaluate:local
+npm run verify
 ```
 
-The [local evaluation guide](EVALUATION.md) explains coverage statuses and checks that require
-native hosts or external access.
+The [local evaluation guide](EVALUATION.md) explains the executable matrix, recorded Pi evidence,
+and the boundary of the automatic-delivery claim.
 
 The helper implements `init`, `doctor`, `show`, `record`, `summarize`, `check`, `search`,
 `history`, `sync`, `push`, and the hook entrypoints. Inspection and check commands accept
@@ -105,6 +105,7 @@ It does not claim an automatic read/edit adapter has passed a host-version confo
 
 ## Status
 
-The V1 protocol, Git core, CLI, Skills, host-neutral hook contract, and conservative host adapters
-are implemented. Every host remains at `CORE` until a named host version passes the native
-automatic-delivery conformance suite.
+Reveries V1.0.0 implements the protocol, Git core, CLI, Skills, host-neutral hook contract, and
+conservative host adapters. The release gate covers 46 claimed acceptance criteria; automatic
+delivery remains explicitly unclaimed. Every host stays at `CORE` until a named host version
+passes the native automatic-delivery conformance suite.

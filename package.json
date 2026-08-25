@@ -16,19 +16,23 @@
     "packages/*"
   ],
   "scripts": {
+    "acceptance:direct-git": "node scripts/direct-git-acceptance.mjs",
+    "acceptance:installer": "node scripts/installer-acceptance.mjs",
+    "acceptance:native-evidence": "node scripts/native-skill-evidence.mjs",
     "build": "npm run build --workspace @reveries/cli",
     "conformance": "npm run build && node scripts/conformance.mjs",
     "evaluate:local": "node scripts/evaluate-local.mjs",
     "test": "npm run test --workspace @reveries/cli",
     "test:full": "npm run test:full --workspace @reveries/cli",
     "typecheck": "npm run typecheck --workspace @reveries/cli",
-    "verify": "npm run typecheck && npm run test:full && npm run conformance"
+    "verify": "npm run evaluate:local -- --strict"
   },
   "engines": {
     "node": ">=20.11"
   },
   "devDependencies": {
     "@types/node": "^26.3.0",
+    "skills": "1.5.23",
     "typescript": "^7.0.2"
   }
 }
