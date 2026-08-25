@@ -2501,8 +2501,6 @@ The system is correct only if these invariants hold:
 
 ## 39. Main point
 
-Reveries is deliberately smaller than Coherence.
-
 It does not attempt to model the entire repository or coordinate an agent swarm.
 
 It preserves one thing that source control routinely loses:
