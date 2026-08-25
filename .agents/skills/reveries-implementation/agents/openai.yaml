@@ -1,4 +1,0 @@
-interface:
-  display_name: "Reveries Implementation"
-  short_description: "Implement and verify Reveries V1 safely"
-  default_prompt: "Use $reveries-implementation to implement a bounded Reveries V1 component."
