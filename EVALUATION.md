@@ -51,7 +51,7 @@ node scripts/native-skill-evidence.mjs --capture
 The checked-in evidence is valid only while those Skill digests match. The normal verifier rejects
 stale evidence. Recapture requires Pi and model access; verification does not.
 
-## V1.0.0 result
+## V1.0.1 result
 
 The strict evaluation on 2026-08-25 produced:
 
@@ -60,7 +60,9 @@ The strict evaluation on 2026-08-25 produced:
 | Covered | 46 |
 | Not claimed | 1 |
 
-All eight executable gates passed and `release_ready` was `true`.
+All eight local executable gates passed and `release_ready` was `true`. CI also reruns the complete
+suite in the official Node 22.20 Debian image, whose Git 2.39 client guards the portable notes-write
+path.
 
 The single `not-claimed` criterion is native automatic delivery. All hosts remain at `CORE`.
 Pi 0.84.1 was tested for Skill routing, explicit initialization, and a read-only rationale search;
@@ -68,7 +70,7 @@ that evidence does not imply its automatic read/edit adapter passed the 20-case 
 
 ## Remaining compatibility boundary
 
-V1.0.0 does not claim:
+V1.0.1 does not claim:
 
 - automatic delivery against any named host version;
 - native Skill routing on Claude Code, OpenCode, Codex, or Gemini CLI;

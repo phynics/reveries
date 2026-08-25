@@ -105,7 +105,7 @@ It does not claim an automatic read/edit adapter has passed a host-version confo
 
 ## Status
 
-Reveries V1.0.0 implements the protocol, Git core, CLI, Skills, host-neutral hook contract, and
+Reveries V1.0.1 implements the protocol, Git core, CLI, Skills, host-neutral hook contract, and
 conservative host adapters. The release gate covers 46 claimed acceptance criteria; automatic
 delivery remains explicitly unclaimed. Every host stays at `CORE` until a named host version
 passes the native automatic-delivery conformance suite.

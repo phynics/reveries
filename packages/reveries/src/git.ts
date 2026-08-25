@@ -97,25 +97,14 @@ class TemporaryNotesTransaction implements NotesTransaction {
 
   async append(object: ObjectId, canonicalLine: string): Promise<void> {
     validateCanonicalBody(canonicalLine);
-    await this.repository.run(
-      [
-        "notes",
-        `--ref=${this.temporaryRef}`,
-        "append",
-        "--no-separator",
-        "--no-stripspace",
-        "-F",
-        "-",
-        object,
-      ],
-      { input: canonicalLine },
-    );
+    const existing = await this.read(object);
+    await this.replace(object, `${existing ?? ""}${canonicalLine}`);
   }
 
   async replace(object: ObjectId, canonicalBody: string): Promise<void> {
     validateCanonicalBody(canonicalBody);
     await this.repository.run(
-      ["notes", `--ref=${this.temporaryRef}`, "add", "-f", "--no-stripspace", "-F", "-", object],
+      ["notes", `--ref=${this.temporaryRef}`, "add", "-f", "-F", "-", object],
       { input: canonicalBody },
     );
   }
@@ -394,6 +383,9 @@ async function runGit(cwd: string, args: readonly string[], options: RunOptions 
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", reject);
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE") reject(error);
+    });
     child.on("close", (exitCode) => {
       const result: GitResult = {
         stdout: Buffer.concat(stdout).toString("utf8"),

@@ -157,7 +157,7 @@ For rationale/history questions, use \`reveries-git-notes-search\`.
   };
   const noteFile = join(directory, "record.jsonl");
   await writeFile(noteFile, `${JSON.stringify(record)}\n`, "utf8");
-  await git(directory, "notes", "--ref=refs/notes/reveries", "add", "--no-stripspace", "-F", noteFile, blob);
+  await git(directory, "notes", "--ref=refs/notes/reveries", "add", "-F", noteFile, blob);
   await rm(noteFile);
   return { directory, id, decision: semantic.decision };
 }

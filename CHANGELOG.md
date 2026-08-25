@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 - 2026-08-25
+
+- Write canonical JSONL notes through a portable read-concatenate-replace transaction so the
+  helper works with Git 2.39 as well as newer clients.
+- Make the stale-clone acceptance fixture independent of global Git identity.
+- Include captured test output in evaluator failures and run the suite against Git 2.39 in CI.
+
 ## 1.0.0 - 2026-08-25
 
 Reveries V1 provides Git-notes engineering memory for exact file blobs and commits.

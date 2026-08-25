@@ -253,6 +253,8 @@ test("a stale non-fast-forward notes push fails safely", async () => {
   await git(source, "push", "origin", "main");
   await git(stale, "clone", source, ".");
   await git(stale, "remote", "set-url", "origin", bare);
+  await git(stale, "config", "user.name", "Reveries Test");
+  await git(stale, "config", "user.email", "reveries@example.com");
 
   const current = await GitRepository.open(source);
   const oldClone = await GitRepository.open(stale);

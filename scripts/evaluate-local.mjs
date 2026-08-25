@@ -173,11 +173,11 @@ try {
       native_host_testing: false,
       recorded_native_host_evidence: "Pi 0.84.1",
     },
-    gates: gates.map(({ ok, command, duration_ms, stderr }) => ({
+    gates: gates.map(({ ok, command, duration_ms, stdout, stderr }) => ({
       ok,
       command,
       duration_ms,
-      diagnostic: ok ? null : stderr.trim(),
+      diagnostic: ok ? null : [stdout, stderr].filter((output) => output.trim().length > 0).join("\n").trim(),
     })),
     acceptance: {
       counts,

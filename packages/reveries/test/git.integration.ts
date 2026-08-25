@@ -61,13 +61,15 @@ test("writes exact JSONL through the canonical notes ref", async () => {
   const repository = await GitRepository.open(directory);
   const blob = await repository.resolvePath({ path: "state.txt", revision: "HEAD" });
   const line = "{\"v\":1,\"type\":\"reverie\",\"id\":\"rv:test\"}\n";
+  const secondLine = "{\"v\":1,\"type\":\"reverie\",\"id\":\"rv:second\"}\n";
 
   await repository.withNotesWrite(async (notes) => {
     assert.equal(await notes.read(blob), null);
     await notes.append(blob, line);
+    await notes.append(blob, secondLine);
   });
 
-  assert.equal(await repository.readNote(blob), line);
+  assert.equal(await repository.readNote(blob), `${line}${secondLine}`);
   assert.equal(await git(directory, "rev-parse", "--verify", NOTES_REF), await repository.notesTip());
 });
 
@@ -128,9 +130,7 @@ test("a writer outside the shared lock forces a compare-and-swap retry", async (
         directory,
         "notes",
         "--ref=refs/notes/reveries",
-        "append",
-        "--no-separator",
-        "--no-stripspace",
+        "add",
         "-m",
         "{\"outside\":true}",
         blob,

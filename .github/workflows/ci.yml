@@ -27,3 +27,11 @@ jobs:
 
       - name: Evaluate Reveries
         run: npm run verify
+
+      - name: Test Git 2.39 compatibility
+        run: >-
+          docker run --rm
+          --mount type=bind,source="$GITHUB_WORKSPACE",target=/work,readonly
+          --workdir /work
+          node:22.20.0-bookworm
+          npm run test:full
