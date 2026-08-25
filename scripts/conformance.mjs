@@ -59,6 +59,8 @@ try {
   await git(repository, "config", "user.email", "conformance@example.com");
   await git(repository, "remote", "add", "origin", remote);
   await writeFile(join(repository, "state.txt"), "first\n", "utf8");
+  await git(repository, "add", "state.txt");
+  await git(repository, "commit", "-m", "initial fixture");
 
   const wrapper = join(bin, "reveries");
   await writeFile(wrapper, `#!/bin/sh\nexec node ${JSON.stringify(cli)} "$@"\n`, "utf8");
@@ -74,6 +76,7 @@ try {
       stdin: async () => stdin,
       stdout: (text) => { stdout += text; },
       stderr: (text) => { stderr += text; },
+      helper: { command: process.execPath, args: [cli], verification: "self" },
     });
     return { code, stdout, stderr };
   };
@@ -94,45 +97,19 @@ try {
   assert.notEqual(initializationResult.stdout.trim(), "", initializationResult.stderr);
   const initialized = JSON.parse(initializationResult.stdout);
   assert.equal(initialized.ok, true);
-  await git(repository, "add", "state.txt", "AGENTS.md", "CLAUDE.md", "GEMINI.md");
-  await git(repository, "commit", "-m", "adopt Reveries");
-  const adoption = await git(repository, "rev-parse", "HEAD");
-
-  const summaryPath = join(repository, "summary.json");
-  const initPath = join(repository, "init.json");
-  const summary = {
-    v: 1,
-    type: "session-summary",
-    author_email: "conformance@example.com",
-    session: "automation:conformance",
-    created_at: "2026-08-25T03:05:00Z",
-    entries: [{
-      driving_event: "The repository adopted causal engineering memory.",
-      decision: "Publish the Reveries integration because future blob changes need explicit decision continuity.",
-      impact: "Published commits now require summaries and annotated blobs require dispositions.",
-      recurrence_control: "The pre-push check validates summary coverage and continuity.",
-      alternatives: [],
-      sources: [],
-      reveries: [],
-      retirements: [],
-    }],
-  };
-  await writeFile(summaryPath, JSON.stringify(summary), "utf8");
-  await writeFile(initPath, JSON.stringify({
-    v: 1,
-    type: "reveries-init",
-    protocol: 1,
-    notes_ref: "refs/notes/reveries",
-    publishing_remotes: ["origin"],
-    hosts: ["codex", "claude", "gemini"],
-    author_email: "conformance@example.com",
-    created_at: "2026-08-25T03:05:00Z",
-  }), "utf8");
-  await invoke("summarize", adoption, "--from", summaryPath);
-  const beforeInit = JSON.parse((await invoke("show", adoption, "--json")).stdout);
-  assert.deepEqual(beforeInit.result.records.map((record) => record.type), ["session-summary"]);
-  await invoke("summarize", adoption, "--init", "--from", initPath);
+  assert.equal(initialized.result.enforcement, "complete");
+  const adopted = JSON.parse((await invoke(
+    "adopt",
+    "--plan", initialized.result.templatePaths.plan,
+    "--message", "adopt Reveries",
+    "--json",
+  )).stdout);
+  const adoption = adopted.result.commit;
+  const adoptionNote = JSON.parse((await invoke("show", adoption, "--json")).stdout);
+  assert.deepEqual(adoptionNote.result.records.map((record) => record.type).sort(), ["reveries-init", "session-summary"]);
   assert.equal((await invoke("check", adoption, "--json")).code, 0);
+  const summaryPath = join(repository, "summary.json");
+  const summary = JSON.parse(await readFile(initialized.result.templatePaths.sessionSummary, "utf8"));
 
   const reveriePath = join(repository, "reverie.json");
   await writeFile(reveriePath, JSON.stringify({

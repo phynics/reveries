@@ -46,9 +46,9 @@ const criteria = [
   { category: "initialization", criterion: "Unknown hooks are not overwritten", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "unknown hooks are preserved and reported as partial enforcement")] },
   { category: "initialization", criterion: "Removal preserves notes ref", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "removal keeps the notes ref and unknown prose")] },
   { category: "initialization", criterion: "User is queried for publishing remotes", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "Pi ${evidence.host.version} Skill evidence passed.")] },
-  { category: "initialization", criterion: "Multiple remotes are supported", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and leaves unselected host files absent")] },
-  { category: "initialization", criterion: "Directive email is not invented", status: "covered", evidence: [evidence("packages/reveries/test/cli.test.ts", "init refuses to invent a directive email")] },
-  { category: "initialization", criterion: "Host files are created only when selected", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and leaves unselected host files absent")] },
+  { category: "initialization", criterion: "Multiple remotes are supported", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and explains host routing")] },
+  { category: "initialization", criterion: "Directive email is not invented", status: "covered", evidence: [evidence("packages/reveries/test/cli.test.ts", "init requires an explicit directive-email choice")] },
+  { category: "initialization", criterion: "Host files are created only when selected", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and explains host routing")] },
 
   { category: "skills", criterion: "Skill names and frontmatter are structurally valid", status: "local-static" },
   { category: "skills", criterion: "Skill descriptions trigger intended workflows", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "Pi ${evidence.host.version} Skill evidence passed.")] },

@@ -10,15 +10,22 @@ and remains untouched by normal removal.
 
 1. Confirm the repository is a Git worktree and inspect the marker, notes ref, hooks,
    remotes, and current protocol state.
-2. Ask how agents should obtain `using-reveries`, which hosts to support, which remote
-   or remotes publish Reveries, and which Git email identifies material user directives.
-   Never infer any of these choices.
+2. Before running `reveries init`, ask four separate questions:
+   - How should agents obtain the Reveries Skills: reminder, pull, vendored copy, or
+     project-local symlinks?
+   - Which hosts should use the setup? "No host adapters" is valid.
+   - Which remotes should publish Reveries? "Local only" is valid.
+   - Which Git email identifies material user directives? "Leave unset" is valid.
+   Never infer an answer. Map every answer to an explicit CLI flag, including each
+   `--no-*` choice.
 3. Present the intended tracked-file, Git-config, and hook changes before changing them.
 4. Apply the selected Skill setup, then add only the owned marker blocks. Preserve other
-   instruction prose and unknown hooks.
+   instruction prose, unrelated worktree changes, and unknown hooks.
 5. Configure the notes merge strategy and selected remote refspecs, then run `doctor`.
-6. Leave initialization changes uncommitted. Print the commands for the adoption commit,
-   its session summary, initialization record, strict check, and first atomic push.
+6. Leave initialization changes uncommitted. Use the returned adoption plan with
+   `reveries adopt`; it verifies every prepared file, excludes unrelated staged work, creates
+   the exact adoption commit, and atomically attaches its generated summary and initialization
+   records. Print the strict check and first atomic push when a publishing remote was selected.
 
 Do not create a commit, push, install global software, choose a remote, overwrite an
 unknown hook, or delete `refs/notes/reveries` without explicit authorization.

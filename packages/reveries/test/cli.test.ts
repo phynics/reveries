@@ -87,6 +87,12 @@ afterEach(async () => {
   await Promise.all(temporaryRepositories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
+test("version output supports hook preflight without opening a repository", async () => {
+  const io = captureIo("/tmp");
+  assert.equal(await runCli(["--version"], io.io), 0);
+  assert.match(io.stdout(), /^reveries 1\.0\.2\n$/);
+});
+
 test("record and show expose stable JSON output", async () => {
   const directory = await createRepository();
   const draftPath = join(directory, "reverie.json");
@@ -150,7 +156,7 @@ test("init requires a complete Skill setup choice", async () => {
   assert.match(incompletePull.stderr(), /skill-repository/i);
 });
 
-test("init refuses to invent a directive email", async () => {
+test("init requires an explicit directive-email choice", async () => {
   const directory = await createRepository();
   const missing = captureIo(directory);
 
@@ -161,6 +167,90 @@ test("init refuses to invent a directive email", async () => {
     "--skill-setup", "reminder",
   ], missing.io), 3);
   assert.match(missing.stderr(), /directive-email/i);
+});
+
+test("init accepts explicit local-only choices and symlink setup", async () => {
+  const directory = await createRepository();
+  for (const name of ["using-reveries", "reveries-git-notes-search", "reveries-git-notes-init"]) {
+    await execFileAsync("mkdir", ["-p", join(directory, "skills", name)]);
+    await writeFile(join(directory, "skills", name, "SKILL.md"), `---\nname: ${name}\n---\n`, "utf8");
+  }
+  await git(directory, "add", "skills");
+  await git(directory, "commit", "-m", "add skill sources");
+  const init = captureIo(directory);
+
+  assert.equal(await runCli([
+    "init",
+    "--no-hosts",
+    "--no-publish",
+    "--no-directive-email",
+    "--skill-setup", "symlink",
+    "--skill-source", "skills",
+    "--json",
+  ], init.io), 0);
+  assert.match(init.stdout(), /"state":"prepared"/);
+  assert.match(init.stdout(), /\.agents\/skills\/using-reveries/);
+});
+
+test("adopt verifies the plan and excludes unrelated staged work", async () => {
+  const directory = await createRepository();
+  const init = captureIo(directory);
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--no-publish",
+    "--no-directive-email",
+    "--skill-setup", "reminder",
+    "--json",
+  ], init.io), 0);
+  const initialized = JSON.parse(init.stdout()) as { result: { templatePaths: { plan: string } } };
+  await writeFile(join(directory, "unrelated.txt"), "unrelated\n", "utf8");
+  await git(directory, "add", "unrelated.txt");
+  const adoptIo = captureIo(directory);
+
+  assert.equal(await runCli([
+    "adopt",
+    "--plan", initialized.result.templatePaths.plan,
+    "--message", "Adopt Reveries",
+    "--json",
+  ], adoptIo.io), 0);
+  assert.match(adoptIo.stdout(), /"commit":"[0-9a-f]{40}"/);
+  const adopted = JSON.parse(adoptIo.stdout()) as { result: { commit: string } };
+  const note = await (await Reveries.open(directory)).show({ target: adopted.result.commit });
+  assert.deepEqual(note.records.map((record) => record.type).sort(), ["reveries-init", "session-summary"]);
+  const staged = (await execFileAsync("git", ["diff", "--cached", "--name-only"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  assert.equal(staged, "unrelated.txt");
+});
+
+test("post-commit stays quiet while initialization is prepared", async () => {
+  const directory = await createRepository();
+  const init = captureIo(directory);
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--no-publish",
+    "--no-directive-email",
+    "--skill-setup", "reminder",
+  ], init.io), 0);
+
+  const hook = captureIo(directory);
+  assert.equal(await runCli(["post-commit"], hook.io), 0);
+  assert.equal(hook.stdout(), "");
+  assert.equal(hook.stderr(), "");
+});
+
+test("post-commit stays quiet on a branch that predates an existing adoption boundary", async () => {
+  const directory = await createRepository();
+  await git(directory, "branch", "legacy");
+  await writeFile(join(directory, "adoption.txt"), "adopt\n", "utf8");
+  await git(directory, "add", "adoption.txt");
+  await git(directory, "commit", "-m", "adopt reveries");
+  await adopt(directory);
+  await git(directory, "checkout", "legacy");
+  const hook = captureIo(directory);
+
+  assert.equal(await runCli(["post-commit"], hook.io), 0);
+  assert.equal(hook.stderr(), "");
 });
 
 test("pre-push validates every pushed branch tip rather than HEAD", async () => {

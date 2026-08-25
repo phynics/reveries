@@ -1109,10 +1109,11 @@ For each publishing remote selected by the user:
 
 ```bash
 git config --add remote.origin.fetch \
-  '+refs/notes/reveries:refs/notes/remotes/origin/reveries'
+  '+refs/notes/reveries*:refs/notes/remotes/origin/reveries*'
 ```
 
-Ordinary `git fetch origin` updates the remote-tracking notes ref.
+The wildcard allows ordinary `git fetch origin` before the remote publishes its first Reveries
+ref. Once published, it updates the canonical remote-tracking notes ref.
 
 It does not automatically merge that state into the local writable notes ref.
 
@@ -1177,6 +1178,9 @@ During initialization, the agent must ask:
 It may show detected remotes and recommend likely choices.
 
 It never silently selects `origin`.
+
+The user may choose local-only setup with no publishing remotes. In that state, initialization
+does not install pre-push publication enforcement or configure remote push refspecs.
 
 ### 18.2 Ordinary push configuration
 
@@ -1325,11 +1329,11 @@ During initialization, the user chooses how new agents obtain that Skill:
 
 * reminder only, for hosts where the Skill is already installed;
 * an `AGENTS.md` pull instruction that names an approved HTTPS GitHub repository;
-* reminder plus a pinned project-local copy committed with the repository.
+* reminder plus pinned project-local copies committed with the repository;
+* reminder plus project-local relative symlinks to tracked Skill directories.
 
-The vendored choice keeps one canonical copy under `.agents/skills/using-reveries` and adds
-host-specific project copies or links where required. Agent startup never downloads or updates a
-Skill silently.
+The vendored and linked choices expose all three Reveries Skills under `.agents/skills`. Agent
+startup never downloads or updates a Skill silently.
 
 ### 20.1 Host-specific instruction files
 
@@ -1585,10 +1589,10 @@ Responsibilities:
 * confirm Git worktree;
 * detect existing installation;
 * inspect protocol;
-* ask how new agents obtain `using-reveries`;
+* ask how new agents obtain the Reveries Skills;
 * ask supported hosts;
 * ask publishing remote or remotes;
-* ask directive Git email;
+* ask directive Git email or confirm that it stays unset;
 * inspect optional helper and adapters;
 * edit owned instruction blocks;
 * configure notes merge behavior;
@@ -1745,9 +1749,10 @@ npx skills add https://github.com/phynics/reveries \
 
 The current `skills` CLI supports global and project installs, targeted agents, specific Skills, symlink-based installation, copy fallback, listing, updating, and removal. Its supported-agent catalog includes Claude Code, OpenCode, Codex, Pi, and Gemini CLI. ([GitHub][8])
 
-For a shared repository, initialization also supports reminder-only setup, an explicit pull
-instruction in `AGENTS.md`, or a pinned vendored copy. The initializer asks the user to choose.
-It does not infer a source repository or download Skills during agent startup.
+For a shared repository, initialization supports reminder-only setup, an explicit pull
+instruction in `AGENTS.md`, pinned vendored copies, or relative symlinks to tracked Skills. The
+initializer asks the user to choose. It does not infer a source repository or download Skills
+during agent startup.
 
 The optional helper is installed separately:
 
@@ -1771,6 +1776,7 @@ Public commands:
 
 ```text
 reveries init
+reveries adopt
 reveries doctor
 reveries show
 reveries record
@@ -1795,12 +1801,28 @@ reveries post-commit
 ```bash
 reveries init \
   --hosts pi,claude,opencode,codex,gemini \
-  --remote origin
+  --remote origin \
+  --directive-email user@example.com \
+  --skill-setup pull \
+  --skill-repository https://github.com/owner/reveries
 ```
 
-The Skill should normally drive this interactively rather than assuming flags.
+The Skill should normally ask the user and map every answer to an explicit flag. The deliberate
+empty choices are `--no-hosts`, `--no-publish`, and `--no-directive-email`. Vendored and symlink
+setups require `--skill-source`.
 
-### 27.2 `reveries doctor`
+### 27.2 `reveries adopt`
+
+```bash
+reveries adopt \
+  --plan <git-common-dir>/reveries/adoption/<plan-id>/plan.json \
+  --message "Adopt Reveries"
+```
+
+The command verifies every prepared-file fingerprint, stages only the plan paths, and creates
+the adoption commit with only those paths. It refuses if a prepared file changed after `init`.
+
+### 27.3 `reveries doctor`
 
 Checks:
 
@@ -1819,7 +1841,7 @@ Checks:
 * notes divergence;
 * record damage.
 
-### 27.3 `reveries show`
+### 27.4 `reveries show`
 
 ```bash
 reveries show src/state.rs
@@ -1828,7 +1850,7 @@ reveries show <blob-or-commit>
 reveries show src/state.rs --json
 ```
 
-### 27.4 `reveries record`
+### 27.5 `reveries record`
 
 New decision:
 
@@ -1856,7 +1878,7 @@ reveries record supersede src/state.rs \
 
 Retirement is entered through the commit summary.
 
-### 27.5 `reveries summarize`
+### 27.6 `reveries summarize`
 
 ```bash
 reveries summarize HEAD \
@@ -1872,7 +1894,7 @@ reveries summarize <commit> \
   --from corrected-summary.json
 ```
 
-### 27.6 `reveries check`
+### 27.7 `reveries check`
 
 ```bash
 reveries check --staged
@@ -1880,7 +1902,7 @@ reveries check HEAD
 reveries check --outgoing origin
 ```
 
-### 27.7 `reveries search`
+### 27.8 `reveries search`
 
 ```bash
 reveries search "transition authority"
@@ -1890,21 +1912,21 @@ reveries search --at HEAD
 reveries search --all
 ```
 
-### 27.8 `reveries history`
+### 27.9 `reveries history`
 
 ```bash
 reveries history src/state.rs
 reveries history rv:<id>
 ```
 
-### 27.9 `reveries sync`
+### 27.10 `reveries sync`
 
 ```bash
 reveries sync --status origin
 reveries sync --pull origin
 ```
 
-### 27.10 `reveries push`
+### 27.11 `reveries push`
 
 ```bash
 reveries push origin
@@ -1912,7 +1934,7 @@ reveries push origin
 
 Performs an atomic branch-plus-notes push.
 
-### 27.11 Exit codes
+### 27.12 Exit codes
 
 ```text
 0  success / clean
@@ -1921,7 +1943,7 @@ Performs an atomic branch-plus-notes push.
 3  usage or invalid input
 ```
 
-### 27.12 Machine output
+### 27.13 Machine output
 
 Every inspection and check command supports stable `--json` output.
 
@@ -2037,7 +2059,7 @@ done
 
 ```bash
 git fetch origin \
-  '+refs/notes/reveries:refs/notes/remotes/origin/reveries'
+  '+refs/notes/reveries*:refs/notes/remotes/origin/reveries*'
 ```
 
 ### Merge fetched notes
@@ -2175,6 +2197,9 @@ It stores the local preference:
 git config reveries.directiveEmail user@example.com
 ```
 
+The user may leave the preference unset. The initializer records that choice without writing an
+empty config value. A later operation that needs `requested-by` asks before writing the source.
+
 A materially constraining user directive is cited as:
 
 ```json
@@ -2207,7 +2232,8 @@ Rules:
    * healthy;
    * damaged;
    * older protocol.
-4. Ask how new agents obtain `using-reveries`: reminder only, pull when missing, or vendored.
+4. Ask how new agents obtain the Reveries Skills: reminder only, pull when missing, vendored, or
+   project-local symlinks.
 5. Ask which hosts to support.
 6. Ask which remote or remotes publish Reveries.
 7. Ask which Git email identifies user directives.
@@ -2220,16 +2246,16 @@ Rules:
     ```bash
     git config notes.reveries.mergeStrategy cat_sort_uniq
     ```
-13. Configure remote fetch refspecs.
+13. Configure wildcard remote fetch refspecs that tolerate an unpublished notes ref.
 14. Configure approved default push refspecs.
-15. Install or compose post-commit and pre-push hooks.
-16. Run doctor.
+15. Resolve the helper executable, then install or compose post-commit and pre-push hooks. If no
+    executable is available, report partial enforcement and do not install a broken hook.
+16. Run doctor. Before the adoption record exists, report a healthy `prepared` state.
 17. Leave tracked files uncommitted.
 18. Print:
 
-    * commit command;
-    * session-summary command;
-    * initialization-record command;
+    * fingerprinted adoption command, which commits the exact prepared paths and attaches both
+      generated records to that exact commit;
     * strict-check command;
     * first atomic-push command.
 
@@ -2245,6 +2271,7 @@ It:
 
 * removes owned AGENTS content;
 * removes owned Claude and Gemini adapter blocks;
+* removes unchanged Skill links or copies recorded as initializer-owned;
 * removes Reveries-added Git config;
 * removes or unregisters Reveries hooks;
 * disables project adapter activation;

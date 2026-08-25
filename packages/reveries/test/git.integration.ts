@@ -174,3 +174,15 @@ test("two clones merge independent canonical note lines without loss", async () 
   assert.match(merged ?? "", /"record":"a"/);
   assert.match(merged ?? "", /"record":"b"/);
 });
+
+test("fetching an unpublished remote notes ref reports absence without failing", async () => {
+  const directory = await createRepository();
+  const bare = await mkdtemp(join(tmpdir(), "reveries-no-notes-"));
+  temporaryRepositories.push(bare);
+  await git(bare, "init", "--bare");
+  await git(directory, "remote", "add", "origin", bare);
+  await git(directory, "push", "origin", "main");
+
+  const repository = await GitRepository.open(directory);
+  assert.equal(await repository.fetchNotes("origin"), "absent");
+});

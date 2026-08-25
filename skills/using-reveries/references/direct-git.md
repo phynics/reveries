@@ -50,7 +50,7 @@ while read -r note object; do
   fi
 done
 
-git fetch origin '+refs/notes/reveries:refs/notes/remotes/origin/reveries'
+git fetch origin '+refs/notes/reveries*:refs/notes/remotes/origin/reveries*'
 git notes --ref=refs/notes/reveries merge -s cat_sort_uniq \
   refs/notes/remotes/origin/reveries
 git push --atomic origin HEAD refs/notes/reveries:refs/notes/reveries

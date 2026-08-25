@@ -24,6 +24,7 @@ import {
   type Source,
 } from "./protocol.ts";
 import { GitRepository, type NoteListEntry, type NotesTransaction } from "./git.ts";
+import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
 
 export interface RecordTarget {
   readonly path: string;
@@ -59,6 +60,15 @@ export interface ShowResult {
 export interface CheckResult {
   readonly ok: boolean;
   readonly diagnostics: readonly string[];
+}
+
+export interface SyncResult extends CheckResult {
+  readonly state: "fetched" | "remote-notes-absent";
+}
+
+export interface DoctorResult extends CheckResult {
+  readonly state: "prepared" | "adopted" | "damaged";
+  readonly notices: readonly string[];
 }
 
 export interface PushUpdate {
@@ -268,6 +278,36 @@ export class Reveries {
     }, (ref) => this.validateNotesRef(ref));
   }
 
+  async attachAdoption(input: {
+    readonly commit: string;
+    readonly summary: SessionSummary;
+    readonly initialization: ReveriesInit;
+  }): Promise<void> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    validateNote([input.summary, input.initialization], { verifyIds: false });
+    await this.repository.withNotesWrite(async (notes) => {
+      const existing = await notes.read(commit);
+      const records = existing === null
+        ? []
+        : parseNote(existing, "strict", { verifyIds: false }).records;
+      const summary = records.find((record) => record.type === "session-summary");
+      const initialization = records.find((record) => record.type === "reveries-init");
+      if (summary !== undefined && canonicalRecord(summary) !== canonicalRecord(input.summary)) {
+        throw new Error(`Commit ${commit} already has a different session summary`);
+      }
+      if (initialization !== undefined && canonicalRecord(initialization) !== canonicalRecord(input.initialization)) {
+        throw new Error(`Commit ${commit} already has a different initialization record`);
+      }
+      const retained = records.filter(
+        (record) => record.type !== "session-summary" && record.type !== "reveries-init",
+      );
+      await notes.replace(
+        commit,
+        [input.summary, input.initialization, ...retained].map(canonicalRecord).join(""),
+      );
+    }, (ref) => this.validateNotesRef(ref));
+  }
+
   async checkStaged(explicitSuccessors: ReadonlyMap<string, string> = new Map()): Promise<CheckResult> {
     const transitions = [...await this.stagedTransitions()];
     for (const [oldPath, newPath] of explicitSuccessors) {
@@ -433,14 +473,17 @@ export class Reveries {
     return history;
   }
 
-  async syncPull(remote: string): Promise<CheckResult> {
-    await this.repository.fetchNotes(remote);
+  async syncPull(remote: string): Promise<SyncResult> {
+    const fetched = await this.repository.fetchNotes(remote);
+    if (fetched === "absent") {
+      return { ok: true, diagnostics: [], state: "remote-notes-absent" };
+    }
     await this.repository.mergeFetchedNotes(remote);
     try {
       await this.validateNotesRef("refs/notes/reveries");
-      return { ok: true, diagnostics: [] };
+      return { ok: true, diagnostics: [], state: "fetched" };
     } catch (error: unknown) {
-      return { ok: false, diagnostics: [error instanceof Error ? error.message : String(error)] };
+      return { ok: false, diagnostics: [error instanceof Error ? error.message : String(error)], state: "fetched" };
     }
   }
 
@@ -470,24 +513,46 @@ export class Reveries {
     return check;
   }
 
-  async doctor(): Promise<CheckResult> {
+  async postCommitCheck(): Promise<CheckResult> {
+    const initialization = await this.findInitialization();
+    if (initialization === null) return { ok: true, diagnostics: [] };
+    const descendant = await this.repository.run(
+      ["merge-base", "--is-ancestor", initialization.commit, "HEAD"],
+      { allowExitCodes: [0, 1] },
+    );
+    return descendant.exitCode === 0 ? this.checkCommit("HEAD") : { ok: true, diagnostics: [] };
+  }
+
+  async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
+    const notices: string[] = [];
     let agents = "";
     try {
       agents = await readFile(join(this.repository.root, "AGENTS.md"), "utf8");
     } catch {
       diagnostics.push("AGENTS.md is unavailable");
     }
-    if (!agents.includes("<!-- reveries:begin -->")) diagnostics.push("AGENTS.md Reveries marker is missing");
+    if (!agents.includes("<!-- reveries:begin -->") || !agents.includes("<!-- reveries:end -->")) {
+      diagnostics.push("AGENTS.md Reveries marker is missing or incomplete");
+    }
     const strategy = await this.repository.run(
       ["config", "--get", "notes.reveries.mergeStrategy"],
       { allowExitCodes: [0, 1] },
     );
     if (strategy.stdout.trim() !== "cat_sort_uniq") diagnostics.push("notes.reveries.mergeStrategy is not cat_sort_uniq");
     const initialization = await this.findInitialization();
-    if (initialization === null) diagnostics.push("Reveries initialization boundary is missing");
-    else {
-      for (const remote of initialization.record.publishing_remotes) {
+    const configuredRemotes = initialization === null
+      ? (await this.repository.run(["config", "--get-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1] }))
+          .stdout.trim().split("\n").filter(Boolean)
+      : initialization.record.publishing_remotes;
+    if (initialization === null) {
+      notices.push("Reveries is prepared; the adoption boundary has not been committed and annotated yet");
+      const localOnly = await this.repository.run(["config", "--get", "reveries.localOnly"], { allowExitCodes: [0, 1] });
+      if (configuredRemotes.length === 0 && localOnly.stdout.trim() !== "true") {
+        diagnostics.push("Prepared publishing choice is missing");
+      }
+    }
+    for (const remote of configuredRemotes) {
         const fetch = await this.repository.run(
           ["config", "--get-all", `remote.${remote}.fetch`],
           { allowExitCodes: [0, 1] },
@@ -496,7 +561,7 @@ export class Reveries {
           ["config", "--get-all", `remote.${remote}.push`],
           { allowExitCodes: [0, 1] },
         );
-        if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries`)) {
+        if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries*`)) {
           diagnostics.push(`Publishing remote ${remote} lacks the Reveries fetch refspec`);
         }
         if (!push.stdout.includes("refs/notes/reveries:refs/notes/reveries")) {
@@ -511,16 +576,39 @@ export class Reveries {
           );
           if (incorporated.exitCode !== 0) diagnostics.push(`Remote ${remote} notes have not been incorporated`);
         }
-      }
     }
     const commonDirectory = await this.repository.commonDirectory();
-    for (const name of ["pre-push", "post-commit"]) {
+    const helperCommand = await this.repository.run(["config", "--get", "reveries.helperCommand"], { allowExitCodes: [0, 1] });
+    const helperArgs = await this.repository.run(["config", "--get-all", "reveries.helperArg"], { allowExitCodes: [0, 1] });
+    const helperVerification = await this.repository.run(["config", "--get", "reveries.helperVerification"], { allowExitCodes: [0, 1] });
+    const expectedFingerprint = await this.repository.run(["config", "--get", "reveries.helperFingerprint"], { allowExitCodes: [0, 1] });
+    const verification = helperVerification.stdout.trim();
+    const helper = helperCommand.exitCode === 0
+      ? {
+          command: helperCommand.stdout.trim(),
+          args: helperArgs.exitCode === 0 ? helperArgs.stdout.trimEnd().split("\n") : [],
+          verification: verification === "self" ? "self" as const : "probe" as const,
+        }
+      : undefined;
+    const requiredHooks = configuredRemotes.length === 0
+      ? ["post-commit"] as const
+      : ["pre-push", "post-commit"] as const;
+    for (const name of requiredHooks) {
       try {
         const hook = await readFile(join(commonDirectory, "hooks", name), "utf8");
-        if (!hook.includes("reveries:begin")) diagnostics.push(`${name} enforcement is partial`);
+        const expected = helper === undefined
+          ? null
+          : `# reveries:begin\nexec ${hookInvocation(helper, name)}\n# reveries:end`;
+        if (expected === null || !hook.includes(expected)) diagnostics.push(`${name} enforcement is partial`);
       } catch {
         diagnostics.push(`${name} hook is missing`);
       }
+    }
+    const actualFingerprint = await helperInvocationFingerprint(helper);
+    if (!await helperInvocationAvailable(helper)
+      || expectedFingerprint.exitCode !== 0
+      || actualFingerprint !== expectedFingerprint.stdout.trim()) {
+      diagnostics.push("The configured Reveries hook runner is unavailable or changed");
     }
     try {
       await access(join(commonDirectory, "NOTES_MERGE_PARTIAL"));
@@ -533,7 +621,12 @@ export class Reveries {
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
-    return { ok: diagnostics.length === 0, diagnostics };
+    return {
+      ok: diagnostics.length === 0,
+      diagnostics,
+      notices,
+      state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
+    };
   }
 
   private async appendRecord(object: ObjectId, record: ReverieRecord): Promise<void> {

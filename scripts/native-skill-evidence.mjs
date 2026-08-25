@@ -208,7 +208,12 @@ async function verify() {
   const init = evidence.cases?.init?.output;
   assert(init?.selected_skill === "reveries-git-notes-init", "explicit initialization did not select the init Skill");
   assert(init.mutation_before_answers === false, "initialization would mutate before user choices");
-  assert(JSON.stringify(init.setup_modes) === JSON.stringify(["Reminder only", "Pull when missing", "Vendored Skill"]), "initialization did not offer all Skill setup modes");
+  assert(JSON.stringify(init.setup_modes) === JSON.stringify([
+    "Reminder only",
+    "Pull when missing",
+    "Vendored Skills",
+    "Linked project Skills",
+  ]), "initialization did not offer all Skill setup modes");
   assert(init.required_user_choices?.length === 4, "initialization did not ask all four required user choices");
 
   const ordinary = evidence.cases?.ordinary?.output;

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.2 - 2026-08-25
+
+- Make initialization choices explicit, including local-only, no-host, and no-directive-email
+  setups.
+- Add reminder, pull, vendored, and linked project Skill delivery with tracked ownership and
+  collision-safe removal.
+- Bind adoption to an immutable plan and exact commit, preserving unrelated staged work and
+  attaching both required records atomically.
+- Keep ordinary fetches working before the remote notes ref exists, validate hook runners and
+  owned hook bodies, and keep pre-adoption hooks quiet.
+- Add Pi 0.84.1 Skill-routing evidence and expanded setup, concurrency, recovery, and installer
+  acceptance coverage.
+
 ## 1.0.1 - 2026-08-25
 
 - Write canonical JSONL notes through a portable read-concatenate-replace transaction so the

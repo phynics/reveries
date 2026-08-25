@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import {
+  commitAdoption,
   initializeRepository,
   removeIntegration,
+  type HelperInvocation,
   type SkillSetup,
   type SupportedHost,
 } from "./install.ts";
@@ -35,6 +38,7 @@ export interface CliIo {
   readonly stdin: () => Promise<string>;
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
+  readonly helper?: HelperInvocation;
 }
 
 interface ParsedArguments {
@@ -55,10 +59,12 @@ const RELATIONS = new Set<SourceRelation>([
 ]);
 const KINDS = new Set<SourceKind>(["commit", "blob", "path", "note", "git-email", "issue"]);
 const HOSTS = new Set<SupportedHost>(["pi", "claude", "opencode", "codex", "gemini"]);
+const VERSION = "1.0.2";
 const HELP = `reveries <command>
 
 Commands:
   init       Prepare project instructions, Git configuration, and hooks
+  adopt      Verify the prepared files and create the adoption commit
   doctor     Diagnose the local installation and notes state
   show       Show notes for a path, blob, or commit
   record     Create, continue, or supersede a blob reverie
@@ -71,13 +77,15 @@ Commands:
   hook       Handle one host-neutral adapter event from standard input
   remove     Remove owned integration without deleting evidence
 
-Init requires --skill-setup reminder|pull|vendored. Pull setup also requires
---skill-repository with an HTTPS GitHub repository URL.
+Init requires an explicit choice for hosts, publishing, directive email, and
+--skill-setup reminder|pull|vendored|symlink. Pull requires --skill-repository.
+Vendored and symlink setups require --skill-source.
 
 Use --json on inspection and check commands for stable machine output.
 `;
 
 function defaultIo(): CliIo {
+  const script = process.argv[1];
   return {
     cwd: process.cwd(),
     stdin: async () => {
@@ -89,6 +97,9 @@ function defaultIo(): CliIo {
     },
     stdout: (text) => process.stdout.write(text),
     stderr: (text) => process.stderr.write(text),
+    ...(script === undefined ? {} : {
+      helper: { command: process.execPath, args: [resolve(script)], verification: "self" as const },
+    }),
   };
 }
 
@@ -233,8 +244,21 @@ async function parseReverieDraft(path: string): Promise<{
 async function parseProtocolRecord(path: string, type: "session-summary"): Promise<SessionSummary>;
 async function parseProtocolRecord(path: string, type: "reveries-init"): Promise<ReveriesInit>;
 async function parseProtocolRecord(path: string, type: "session-summary" | "reveries-init"): Promise<SessionSummary | ReveriesInit> {
-  const value = expectObject(await readJson(path), type);
-  if (value.type !== type) throw new UsageError(`${path} must contain a ${type} record`);
+  const value = await readJson(path);
+  return type === "session-summary"
+    ? parseProtocolRecordValue(value, "session-summary", path)
+    : parseProtocolRecordValue(value, "reveries-init", path);
+}
+
+function parseProtocolRecordValue(value: unknown, type: "session-summary", label: string): SessionSummary;
+function parseProtocolRecordValue(value: unknown, type: "reveries-init", label: string): ReveriesInit;
+function parseProtocolRecordValue(
+  raw: unknown,
+  type: "session-summary" | "reveries-init",
+  label: string,
+): SessionSummary | ReveriesInit {
+  const value = expectObject(raw, type);
+  if (value.type !== type) throw new UsageError(`${label} must contain a ${type} record`);
   const candidate = value as NoteRecord;
   if (type === "session-summary") validateNote([candidate], { verifyIds: false });
   else {
@@ -266,15 +290,35 @@ function splitList(values: readonly string[]): string[] {
 function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
   const kind = one(parsed, "--skill-setup", true);
   const repository = one(parsed, "--skill-repository");
-  if (kind === "reminder" || kind === "vendored") {
-    if (repository !== undefined) throw new UsageError("--skill-repository requires --skill-setup pull");
+  const sourceRoot = one(parsed, "--skill-source");
+  if (kind === "reminder") {
+    if (repository !== undefined || sourceRoot !== undefined) {
+      throw new UsageError("--skill-repository and --skill-source do not apply to reminder setup");
+    }
     return { kind };
   }
   if (kind === "pull") {
     if (repository === undefined) throw new UsageError("--skill-setup pull requires --skill-repository");
+    if (sourceRoot !== undefined) throw new UsageError("--skill-source does not apply to pull setup");
     return { kind, repository };
   }
-  throw new UsageError("--skill-setup must be reminder, pull, or vendored");
+  if (kind === "vendored" || kind === "symlink") {
+    if (sourceRoot === undefined) throw new UsageError(`--skill-setup ${kind} requires --skill-source`);
+    if (repository !== undefined) throw new UsageError("--skill-repository applies only to pull setup");
+    return { kind, sourceRoot };
+  }
+  throw new UsageError("--skill-setup must be reminder, pull, vendored, or symlink");
+}
+
+function explicitList(
+  parsed: ParsedArguments,
+  value: "--hosts" | "--remote",
+  emptyFlag: "--no-hosts" | "--no-publish",
+): string[] {
+  const hasValues = parsed.values.has(value);
+  const hasEmpty = parsed.flags.has(emptyFlag);
+  if (hasValues === hasEmpty) throw new UsageError(`choose exactly one of ${value} or ${emptyFlag}`);
+  return hasEmpty ? [] : splitList(parsed.values.get(value) ?? []);
 }
 
 export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): Promise<ExitCode> {
@@ -282,9 +326,13 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
   const command = argv[0];
   try {
     if (command === undefined) throw new UsageError("a command is required");
-    const reveries = command === "init" || command === "remove" || command === "hook" || command === "help" || command === "--help"
+    const reveries = command === "init" || command === "adopt" || command === "remove" || command === "hook" || command === "help" || command === "--help" || command === "--version"
       ? null
       : await Reveries.open(io.cwd);
+    if (command === "--version") {
+      io.stdout(`reveries ${VERSION}\n`);
+      return 0;
+    }
     if (command === "help" || command === "--help") {
       io.stdout(HELP);
       return 0;
@@ -292,25 +340,53 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     if (command === "init") {
       const parsed = parseArguments(
         argv.slice(1),
-        ["--hosts", "--remote", "--directive-email", "--skill-setup", "--skill-repository"],
-        ["--json"],
+        ["--hosts", "--remote", "--directive-email", "--skill-setup", "--skill-repository", "--skill-source"],
+        ["--json", "--no-hosts", "--no-publish", "--no-directive-email"],
       );
-      const hosts = splitList(parsed.values.get("--hosts") ?? []);
+      const hosts = explicitList(parsed, "--hosts", "--no-hosts");
       if (!hosts.every((host) => HOSTS.has(host as SupportedHost))) throw new UsageError("--hosts contains an unsupported host");
+      const publishingRemotes = explicitList(parsed, "--remote", "--no-publish");
+      const email = one(parsed, "--directive-email");
+      const noEmail = parsed.flags.has("--no-directive-email");
+      if ((email !== undefined) === noEmail) {
+        throw new UsageError("choose exactly one of --directive-email or --no-directive-email");
+      }
       const result = await initializeRepository(io.cwd, {
         hosts: hosts as SupportedHost[],
-        publishingRemotes: splitList(parsed.values.get("--remote") ?? []),
-        directiveEmail: one(parsed, "--directive-email", true) ?? "",
+        publishingRemotes,
+        directiveEmail: noEmail ? null : email ?? null,
         skillSetup: parseSkillSetup(parsed),
+        ...(io.helper === undefined ? {} : { helper: io.helper }),
       });
       emit(io, json, command, result);
       return 0;
     }
+    if (command === "adopt") {
+      const parsed = parseArguments(argv.slice(1), ["--plan", "--message"], ["--json"]);
+      const plan = resolve(io.cwd, one(parsed, "--plan", true) ?? "");
+      const committed = await commitAdoption(
+        io.cwd,
+        plan,
+        one(parsed, "--message", true) ?? "",
+      );
+      const adoption = await Reveries.open(io.cwd);
+      await adoption.attachAdoption({
+        commit: committed.commit,
+        summary: parseProtocolRecordValue(JSON.parse(committed.sessionSummary), "session-summary", "adoption summary"),
+        initialization: parseProtocolRecordValue(JSON.parse(committed.initialization), "reveries-init", "adoption initialization"),
+      });
+      await adoption.repository.run(["config", "--unset-all", "reveries.adoptionPlan"], { allowExitCodes: [0, 1, 5] });
+      await adoption.repository.run(["config", "--unset-all", "reveries.adoptionPlanHash"], { allowExitCodes: [0, 1, 5] });
+      emit(io, json, command, { commit: committed.commit });
+      return 0;
+    }
     if (command === "remove") {
       const parsed = parseArguments(argv.slice(1), ["--remote"], ["--json"]);
-      await removeIntegration(io.cwd, { publishingRemotes: splitList(parsed.values.get("--remote") ?? []) });
-      emit(io, json, command, { removed: true, evidencePreserved: true });
-      return 0;
+      const result = await removeIntegration(io.cwd, { publishingRemotes: splitList(parsed.values.get("--remote") ?? []) });
+      emit(io, json, command, result, result.preservedSkillPaths.map(
+        (path) => `Owned Skill path was preserved for manual review: ${path}`,
+      ));
+      return result.removed ? 0 : 1;
     }
     if (command === "hook") {
       const eventName = argv[1];
@@ -467,7 +543,7 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       return result.ok ? 0 : 1;
     }
     if (command === "post-commit") {
-      const result = await reveries.checkCommit("HEAD");
+      const result = await reveries.postCommitCheck();
       emit(io, false, command, undefined, result.diagnostics);
       return 0;
     }

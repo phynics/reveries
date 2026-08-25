@@ -51,7 +51,7 @@ node scripts/native-skill-evidence.mjs --capture
 The checked-in evidence is valid only while those Skill digests match. The normal verifier rejects
 stale evidence. Recapture requires Pi and model access; verification does not.
 
-## V1.0.1 result
+## V1.0.2 result
 
 The strict evaluation on 2026-08-25 produced:
 
@@ -70,7 +70,7 @@ that evidence does not imply its automatic read/edit adapter passed the 20-case 
 
 ## Remaining compatibility boundary
 
-V1.0.1 does not claim:
+V1.0.2 does not claim:
 
 - automatic delivery against any named host version;
 - native Skill routing on Claude Code, OpenCode, Codex, or Gemini CLI;

@@ -344,12 +344,14 @@ export class GitRepository {
     }
   }
 
-  async fetchNotes(remote: string): Promise<void> {
+  async fetchNotes(remote: string): Promise<"fetched" | "absent"> {
+    if (await this.remoteObject(remote, NOTES_REF) === null) return "absent";
     await this.run([
       "fetch",
       remote,
       `+${NOTES_REF}:refs/notes/remotes/${remote}/reveries`,
     ]);
+    return "fetched";
   }
 
   async mergeFetchedNotes(remote: string): Promise<void> {

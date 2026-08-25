@@ -9,10 +9,12 @@ For each remote explicitly approved for publication:
 ```bash
 git config notes.reveries.mergeStrategy cat_sort_uniq
 git config --add remote.origin.fetch \
-  '+refs/notes/reveries:refs/notes/remotes/origin/reveries'
+  '+refs/notes/reveries*:refs/notes/remotes/origin/reveries*'
 ```
 
-The fetched ref is remote-tracking state. Fetch does not merge it into the writable local ref.
+The wildcard makes a normal fetch succeed before the remote publishes its first Reveries ref.
+The canonical remote-tracking ref remains `refs/notes/remotes/origin/reveries`. Fetch does not
+merge it into the writable local ref.
 
 ```bash
 git fetch origin
@@ -23,6 +25,9 @@ git notes --ref=refs/notes/reveries merge -s cat_sort_uniq \
 Run strict validation and semantic conflict analysis after this byte-level merge.
 
 ## Push setup
+
+For local-only setup, add no remote refspecs and install no Reveries pre-push hook. The
+post-commit reminder may remain active.
 
 With the user’s approval, add both intended push refspecs:
 
@@ -47,6 +52,10 @@ Never overwrite an unknown hook.
 - No hook: install the Reveries hook.
 - Recognized dispatcher or hook manager: register `reveries pre-push` through it.
 - Unknown hook: leave it intact and report `PUSH ENFORCEMENT PARTIAL`.
+
+Resolve and verify the helper executable before installing either hook. Render the verified
+command into the owned hook block. If no executable is available, install no broken hook,
+report partial enforcement, and return the composition snippets.
 
 A pre-push check is local enforcement and can be bypassed with `--no-verify`. It checks outgoing
 summary coverage, continuity, notes state, remote-note incorporation, semantic conflicts, and that

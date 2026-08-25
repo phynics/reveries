@@ -23,8 +23,10 @@ server-side enforcement.
 ## Quick start
 
 Install the Skills, then explicitly initialize a repository with
-`reveries-git-notes-init`. Initialization asks which remotes publish the notes and which hosts to
-configure. It does not create the adoption commit or push.
+`reveries-git-notes-init`. Initialization asks how agents obtain the Skills, which hosts to
+configure, which remotes publish the notes, and which email identifies material directives.
+Local-only setup, no host adapters, and no directive email are valid choices. The initializer
+does not create the adoption commit or push.
 
 ```bash
 npx skills add https://github.com/phynics/reveries --global \
@@ -34,9 +36,10 @@ npx skills add https://github.com/phynics/reveries --global \
   --skill reveries-git-notes-search
 ```
 
-The initializer asks how future agents should obtain `using-reveries`: rely on an existing
-installation, pull it from this repository when missing, or commit a vendored copy with the
-project. The Skills and direct Git fallback do not require the helper.
+The initializer asks how future agents should obtain the Reveries Skills: rely on an existing
+installation, pull them from an approved repository, commit pinned copies, or expose tracked
+project Skills through relative symlinks. The Skills and direct Git fallback do not require the
+helper.
 
 Build and run the helper from this repository:
 
@@ -55,7 +58,7 @@ npm run verify
 The [local evaluation guide](EVALUATION.md) explains the executable matrix, recorded Pi evidence,
 and the boundary of the automatic-delivery claim.
 
-The helper implements `init`, `doctor`, `show`, `record`, `summarize`, `check`, `search`,
+The helper implements `init`, `adopt`, `doctor`, `show`, `record`, `summarize`, `check`, `search`,
 `history`, `sync`, `push`, and the hook entrypoints. Inspection and check commands accept
 `--json` for stable machine output.
 
@@ -105,7 +108,7 @@ It does not claim an automatic read/edit adapter has passed a host-version confo
 
 ## Status
 
-Reveries V1.0.1 implements the protocol, Git core, CLI, Skills, host-neutral hook contract, and
+Reveries V1.0.2 implements the protocol, Git core, CLI, Skills, host-neutral hook contract, and
 conservative host adapters. The release gate covers 46 claimed acceptance criteria; automatic
 delivery remains explicitly unclaimed. Every host stays at `CORE` until a named host version
 passes the native automatic-delivery conformance suite.
