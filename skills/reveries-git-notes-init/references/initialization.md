@@ -34,6 +34,10 @@ Offer exactly these choices. Do not choose one for the user.
 4. **Linked project Skills.** Add the reminder and create project-local relative symlinks under
    `.agents/skills` to all three Skills in a tracked source root. Use this for a repository that
    develops or already tracks the Skills. Pass that root with `--skill-source`.
+5. **Git submodule.** Add the full approved repository as the pinned submodule
+   `.agents/reveries`. The submodule delivers all three Skills under
+   `.agents/reveries/skills`; pass the repository URL with `--skill-repository`.
+   Generated instructions initialize the recorded commit only when the checkout is missing.
 
 For the vendored choice, verify that each destination matches its source Skill. Add every
 vendored path to the initializer's tracked-file plan. Updates arrive as reviewed repository
@@ -44,6 +48,10 @@ replace one. Record linked or vendored ownership in the tracked `.agents/skills`
 so a later clone can remove only paths created by Reveries. Preserve that metadata when a path
 has drifted and needs manual review. A repeated vendored or linked setup must converge without
 changing files. For linked Skills, require every file in each source Skill subtree to be tracked.
+
+Adding a submodule stages `.gitmodules` and the gitlink as part of the prepared adoption change.
+Do not advance it automatically with `--remote`; update it later through a reviewed gitlink
+change. An existing matching submodule is reused without being claimed for removal.
 
 ## Owned instruction block
 

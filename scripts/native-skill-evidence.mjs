@@ -213,6 +213,7 @@ async function verify() {
     "Pull when missing",
     "Vendored Skills",
     "Linked project Skills",
+    "Git submodule",
   ]), "initialization did not offer all Skill setup modes");
   assert(init.required_user_choices?.length === 4, "initialization did not ask all four required user choices");
 

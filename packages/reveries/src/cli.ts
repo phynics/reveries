@@ -78,7 +78,8 @@ Commands:
   remove     Remove owned integration without deleting evidence
 
 Init requires an explicit choice for hosts, publishing, directive email, and
---skill-setup reminder|pull|vendored|symlink. Pull requires --skill-repository.
+--skill-setup reminder|pull|vendored|symlink|submodule. Pull and submodule
+require --skill-repository.
 Vendored and symlink setups require --skill-source.
 
 Use --json on inspection and check commands for stable machine output.
@@ -302,12 +303,17 @@ function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
     if (sourceRoot !== undefined) throw new UsageError("--skill-source does not apply to pull setup");
     return { kind, repository };
   }
+  if (kind === "submodule") {
+    if (repository === undefined) throw new UsageError("--skill-setup submodule requires --skill-repository");
+    if (sourceRoot !== undefined) throw new UsageError("--skill-source does not apply to submodule setup");
+    return { kind, repository };
+  }
   if (kind === "vendored" || kind === "symlink") {
     if (sourceRoot === undefined) throw new UsageError(`--skill-setup ${kind} requires --skill-source`);
-    if (repository !== undefined) throw new UsageError("--skill-repository applies only to pull setup");
+    if (repository !== undefined) throw new UsageError("--skill-repository applies only to pull or submodule setup");
     return { kind, sourceRoot };
   }
-  throw new UsageError("--skill-setup must be reminder, pull, vendored, or symlink");
+  throw new UsageError("--skill-setup must be reminder, pull, vendored, symlink, or submodule");
 }
 
 function explicitList(

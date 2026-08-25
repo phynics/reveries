@@ -37,9 +37,11 @@ npx skills add https://github.com/phynics/reveries --global \
 ```
 
 The initializer asks how future agents should obtain the Reveries Skills: rely on an existing
-installation, pull them from an approved repository, commit pinned copies, or expose tracked
-project Skills through relative symlinks. The Skills and direct Git fallback do not require the
-helper.
+installation, pull them from an approved repository, commit pinned copies, expose tracked
+project Skills through relative symlinks, or add the full Reveries repository as a pinned Git
+submodule at `.agents/reveries`. Submodules keep reviewed revisions reproducible, but require
+the usual Git submodule checkout step on fresh clones. The Skills and direct Git fallback do not
+require the helper.
 
 Build and run the helper from this repository:
 

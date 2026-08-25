@@ -11,6 +11,7 @@ import { Reveries } from "../src/operations.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
+let previousGlobalConfig: string | undefined;
 const helper = {
   command: "/bin/sh",
   args: ["-c", "if [ \"$1\" = --version ]; then echo 'reveries 1.0.1'; fi", "reveries-test-helper"],
@@ -44,7 +45,34 @@ async function createSkillSource(directory: string): Promise<void> {
   await git(directory, "commit", "-m", "add skill sources");
 }
 
+async function createSkillRepository(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "reveries-skills-"));
+  temporaryRepositories.push(directory);
+  await git(directory, "init", "-b", "main");
+  await git(directory, "config", "user.name", "Reveries Skills Test");
+  await git(directory, "config", "user.email", "reveries-skills@example.com");
+  for (const name of ["using-reveries", "reveries-git-notes-search", "reveries-git-notes-init"]) {
+    await mkdir(join(directory, "skills", name), { recursive: true });
+    await writeFile(join(directory, "skills", name, "SKILL.md"), `---\nname: ${name}\n---\n`, "utf8");
+  }
+  await git(directory, "add", "skills");
+  await git(directory, "commit", "-m", "add skill sources");
+  return directory;
+}
+
+async function configureLocalSubmoduleSource(directory: string, source: string): Promise<void> {
+  previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+  const configPath = join(directory, ".git", "reveries-test-global-config");
+  await writeFile(configPath, "", "utf8");
+  process.env.GIT_CONFIG_GLOBAL = configPath;
+  await git(directory, "config", "--global", "protocol.file.allow", "always");
+  await git(directory, "config", "--global", `url.file://${source}.insteadOf`, "https://github.com/phynics/reveries");
+}
+
 afterEach(async () => {
+  if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+  else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+  previousGlobalConfig = undefined;
   await Promise.all(temporaryRepositories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
@@ -173,6 +201,41 @@ test("initialization can link project-local tracked Skills without calling them 
   assert.equal(await readlink(join(directory, ".agents", "skills", "using-reveries")), "../../skills/using-reveries");
   assert.ok(result.adoptionFiles.includes(".agents/skills/using-reveries"));
   assert.doesNotMatch(result.nextCommands.join("\n"), /reveries push/);
+});
+
+test("initialization can deliver the Skills through a pinned Git submodule", async () => {
+  const directory = await createRepository();
+  const source = await createSkillRepository();
+  await configureLocalSubmoduleSource(directory, source);
+
+  const options = {
+    hosts: ["codex"] as const,
+    publishingRemotes: ["origin"],
+    directiveEmail: "user@example.com",
+    skillSetup: { kind: "submodule", repository: "https://github.com/phynics/reveries" } as const,
+    helper,
+  };
+  const first = await initializeRepository(directory, options);
+  const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
+  assert.match(agents, /git submodule update --init --recursive -- \.agents\/reveries/);
+  assert.match(agents, /\.agents\/reveries\/skills\/using-reveries\/SKILL\.md/);
+  assert.match(await readFile(join(directory, ".agents", "reveries", "skills", "using-reveries", "SKILL.md"), "utf8"), /using-reveries/);
+  assert.match(await git(directory, "ls-files", "--stage", "--", ".agents/reveries"), /^160000 /m);
+  assert.equal(await git(directory, "config", "-f", ".gitmodules", "--get", "submodule.reveries-skills.path"), ".agents/reveries");
+  assert.ok(first.adoptionFiles.includes(".gitmodules"));
+  assert.ok(first.adoptionFiles.includes(".agents/reveries"));
+  await commitAdoption(directory, first.templatePaths.plan, "Adopt Reveries Skills");
+
+  const second = await initializeRepository(directory, options);
+  assert.deepEqual(second.changedFiles, []);
+  await git(directory, "submodule", "deinit", "--force", "--", ".agents/reveries");
+  await assert.rejects(readFile(join(directory, ".agents", "reveries", "skills", "using-reveries", "SKILL.md"), "utf8"), { code: "ENOENT" });
+  await git(directory, "submodule", "update", "--init", "--recursive", "--", ".agents/reveries");
+  assert.match(await readFile(join(directory, ".agents", "reveries", "skills", "using-reveries", "SKILL.md"), "utf8"), /using-reveries/);
+
+  await removeIntegration(directory, { publishingRemotes: ["origin"] });
+  await assert.rejects(readFile(join(directory, ".agents", "reveries"), "utf8"), { code: "ENOENT" });
+  await assert.rejects(readFile(join(directory, ".gitmodules"), "utf8"), { code: "ENOENT" });
 });
 
 test("linked Skills refuse an untracked referenced file", async () => {

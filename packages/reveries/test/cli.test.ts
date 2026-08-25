@@ -154,6 +154,16 @@ test("init requires a complete Skill setup choice", async () => {
     "--skill-setup", "pull",
   ], incompletePull.io), 3);
   assert.match(incompletePull.stderr(), /skill-repository/i);
+
+  const incompleteSubmodule = captureIo(directory);
+  assert.equal(await runCli([
+    "init",
+    "--hosts", "codex",
+    "--remote", "origin",
+    "--directive-email", "user@example.com",
+    "--skill-setup", "submodule",
+  ], incompleteSubmodule.io), 3);
+  assert.match(incompleteSubmodule.stderr(), /skill-repository/i);
 });
 
 test("init requires an explicit directive-email choice", async () => {

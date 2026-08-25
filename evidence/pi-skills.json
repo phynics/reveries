@@ -10,7 +10,7 @@
     "model": "gpt-5.4-mini"
   },
   "skill_sha256": {
-    "reveries-git-notes-init": "4b4ff4b291ad8676f64136f0c1f42f09825b1901248ae6c303ae749a8e982d5b",
+    "reveries-git-notes-init": "62f68234be72c6606b144b6c2889960e734de29d98720cfbb9f97b1f0b62360c",
     "using-reveries": "675c0699e9893adb7b4af11480b55f5e42da61a79453cc9fd229292b60e6d9c2",
     "reveries-git-notes-search": "b106e79430c35aace1bfbc57c2d29015762e65257f0bf8193414209b1cd64274"
   },
@@ -23,7 +23,8 @@
           "Reminder only",
           "Pull when missing",
           "Vendored Skills",
-          "Linked project Skills"
+          "Linked project Skills",
+          "Git submodule"
         ],
         "required_user_choices": [
           "How should agents obtain the Reveries Skills?",

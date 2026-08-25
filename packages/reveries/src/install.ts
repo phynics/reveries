@@ -12,6 +12,8 @@ const END = "<!-- reveries:end -->";
 const HOOK_BEGIN = "# reveries:begin";
 const HOOK_END = "# reveries:end";
 const SKILL_NAMES = ["using-reveries", "reveries-git-notes-search", "reveries-git-notes-init"] as const;
+const SKILL_SUBMODULE_NAME = "reveries-skills";
+const SKILL_SUBMODULE_PATH = ".agents/reveries";
 const execFileAsync = promisify(execFile);
 
 const AGENTS_INTRO = `## Reveries
@@ -56,6 +58,19 @@ This repository exposes linked project Skills under \`.agents/skills\`. If the
 host did not load them, read \`.agents/skills/using-reveries/SKILL.md\` before
 continuing.`;
 
+function submoduleSetup(repository: string): string {
+  return `${REMINDER_SETUP}
+
+This repository pins the Reveries Skills in the Git submodule
+\`.agents/reveries\` from \`${repository}\`. If the submodule is absent or
+uninitialized, restore its recorded commit before continuing:
+
+    git submodule update --init --recursive -- .agents/reveries
+
+If the host did not load the Skill, read
+\`.agents/reveries/skills/using-reveries/SKILL.md\` before continuing.`;
+}
+
 function agentsBlock(skillSetup: SkillSetup): string {
   let setup: string;
   switch (skillSetup.kind) {
@@ -70,6 +85,9 @@ function agentsBlock(skillSetup: SkillSetup): string {
       break;
     case "symlink":
       setup = SYMLINK_SETUP;
+      break;
+    case "submodule":
+      setup = submoduleSetup(skillSetup.repository);
       break;
     default: {
       const exhaustive: never = skillSetup;
@@ -99,7 +117,8 @@ export type SkillSetup =
   | { readonly kind: "reminder" }
   | { readonly kind: "pull"; readonly repository: string }
   | { readonly kind: "vendored"; readonly sourceRoot: string }
-  | { readonly kind: "symlink"; readonly sourceRoot: string };
+  | { readonly kind: "symlink"; readonly sourceRoot: string }
+  | { readonly kind: "submodule"; readonly repository: string };
 
 export interface HelperInvocation {
   readonly command: string;
@@ -236,6 +255,7 @@ function validateSkillSetup(skillSetup: SkillSetup): void {
       }
       return;
     case "pull":
+    case "submodule":
       if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(skillSetup.repository)) {
         throw new Error("skillSetup.repository must be an HTTPS GitHub repository URL");
       }
@@ -444,6 +464,108 @@ async function preflightSkills(
   }
 }
 
+interface SubmoduleEntry {
+  readonly name: string;
+  readonly path: string;
+  readonly repository: string;
+}
+
+function canonicalRepositoryUrl(repository: string): string {
+  return repository.replace(/\.git$/, "");
+}
+
+async function submoduleEntries(repository: GitRepository): Promise<readonly SubmoduleEntry[]> {
+  const result = await repository.run(
+    ["config", "-f", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"],
+    { allowExitCodes: [0, 1, 5] },
+  );
+  if (result.exitCode !== 0) return [];
+  const entries: SubmoduleEntry[] = [];
+  for (const line of result.stdout.trimEnd().split("\n").filter(Boolean)) {
+    const separator = line.indexOf(" ");
+    if (separator < 0) throw new Error("The .gitmodules file contains a malformed submodule path");
+    const key = line.slice(0, separator);
+    const path = line.slice(separator + 1);
+    const prefix = "submodule.";
+    const suffix = ".path";
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) {
+      throw new Error("The .gitmodules file contains a malformed submodule path");
+    }
+    const name = key.slice(prefix.length, -suffix.length);
+    const url = await repository.run(
+      ["config", "-f", ".gitmodules", "--get", `submodule.${name}.url`],
+      { allowExitCodes: [0, 1, 5] },
+    );
+    if (url.exitCode !== 0 || url.stdout.trim().length === 0) {
+      throw new Error(`Submodule ${name} has no repository URL`);
+    }
+    entries.push({ name, path, repository: url.stdout.trim() });
+  }
+  return entries;
+}
+
+async function preflightSubmodule(repository: GitRepository, setup: Extract<SkillSetup, { readonly kind: "submodule" }>): Promise<void> {
+  const entries = await submoduleEntries(repository);
+  const byPath = entries.find((entry) => entry.path === SKILL_SUBMODULE_PATH);
+  const byName = entries.find((entry) => entry.name === SKILL_SUBMODULE_NAME);
+  if (byPath !== undefined && byPath.name !== SKILL_SUBMODULE_NAME) {
+    throw new Error(`The ${SKILL_SUBMODULE_PATH} path belongs to submodule ${byPath.name}`);
+  }
+  if (byName !== undefined && byName.path !== SKILL_SUBMODULE_PATH) {
+    throw new Error(`The ${SKILL_SUBMODULE_NAME} submodule is configured at ${byName.path}`);
+  }
+  if (byPath !== undefined) {
+    if (canonicalRepositoryUrl(byPath.repository) !== canonicalRepositoryUrl(setup.repository)) {
+      throw new Error(`The ${SKILL_SUBMODULE_PATH} submodule points to a different repository`);
+    }
+    return;
+  }
+  if (await pathKind(join(repository.root, SKILL_SUBMODULE_PATH)) !== "absent") {
+    throw new Error(`Refusing to replace existing path: ${SKILL_SUBMODULE_PATH}`);
+  }
+  const tracked = await repository.run(["ls-files", "--stage", "--", SKILL_SUBMODULE_PATH], { allowExitCodes: [0, 1] });
+  if (tracked.stdout.trim().length > 0) {
+    throw new Error(`The ${SKILL_SUBMODULE_PATH} path is already tracked but is not configured as the Reveries submodule`);
+  }
+  const gitmodulesStatus = await repository.run(["status", "--porcelain=v1", "--", ".gitmodules"], { allowExitCodes: [0, 1] });
+  if (gitmodulesStatus.stdout.trim().length > 0) {
+    throw new Error("Refusing to edit a modified .gitmodules file while adding Reveries Skills");
+  }
+}
+
+async function ensureSubmoduleSkills(repository: GitRepository): Promise<void> {
+  const sourceRoot = join(repository.root, SKILL_SUBMODULE_PATH, "skills");
+  for (const name of SKILL_NAMES) {
+    await access(join(sourceRoot, name, "SKILL.md"), constants.R_OK);
+  }
+}
+
+async function installSubmodule(
+  repository: GitRepository,
+  setup: Extract<SkillSetup, { readonly kind: "submodule" }>,
+): Promise<{ readonly changed: readonly string[]; readonly created: boolean }> {
+  const existing = (await submoduleEntries(repository)).find((entry) => entry.path === SKILL_SUBMODULE_PATH);
+  if (existing !== undefined) {
+    await repository.run(["submodule", "update", "--init", "--recursive", "--", SKILL_SUBMODULE_PATH]);
+    await ensureSubmoduleSkills(repository);
+    return { changed: [], created: false };
+  }
+  try {
+    await repository.run(["submodule", "add", "--name", SKILL_SUBMODULE_NAME, setup.repository, SKILL_SUBMODULE_PATH]);
+    await ensureSubmoduleSkills(repository);
+    return { changed: [".gitmodules", SKILL_SUBMODULE_PATH], created: true };
+  } catch (error: unknown) {
+    await repository.run(["submodule", "deinit", "--force", "--", SKILL_SUBMODULE_PATH], { allowExitCodes: [0, 1, 128] });
+    await repository.run(["rm", "--cached", "--ignore-unmatch", "--", SKILL_SUBMODULE_PATH], { allowExitCodes: [0, 1, 128] });
+    const entry = (await submoduleEntries(repository)).find((item) => item.path === SKILL_SUBMODULE_PATH);
+    if (entry !== undefined) {
+      await repository.run(["config", "-f", ".gitmodules", "--remove-section", `submodule.${entry.name}`], { allowExitCodes: [0, 1, 5] });
+      await repository.run(["add", "-A", "--", ".gitmodules"], { allowExitCodes: [0, 1] });
+    }
+    throw error;
+  }
+}
+
 async function directoryLeafPaths(path: string): Promise<readonly string[]> {
   const paths: string[] = [];
   for (const entry of await readdir(path, { withFileTypes: true })) {
@@ -459,26 +581,39 @@ interface SkillOwnership {
   readonly sourceRoot: string;
 }
 
+interface SubmoduleOwnership {
+  readonly kind: "submodule";
+  readonly path: string;
+  readonly repository: string;
+}
+
+type ReveriesSkillOwnership = SkillOwnership | SubmoduleOwnership;
+
 async function skillOwnershipPath(repository: GitRepository): Promise<string> {
   return join(repository.root, ".agents", "skills", ".reveries-owned.json");
 }
 
-async function readSkillOwnership(repository: GitRepository): Promise<SkillOwnership | null> {
+async function readSkillOwnership(repository: GitRepository): Promise<ReveriesSkillOwnership | null> {
   const content = await readOptional(await skillOwnershipPath(repository));
   if (content.length === 0) return null;
   const value = JSON.parse(content) as unknown;
-  if (typeof value !== "object" || value === null || !("kind" in value) || !("sourceRoot" in value)) {
+  if (typeof value !== "object" || value === null || !("kind" in value)) {
     throw new Error("The Reveries Skill ownership record is malformed");
   }
   const kind = value.kind;
-  const sourceRoot = value.sourceRoot;
-  if ((kind !== "vendored" && kind !== "symlink") || typeof sourceRoot !== "string") {
+  if (kind === "submodule") {
+    if (!("path" in value) || !("repository" in value) || typeof value.path !== "string" || typeof value.repository !== "string") {
+      throw new Error("The Reveries Skill ownership record is malformed");
+    }
+    return { kind, path: value.path, repository: value.repository };
+  }
+  if ((kind !== "vendored" && kind !== "symlink") || !("sourceRoot" in value) || typeof value.sourceRoot !== "string") {
     throw new Error("The Reveries Skill ownership record is malformed");
   }
-  return { kind, sourceRoot };
+  return { kind, sourceRoot: value.sourceRoot };
 }
 
-async function writeSkillOwnership(repository: GitRepository, ownership: SkillOwnership): Promise<boolean> {
+async function writeSkillOwnership(repository: GitRepository, ownership: ReveriesSkillOwnership): Promise<boolean> {
   const path = await skillOwnershipPath(repository);
   await mkdir(dirname(path), { recursive: true });
   const content = `${JSON.stringify(ownership)}\n`;
@@ -495,6 +630,35 @@ interface SkillRemovalResult {
 async function removeOwnedSkills(repository: GitRepository): Promise<SkillRemovalResult> {
   const ownership = await readSkillOwnership(repository);
   if (ownership === null) return { removed: [], preserved: [] };
+  if (ownership.kind === "submodule") {
+    if (ownership.path !== SKILL_SUBMODULE_PATH) {
+      return { removed: [], preserved: [ownership.path] };
+    }
+    const entry = (await submoduleEntries(repository)).find((item) => item.path === ownership.path);
+    if (entry === undefined || canonicalRepositoryUrl(entry.repository) !== canonicalRepositoryUrl(ownership.repository)) {
+      return { removed: [], preserved: [ownership.path] };
+    }
+    const submodulePath = join(repository.root, ownership.path);
+    if (await pathKind(submodulePath) === "directory") {
+      const status = await repository.run(["-C", ownership.path, "status", "--porcelain=v1", "--untracked-files=all"], { allowExitCodes: [0, 1, 128] });
+      if (status.exitCode !== 0 || status.stdout.trim().length > 0) {
+        return { removed: [], preserved: [ownership.path] };
+      }
+    }
+    await repository.run(["submodule", "deinit", "--force", "--", ownership.path], { allowExitCodes: [0, 1, 128] });
+    await repository.run(["rm", "-f", "--", ownership.path]);
+    const remaining = (await submoduleEntries(repository)).filter((item) => item.path !== ownership.path);
+    if (remaining.length === 0 && await pathKind(join(repository.root, ".gitmodules")) !== "absent") {
+      await rm(join(repository.root, ".gitmodules"), { force: true });
+      await repository.run(["add", "-A", "--", ".gitmodules"], { allowExitCodes: [0, 1] });
+    }
+    const ownershipPath = await skillOwnershipPath(repository);
+    await rm(ownershipPath, { force: true });
+    return {
+      removed: [ownership.path, ".gitmodules", relative(repository.root, ownershipPath)],
+      preserved: [],
+    };
+  }
   const sourceRoot = resolve(repository.root, ownership.sourceRoot);
   const removable: string[] = [];
   const preserved: string[] = [];
@@ -623,16 +787,22 @@ interface AdoptionPlan {
   readonly files: readonly AdoptionPlanFile[];
 }
 
-async function pathFingerprint(path: string): Promise<string> {
+async function pathFingerprint(path: string, repository?: GitRepository): Promise<string> {
   const kind = await pathKind(path);
   if (kind === "absent") return "absent";
   if (kind === "symlink") return `symlink:${createHash("sha256").update(await readlink(path)).digest("hex")}`;
   if (kind === "other") return `file:${createHash("sha256").update(await readFile(path)).digest("hex")}`;
+  if (repository !== undefined) {
+    const relativePath = relative(repository.root, path);
+    const staged = await repository.run(["ls-files", "--stage", "--", relativePath], { allowExitCodes: [0, 1] });
+    const mode = staged.stdout.trimStart().split(/\s+/, 1)[0];
+    if (mode === "160000") return `submodule:${staged.stdout.trimStart().split(/\s+/, 3)[1] ?? ""}`;
+  }
   const hash = createHash("sha256");
   for (const entry of (await readdir(path)).sort()) {
     hash.update(entry);
     hash.update("\0");
-    hash.update(await pathFingerprint(join(path, entry)));
+    hash.update(await pathFingerprint(join(path, entry), repository));
     hash.update("\0");
   }
   return `directory:${hash.digest("hex")}`;
@@ -653,7 +823,7 @@ async function writeAdoptionPlan(
     },
     files: await Promise.all(files.map(async (file) => ({
       path: file,
-      fingerprint: await pathFingerprint(join(repository.root, file)),
+      fingerprint: await pathFingerprint(join(repository.root, file), repository),
     }))),
   };
   await writeFile(path, `${JSON.stringify(plan, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
@@ -714,7 +884,7 @@ async function verifyAdoptionPlan(repository: GitRepository, planPath: string, p
     throw new Error("Adoption templates changed after initialization");
   }
   for (const file of plan.files) {
-    const actual = await pathFingerprint(join(repository.root, file.path));
+    const actual = await pathFingerprint(join(repository.root, file.path), repository);
     if (actual !== file.fingerprint) throw new Error(`Adoption file changed after initialization: ${file.path}`);
   }
 }
@@ -962,6 +1132,8 @@ async function initializeUnlocked(
   validateEmail(author.stdout.trim());
   if (options.skillSetup.kind === "vendored" || options.skillSetup.kind === "symlink") {
     await preflightSkills(repository, options.skillSetup);
+  } else if (options.skillSetup.kind === "submodule") {
+    await preflightSubmodule(repository, options.skillSetup);
   }
   const previousRemotes = await configValues(repository, "reveries.publishingRemote");
   for (const remote of new Set([...previousRemotes, ...existingRemotes])) {
@@ -1008,10 +1180,11 @@ async function initializeUnlocked(
     }
   }
 
+  const ownership = await readSkillOwnership(repository);
   if (options.skillSetup.kind === "vendored" || options.skillSetup.kind === "symlink") {
-    const ownership = await readSkillOwnership(repository);
     if (ownership !== null && (
-      ownership.kind !== options.skillSetup.kind || ownership.sourceRoot !== options.skillSetup.sourceRoot
+      ownership.kind !== options.skillSetup.kind
+      || ownership.sourceRoot !== options.skillSetup.sourceRoot
     )) {
       const removal = await removeOwnedSkills(repository);
       if (removal.preserved.length > 0) {
@@ -1030,6 +1203,35 @@ async function initializeUnlocked(
     }
     adoptionFiles.add(ownershipPath);
     for (const name of SKILL_NAMES) adoptionFiles.add(`.agents/skills/${name}`);
+  } else if (options.skillSetup.kind === "submodule") {
+    if (ownership !== null && (
+      ownership.kind !== "submodule"
+      || canonicalRepositoryUrl(ownership.repository) !== canonicalRepositoryUrl(options.skillSetup.repository)
+    )) {
+      const removal = await removeOwnedSkills(repository);
+      if (removal.preserved.length > 0) {
+        throw new Error(`Owned Skill paths changed and require manual review: ${removal.preserved.join(", ")}`);
+      }
+      for (const path of removal.removed) {
+        changedFiles.push(path);
+        adoptionFiles.add(path);
+      }
+    }
+    const installed = await installSubmodule(repository, options.skillSetup);
+    for (const path of installed.changed) {
+      changedFiles.push(path);
+      adoptionFiles.add(path);
+    }
+    if (installed.created) {
+      const ownershipPath = relative(repository.root, await skillOwnershipPath(repository));
+      if (await writeSkillOwnership(repository, {
+        kind: "submodule",
+        path: SKILL_SUBMODULE_PATH,
+        repository: options.skillSetup.repository,
+      })) changedFiles.push(ownershipPath);
+      adoptionFiles.add(ownershipPath);
+      adoptionFiles.add(SKILL_SUBMODULE_PATH);
+    }
   } else {
     const removal = await removeOwnedSkills(repository);
     if (removal.preserved.length > 0) {

@@ -1325,15 +1325,18 @@ Before publishing:
 
 The fuller writing discipline lives in `using-reveries`.
 
-During initialization, the user chooses how new agents obtain that Skill:
+During initialization, the user chooses how new agents obtain the Reveries Skills:
 
 * reminder only, for hosts where the Skill is already installed;
 * an `AGENTS.md` pull instruction that names an approved HTTPS GitHub repository;
 * reminder plus pinned project-local copies committed with the repository;
-* reminder plus project-local relative symlinks to tracked Skill directories.
+* reminder plus project-local relative symlinks to tracked Skill directories;
+* a pinned Git submodule at `.agents/reveries` containing the full Skills tree.
 
-The vendored and linked choices expose all three Reveries Skills under `.agents/skills`. Agent
-startup never downloads or updates a Skill silently.
+The vendored and linked choices expose all three Reveries Skills under `.agents/skills`. The
+submodule choice exposes them under `.agents/reveries/skills` and generates a command that
+initializes only the recorded gitlink commit. Agent startup never downloads or updates a Skill
+silently.
 
 ### 20.1 Host-specific instruction files
 
@@ -1750,7 +1753,8 @@ npx skills add https://github.com/phynics/reveries \
 The current `skills` CLI supports global and project installs, targeted agents, specific Skills, symlink-based installation, copy fallback, listing, updating, and removal. Its supported-agent catalog includes Claude Code, OpenCode, Codex, Pi, and Gemini CLI. ([GitHub][8])
 
 For a shared repository, initialization supports reminder-only setup, an explicit pull
-instruction in `AGENTS.md`, pinned vendored copies, or relative symlinks to tracked Skills. The
+instruction in `AGENTS.md`, pinned vendored copies, relative symlinks to tracked Skills, or a
+pinned Git submodule. The
 initializer asks the user to choose. It does not infer a source repository or download Skills
 during agent startup.
 
@@ -1809,7 +1813,13 @@ reveries init \
 
 The Skill should normally ask the user and map every answer to an explicit flag. The deliberate
 empty choices are `--no-hosts`, `--no-publish`, and `--no-directive-email`. Vendored and symlink
-setups require `--skill-source`.
+setups require `--skill-source`; pull and submodule setups require `--skill-repository`.
+
+Submodule delivery keeps a reviewed gitlink pin and avoids copied Skill drift. It also adds
+`.gitmodules`, a network-dependent first checkout, and a nested path that hosts may not discover
+automatically. The generated instruction therefore hydrates only the recorded commit and names
+the nested Skill path explicitly. Updates remain reviewed gitlink changes, never agent-startup
+remote advances.
 
 ### 27.2 `reveries adopt`
 
@@ -2232,8 +2242,8 @@ Rules:
    * healthy;
    * damaged;
    * older protocol.
-4. Ask how new agents obtain the Reveries Skills: reminder only, pull when missing, vendored, or
-   project-local symlinks.
+4. Ask how new agents obtain the Reveries Skills: reminder only, pull when missing, vendored,
+   project-local symlinks, or a pinned Git submodule.
 5. Ask which hosts to support.
 6. Ask which remote or remotes publish Reveries.
 7. Ask which Git email identifies user directives.

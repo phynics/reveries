@@ -11,8 +11,8 @@ and remains untouched by normal removal.
 1. Confirm the repository is a Git worktree and inspect the marker, notes ref, hooks,
    remotes, and current protocol state.
 2. Before running `reveries init`, ask four separate questions:
-   - How should agents obtain the Reveries Skills: reminder, pull, vendored copy, or
-     project-local symlinks?
+   - How should agents obtain the Reveries Skills: reminder, pull, vendored copy,
+     project-local symlinks, or a pinned Git submodule?
    - Which hosts should use the setup? "No host adapters" is valid.
    - Which remotes should publish Reveries? "Local only" is valid.
    - Which Git email identifies material user directives? "Leave unset" is valid.

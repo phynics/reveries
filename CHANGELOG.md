@@ -5,7 +5,7 @@
 - Make initialization choices explicit, including local-only, no-host, and no-directive-email
   setups.
 - Add reminder, pull, vendored, and linked project Skill delivery with tracked ownership and
-  collision-safe removal.
+  collision-safe removal, plus pinned Git-submodule delivery for the complete Skill set.
 - Bind adoption to an immutable plan and exact commit, preserving unrelated staged work and
   attaching both required records atomically.
 - Keep ordinary fetches working before the remote notes ref exists, validate hook runners and
