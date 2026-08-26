@@ -3,7 +3,7 @@
 ## Diagnose first
 
 Use `reveries doctor` when available. It should report worktree, marker, protocol, notes ref,
-selected remotes, fetch/push refspecs, merge strategy, hook composition, adapter grade,
+selected remotes, notes fetch refspecs, unsafe legacy push refspecs, merge strategy, hook composition, adapter grade,
 initialization boundary, notes divergence, and record damage.
 
 `prepared` is healthy before the adoption commit. It means the owned instructions,

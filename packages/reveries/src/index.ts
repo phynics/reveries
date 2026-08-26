@@ -1,5 +1,5 @@
 export * from "./protocol.ts";
-export { GitCommandError, GitRepository, NotesLockError } from "./git.ts";
+export { AtomicPushUnavailableError, GitCommandError, GitRepository, NotesLockError } from "./git.ts";
 export type {
   GitResult,
   NoteListEntry,

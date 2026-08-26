@@ -42,7 +42,8 @@ installation, pull them from an approved repository, commit pinned copies, expos
 project Skills through relative symlinks, or add the full Reveries repository as a pinned Git
 submodule at `.agents/reveries`. Submodules keep reviewed revisions reproducible, but require
 the usual Git submodule checkout step on fresh clones. The Skills and direct Git fallback do not
-require the helper.
+require the helper. After adoption, publish with `reveries push <remote>`. Do not use a generic
+multi-ref `git push`: only the helper verifies and requests an atomic branch-plus-notes update.
 
 Build and run the helper from this repository:
 
@@ -71,7 +72,7 @@ For day-to-day changes, use `using-reveries`:
 
 ```text
 inspect blob evidence → edit → stage → reconcile continuity → commit
-→ summarize the commit → strict check → synchronize → publish branch + notes
+→ summarize the commit → strict check → synchronize → `reveries push <remote>`
 ```
 
 For rationale questions, use `reveries-git-notes-search`. It is read-only and starts from the
@@ -89,6 +90,18 @@ git log -p refs/notes/reveries
 
 Use `git notes --ref=refs/notes/reveries` explicitly; Reveries never changes `core.notesRef`.
 The Skills include safe writing, synchronization, and recovery commands.
+
+When the helper is unavailable, the lower-grade evidence-first fallback is two separate pushes:
+
+```bash
+git push origin refs/notes/reveries:refs/notes/reveries
+git push origin HEAD
+```
+
+Push the notes first and push code only after the evidence succeeds. This ordering avoids publishing
+code before its evidence, but it is not atomic and cannot prevent a later code push from being made
+without the notes. Local hooks are useful accidental-bypass protection, not a security boundary;
+they can be skipped with `--no-verify`. Configure receive-side checks for a stronger boundary.
 
 ## Protocol documentation
 

@@ -1188,41 +1188,18 @@ It never silently selects `origin`.
 The user may choose local-only setup with no publishing remotes. In that state, initialization
 does not install pre-push publication enforcement or configure remote push refspecs.
 
-### 18.2 Ordinary push configuration
+### 18.2 Generic push is not a publication path
 
-For an approved publishing remote:
+Initialization configures only the notes fetch refspec. It deliberately does **not** configure
+`remote.<name>.push` entries: generic `git push` cannot request an atomic multi-ref transaction,
+and an explicit refspec can publish a branch while omitting `refs/notes/reveries`.
 
-```bash
-git config --add remote.origin.push HEAD
-git config --add remote.origin.push \
-  refs/notes/reveries:refs/notes/reveries
-```
-
-An argumentless:
-
-```bash
-git push origin
-```
-
-then uses those configured push refspecs.
-
-Explicit command-line refspecs take precedence, so:
-
-```bash
-git push origin main
-```
-
-can omit the notes ref. Git supports multiple configured push refspecs, and `--atomic` can update several refs in one remote transaction when the remote supports it. ([Git SCM][4])
+The local pre-push hook rejects a branch publication that omits the notes ref when the hook is
+installed, but that is accidental-bypass protection only. `--no-verify`, an unknown hook, or a
+different client can bypass it. Generic `git push <remote>` must therefore not be presented as a
+safe publication command.
 
 ### 18.3 Atomic publishing
-
-The strong publishing operation is:
-
-```bash
-git push --atomic origin \
-  HEAD \
-  refs/notes/reveries:refs/notes/reveries
-```
 
 The helper exposes:
 
@@ -1230,14 +1207,32 @@ The helper exposes:
 reveries push origin
 ```
 
-This is the recommended path for:
+Before the real push, the helper performs a no-write `git push --atomic --dry-run` capability
+probe. If the receiving end does not advertise atomic pushes, the helper fails closed without
+attempting either ref. The real operation then requests both refs with `--atomic`, so a rejected
+branch or notes update advances neither ref on a receiver that supports atomic transactions.
+
+This is the required path for:
 
 * releases;
 * shared integration branches;
 * CI publication;
 * high-consequence changes.
 
-### 18.4 Pre-push enforcement
+### 18.4 Evidence-first fallback
+
+If the helper cannot be used, a lower-grade fallback publishes evidence before code:
+
+```bash
+git push origin refs/notes/reveries:refs/notes/reveries
+git push origin HEAD
+```
+
+The second command must run only after the first succeeds. This avoids code-before-evidence but is
+not atomic: a later code push can still omit notes, and a failure between the two commands leaves
+the remote with evidence ahead of code. Use receive-side enforcement when this distinction matters.
+
+### 18.5 Pre-push enforcement
 
 A local pre-push hook checks:
 
@@ -1248,9 +1243,11 @@ A local pre-push hook checks:
 * the remote notes history has been incorporated;
 * no semantic decision conflict remains.
 
-A pre-push hook may approve or abort a push; it cannot add a missing refspec itself. Git hooks are local client controls and can be bypassed with `--no-verify`. ([Git SCM][5])
+A pre-push hook may approve or abort a push; it cannot add a missing refspec itself or enforce
+atomicity. Git hooks are local client controls and can be bypassed with `--no-verify`. They are not
+a security boundary. ([Git SCM][5])
 
-### 18.5 Hook composition
+### 18.6 Hook composition
 
 Initialization never silently overwrites an existing unknown hook.
 
@@ -1267,7 +1264,7 @@ The user receives a snippet that invokes:
 reveries pre-push
 ```
 
-### 18.6 Enforcement boundary
+### 18.7 Enforcement boundary
 
 V1 is client-enforced.
 
@@ -1605,7 +1602,7 @@ Responsibilities:
 * inspect optional helper and adapters;
 * edit owned instruction blocks;
 * configure notes merge behavior;
-* configure fetch and push refspecs;
+* configure notes fetch refspecs and remove unsafe managed push refspecs;
 * compose Git hooks;
 * prepare initialization commit;
 * run doctor;
@@ -1848,7 +1845,8 @@ Checks:
 * notes ref;
 * selected remotes;
 * fetch refspec;
-* push refspec;
+* unsafe legacy push refspecs;
+* helper, local-hook, and receive-side protection status;
 * notes merge strategy;
 * hook composition;
 * helper version;
@@ -2086,12 +2084,10 @@ git notes --ref=refs/notes/reveries \
   refs/notes/remotes/origin/reveries
 ```
 
-### Push branch and notes atomically
+### Publish branch and notes atomically
 
 ```bash
-git push --atomic origin \
-  HEAD \
-  refs/notes/reveries:refs/notes/reveries
+reveries push origin
 ```
 
 ### Inspect notes history
@@ -2263,7 +2259,7 @@ Rules:
     git config notes.reveries.mergeStrategy cat_sort_uniq
     ```
 13. Configure wildcard remote fetch refspecs that tolerate an unpublished notes ref.
-14. Configure approved default push refspecs.
+14. Configure approved notes fetch refspecs; do not configure generic push refspecs.
 15. Resolve the helper executable, then install or compose post-commit and pre-push hooks. If no
     executable is available, report partial enforcement and do not install a broken hook.
 16. Run doctor. Before the adoption record exists, report a healthy `prepared` state.

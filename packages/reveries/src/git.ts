@@ -39,6 +39,13 @@ export class NotesLockError extends Error {
   }
 }
 
+export class AtomicPushUnavailableError extends Error {
+  constructor(readonly remote: string) {
+    super(`Remote ${remote} does not support atomic pushes; refusing to publish code and Reveries notes`);
+    this.name = "AtomicPushUnavailableError";
+  }
+}
+
 export interface NoteListEntry {
   readonly note: ObjectId;
   readonly object: ObjectId;
@@ -439,6 +446,22 @@ export class GitRepository {
   }
 
   async pushAtomically(remote: string): Promise<void> {
+    const probe = [
+      "push",
+      "--atomic",
+      "--dry-run",
+      "--no-verify",
+      remote,
+      "HEAD",
+      `${NOTES_REF}:${NOTES_REF}`,
+    ];
+    const result = await this.run(probe, { allowExitCodes: [0, 1, 128] });
+    if (result.exitCode !== 0) {
+      if (/atomic(?: pushes?)?[^\n]*(?:not supported|unsupported)|does not support[^\n]*atomic/i.test(result.stderr)) {
+        throw new AtomicPushUnavailableError(remote);
+      }
+      throw new GitCommandError(probe, result);
+    }
     await this.run(["push", "--atomic", remote, "HEAD", `${NOTES_REF}:${NOTES_REF}`]);
   }
 }

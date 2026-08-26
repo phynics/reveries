@@ -18,5 +18,6 @@ Automatic note delivery is best-effort. When needed, inspect a file directly:
 
 Before publishing:
 - every changed annotated blob must continue, supersede, or retire its prior reveries;
-- every post-initialization commit must have exactly one valid session summary.
+- every post-initialization commit must have exactly one valid session summary;
+- use `reveries push <remote>` for publication; generic `git push` is not atomic.
 <!-- reveries:end -->

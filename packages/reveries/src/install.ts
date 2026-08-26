@@ -28,7 +28,8 @@ const AGENTS_OUTRO = `Automatic note delivery is best-effort. When needed, inspe
 
 Before publishing:
 - every changed annotated blob must continue, supersede, or retire its prior reveries;
-- every post-initialization commit must have exactly one valid session summary.`;
+- every post-initialization commit must have exactly one valid session summary;
+- use \`reveries push <remote>\` for publication; generic \`git push\` is not atomic.`;
 
 const REMINDER_SETUP = `Before interpreting or changing tracked code, use \`using-reveries\`.
 For rationale and history questions, use \`reveries-git-notes-search\`.`;
@@ -1056,13 +1057,17 @@ async function removeManagedRemoteConfig(repository: GitRepository, remote: stri
       await unsetConfigValue(repository, `remote.${remote}.fetch`, value);
     }
   }
+  await removeManagedPushConfig(repository, remote);
+}
+
+async function removeManagedPushConfig(repository: GitRepository, remote: string): Promise<void> {
   if (await managedFlag(repository, `reveries.managed-${remote}.pushHead`)) {
     await unsetConfigValue(repository, `remote.${remote}.push`, "HEAD");
   }
   if (await managedFlag(repository, `reveries.managed-${remote}.pushNotes`)) {
     await unsetConfigValue(repository, `remote.${remote}.push`, "refs/notes/reveries:refs/notes/reveries");
   }
-  for (const key of ["fetch", "pushHead", "pushNotes"]) {
+  for (const key of ["pushHead", "pushNotes"]) {
     await repository.run(
       ["config", "--unset-all", `reveries.managed-${remote}.${key}`],
       { allowExitCodes: [0, 1, 5] },
@@ -1273,20 +1278,13 @@ async function initializeUnlocked(
         exactFetch,
       );
     }
+    await removeManagedPushConfig(repository, remote);
     const fetchAdded = await ensureConfigValue(
       repository,
       `remote.${remote}.fetch`,
       `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
     );
-    const pushHeadAdded = await ensureConfigValue(repository, `remote.${remote}.push`, "HEAD");
-    const pushNotesAdded = await ensureConfigValue(
-      repository,
-      `remote.${remote}.push`,
-      "refs/notes/reveries:refs/notes/reveries",
-    );
     await rememberManagedValue(repository, `reveries.managed-${remote}.fetch`, fetchAdded);
-    await rememberManagedValue(repository, `reveries.managed-${remote}.pushHead`, pushHeadAdded);
-    await rememberManagedValue(repository, `reveries.managed-${remote}.pushNotes`, pushNotesAdded);
   }
 
   const hookSnippets: string[] = [];
