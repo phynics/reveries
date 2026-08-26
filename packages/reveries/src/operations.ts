@@ -478,12 +478,22 @@ export class Reveries {
     if (fetched === "absent") {
       return { ok: true, diagnostics: [], state: "remote-notes-absent" };
     }
-    await this.repository.mergeFetchedNotes(remote);
+    let quarantineRef: string | null = null;
     try {
-      await this.validateNotesRef("refs/notes/reveries");
+      await this.repository.mergeFetchedNotes(
+        remote,
+        (ref) => this.validateNotesRef(ref),
+        async (_candidateRef, candidate) => {
+          quarantineRef = await this.repository.quarantineNotes(remote, candidate);
+        },
+      );
       return { ok: true, diagnostics: [], state: "fetched" };
     } catch (error: unknown) {
-      return { ok: false, diagnostics: [error instanceof Error ? error.message : String(error)], state: "fetched" };
+      const diagnostics = [error instanceof Error ? error.message : String(error)];
+      if (quarantineRef !== null) {
+        diagnostics.push(`Invalid fetched notes union quarantined at ${quarantineRef}`);
+      }
+      return { ok: false, diagnostics, state: "fetched" };
     }
   }
 
@@ -754,14 +764,27 @@ export class Reveries {
 
   private async validateNotesRef(ref: string): Promise<void> {
     const entries = await this.repository.listNotes(ref);
+    let initialization: ObjectId | null = null;
     for (const entry of entries) {
       const strict = await this.strictRead(entry.object, ref);
       const objectType = (await this.repository.run(["cat-file", "-t", entry.object])).stdout.trim();
+      if (strict.records.some((record) => record.type === "reveries-init")) {
+        if (objectType !== "commit") {
+          throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
+        }
+        if (initialization !== null) {
+          throw new Error("More than one Reveries initialization boundary exists");
+        }
+        initialization = entry.object;
+      }
       if (objectType === "blob" && strict.records.some((record) => record.type !== "reverie")) {
         throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
       }
       if (objectType === "commit" && strict.records.some((record) => record.type === "reverie")) {
         throw new Error(`Commit ${entry.object} has a file reverie record`);
+      }
+      if (objectType !== "blob" && objectType !== "commit" && strict.records.length > 0) {
+        throw new Error(`Protocol records cannot be attached to ${objectType} object ${entry.object}`);
       }
     }
   }

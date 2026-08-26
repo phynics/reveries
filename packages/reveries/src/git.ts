@@ -61,7 +61,12 @@ export type TreeEntry =
   | { readonly mode: string; readonly type: "commit"; readonly object: CommitId; readonly path: string }
   | { readonly mode: string; readonly type: "tree"; readonly object: ObjectId; readonly path: string };
 
-type RefValidator = (temporaryRef: string) => Promise<void>;
+export type NotesRefValidator = (temporaryRef: string) => Promise<void>;
+export type NotesValidationFailure = (
+  temporaryRef: string,
+  candidate: ObjectId,
+  error: unknown,
+) => Promise<void>;
 
 function isObjectId(value: string): value is ObjectId {
   return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
@@ -290,7 +295,8 @@ export class GitRepository {
 
   async withNotesWrite<T>(
     operation: (notes: NotesTransaction) => Promise<T>,
-    validate: RefValidator = async () => undefined,
+    validate: NotesRefValidator = async () => undefined,
+    onValidationFailure?: NotesValidationFailure,
   ): Promise<T> {
     const lockPath = this.writeLockPath();
     await mkdir(dirname(lockPath), { recursive: true });
@@ -322,7 +328,14 @@ export class GitRepository {
           if (newTip === null) {
             return value;
           }
-          await validate(temporaryRef);
+          try {
+            await validate(temporaryRef);
+          } catch (error: unknown) {
+            if (onValidationFailure !== undefined) {
+              await onValidationFailure(temporaryRef, newTip, error);
+            }
+            throw error;
+          }
           const format = await this.objectFormat();
           const absent = "0".repeat(format === "sha1" ? 40 : 64);
           const update = await this.run(["update-ref", NOTES_REF, newTip, expectedTip ?? absent], {
@@ -354,7 +367,11 @@ export class GitRepository {
     return "fetched";
   }
 
-  async mergeFetchedNotes(remote: string): Promise<void> {
+  async mergeFetchedNotes(
+    remote: string,
+    validate: NotesRefValidator = async () => undefined,
+    onValidationFailure?: NotesValidationFailure,
+  ): Promise<void> {
     await this.withNotesWrite(async (notes) => {
       await this.run([
         "notes",
@@ -364,7 +381,13 @@ export class GitRepository {
         "cat_sort_uniq",
         `refs/notes/remotes/${remote}/reveries`,
       ]);
-    });
+    }, validate, onValidationFailure);
+  }
+
+  async quarantineNotes(remote: string, candidate: ObjectId): Promise<string> {
+    const ref = `refs/reveries/quarantine/${remote}/${candidate}`;
+    await this.run(["update-ref", ref, candidate]);
+    return ref;
   }
 
   async pushAtomically(remote: string): Promise<void> {
