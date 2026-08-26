@@ -53,7 +53,10 @@ done
 git fetch origin '+refs/notes/reveries*:refs/notes/remotes/origin/reveries*'
 git notes --ref=refs/notes/reveries merge -s cat_sort_uniq \
   refs/notes/remotes/origin/reveries
-git push --atomic origin HEAD refs/notes/reveries:refs/notes/reveries
+reveries push origin
 ```
 
 After a manual append or merge, use the helper’s strict check when available before publishing.
+Publish with `reveries push <remote>` so the receiver's atomic capability is checked before the
+branch and notes refs are requested together. If the helper is unavailable, use the lower-grade
+evidence-first sequence: push `refs/notes/reveries` first, then push the code ref separately.

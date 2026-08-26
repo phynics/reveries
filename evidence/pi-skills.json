@@ -10,8 +10,8 @@
     "model": "gpt-5.4-mini"
   },
   "skill_sha256": {
-    "reveries-git-notes-init": "62f68234be72c6606b144b6c2889960e734de29d98720cfbb9f97b1f0b62360c",
-    "using-reveries": "675c0699e9893adb7b4af11480b55f5e42da61a79453cc9fd229292b60e6d9c2",
+    "reveries-git-notes-init": "b10fc3a4777a5e8bfa93bec11cc013e35b95508ea6f910adca5c9c08015bbf99",
+    "using-reveries": "a8d43e0d9911ac1614ae66de196e8ca80f3b6aa965cb4a3862ca40373eacfd45",
     "reveries-git-notes-search": "b106e79430c35aace1bfbc57c2d29015762e65257f0bf8193414209b1cd64274"
   },
   "cases": {

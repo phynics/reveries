@@ -29,21 +29,18 @@ Run strict validation and semantic conflict analysis after this byte-level merge
 For local-only setup, add no remote refspecs and install no Reveries pre-push hook. The
 post-commit reminder may remain active.
 
-With the user’s approval, add both intended push refspecs:
+For an approved publishing remote, configure only the notes fetch refspec above. Do not configure
+`remote.<name>.push` entries: generic `git push` cannot request an atomic multi-ref transaction.
+The required publication command is:
 
 ```bash
-git config --add remote.origin.push HEAD
-git config --add remote.origin.push refs/notes/reveries:refs/notes/reveries
+reveries push origin
 ```
 
-The recommended high-consequence publish command is:
-
-```bash
-git push --atomic origin HEAD refs/notes/reveries:refs/notes/reveries
-```
-
-An explicit refspec such as `git push origin main` can omit notes. A pre-push hook can reject
-that incomplete publication but cannot add the notes refspec.
+The helper probes atomic support without writing, then requests the branch and notes ref together.
+If the helper is unavailable, push `refs/notes/reveries` first and the code ref second as a
+lower-grade fallback. A pre-push hook can reject incomplete publication but cannot add a missing
+refspec, enforce atomicity, or act as a security boundary.
 
 ## Hooks
 

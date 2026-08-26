@@ -69,6 +69,13 @@ export interface SyncResult extends CheckResult {
 export interface DoctorResult extends CheckResult {
   readonly state: "prepared" | "adopted" | "damaged";
   readonly notices: readonly string[];
+  readonly protection: DoctorProtection;
+}
+
+export interface DoctorProtection {
+  readonly helper: "available" | "unavailable";
+  readonly local: "complete" | "partial" | "not-configured";
+  readonly receiveSide: "unknown";
 }
 
 export interface PushUpdate {
@@ -557,15 +564,15 @@ export class Reveries {
           ["config", "--get-all", `remote.${remote}.fetch`],
           { allowExitCodes: [0, 1] },
         );
+        if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries*`)) {
+          diagnostics.push(`Publishing remote ${remote} lacks the Reveries fetch refspec`);
+        }
         const push = await this.repository.run(
           ["config", "--get-all", `remote.${remote}.push`],
           { allowExitCodes: [0, 1] },
         );
-        if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries*`)) {
-          diagnostics.push(`Publishing remote ${remote} lacks the Reveries fetch refspec`);
-        }
-        if (!push.stdout.includes("refs/notes/reveries:refs/notes/reveries")) {
-          diagnostics.push(`Publishing remote ${remote} lacks the Reveries push refspec`);
+        if (push.stdout.split("\n").some((value) => value.trim() === `${NOTES_REF}:${NOTES_REF}`)) {
+          diagnostics.push(`Publishing remote ${remote} has an unsafe non-atomic notes push refspec; use reveries push`);
         }
         const remoteTip = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
         const localTip = await this.repository.notesTip();
@@ -593,22 +600,29 @@ export class Reveries {
     const requiredHooks = configuredRemotes.length === 0
       ? ["post-commit"] as const
       : ["pre-push", "post-commit"] as const;
+    let localHookComplete = configuredRemotes.length > 0;
     for (const name of requiredHooks) {
       try {
         const hook = await readFile(join(commonDirectory, "hooks", name), "utf8");
         const expected = helper === undefined
           ? null
           : `# reveries:begin\nexec ${hookInvocation(helper, name)}\n# reveries:end`;
-        if (expected === null || !hook.includes(expected)) diagnostics.push(`${name} enforcement is partial`);
+        if (expected === null || !hook.includes(expected)) {
+          diagnostics.push(`${name} enforcement is partial`);
+          if (configuredRemotes.length > 0) localHookComplete = false;
+        }
       } catch {
         diagnostics.push(`${name} hook is missing`);
+        if (configuredRemotes.length > 0) localHookComplete = false;
       }
     }
+    const helperAvailable = await helperInvocationAvailable(helper);
     const actualFingerprint = await helperInvocationFingerprint(helper);
-    if (!await helperInvocationAvailable(helper)
+    if (!helperAvailable
       || expectedFingerprint.exitCode !== 0
       || actualFingerprint !== expectedFingerprint.stdout.trim()) {
       diagnostics.push("The configured Reveries hook runner is unavailable or changed");
+      if (configuredRemotes.length > 0) localHookComplete = false;
     }
     try {
       await access(join(commonDirectory, "NOTES_MERGE_PARTIAL"));
@@ -621,10 +635,20 @@ export class Reveries {
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
+    const protection: DoctorProtection = {
+      helper: helperAvailable ? "available" : "unavailable",
+      local: configuredRemotes.length === 0 ? "not-configured" : localHookComplete ? "complete" : "partial",
+      receiveSide: "unknown",
+    };
+    notices.push(
+      `Protection: helper ${protection.helper}; local ${protection.local}; receive-side ${protection.receiveSide}. `
+      + "Local hooks are not a security boundary and may be bypassed with --no-verify.",
+    );
     return {
       ok: diagnostics.length === 0,
       diagnostics,
       notices,
+      protection,
       state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
     };
   }

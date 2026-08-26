@@ -23,6 +23,15 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
+async function configValues(cwd: string, key: string): Promise<readonly string[]> {
+  try {
+    const result = await execFileAsync("git", ["config", "--get-all", key], { cwd, encoding: "utf8" });
+    return result.stdout.trimEnd().split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 async function createRepository(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "reveries-init-"));
   temporaryRepositories.push(directory);
@@ -104,9 +113,9 @@ test("initialization is explicit and idempotent", async () => {
   assert.equal(await git(directory, "config", "reveries.directiveEmail"), "user@example.com");
   const fetchValues = await git(directory, "config", "--get-all", "remote.origin.fetch");
   assert.match(fetchValues, /refs\/notes\/reveries\*:refs\/notes\/remotes\/origin\/reveries\*/);
-  const pushValues = await git(directory, "config", "--get-all", "remote.origin.push");
-  assert.match(pushValues, /^HEAD$/m);
-  assert.match(pushValues, /refs\/notes\/reveries:refs\/notes\/reveries/);
+  assert.deepEqual(await configValues(directory, "remote.origin.push"), []);
+  assert.match(first.nextCommands.join("\n"), /push origin/);
+  assert.match(agents, /generic `git push` is not atomic/);
   const prePush = await readFile(join(directory, ".git", "hooks", "pre-push"), "utf8");
   assert.match(prePush, /\/bin\/sh/);
   assert.doesNotMatch(prePush, /exec reveries pre-push/);
@@ -126,10 +135,8 @@ test("initialization configures every selected remote and explains host routing"
 
   for (const remote of ["origin", "mirror"]) {
     const fetchValues = await git(directory, "config", "--get-all", `remote.${remote}.fetch`);
-    const pushValues = await git(directory, "config", "--get-all", `remote.${remote}.push`);
     assert.match(fetchValues, new RegExp(`refs/notes/reveries\\*:refs/notes/remotes/${remote}/reveries\\*`));
-    assert.match(pushValues, /^HEAD$/m);
-    assert.match(pushValues, /refs\/notes\/reveries:refs\/notes\/reveries/);
+    assert.deepEqual(await configValues(directory, `remote.${remote}.push`), []);
   }
   assert.deepEqual(result.hostRouting, [
     { host: "pi", instructionFile: "AGENTS.md" },
@@ -384,7 +391,33 @@ test("doctor reports a prepared installation as successful before the adoption c
   assert.equal(result.ok, true);
   assert.equal(result.state, "prepared");
   assert.equal(result.diagnostics.length, 0);
+  assert.deepEqual(result.protection, {
+    helper: "available",
+    local: "complete",
+    receiveSide: "unknown",
+  });
   assert.match(result.notices.join("\n"), /prepared.*adoption boundary/i);
+  assert.match(result.notices.join("\n"), /helper available; local complete; receive-side unknown/i);
+});
+
+test("initialization removes legacy managed generic push refspecs", async () => {
+  const directory = await createRepository();
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
+  await git(directory, "config", "--add", "remote.origin.push", "refs/notes/reveries:refs/notes/reveries");
+  await git(directory, "config", "reveries.managed-origin.pushHead", "true");
+  await git(directory, "config", "reveries.managed-origin.pushNotes", "true");
+
+  await initializeRepository(directory, {
+    hosts: ["codex"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+
+  assert.deepEqual(await configValues(directory, "remote.origin.push"), []);
+  assert.deepEqual(await configValues(directory, "reveries.managed-origin.pushHead"), []);
+  assert.deepEqual(await configValues(directory, "reveries.managed-origin.pushNotes"), []);
 });
 
 test("doctor detects a hook runner that disappeared after setup", async () => {
@@ -441,11 +474,11 @@ test("doctor validates selected remote config before adoption", async () => {
     skillSetup: { kind: "reminder" },
     helper,
   });
-  await git(directory, "config", "--fixed-value", "--unset-all", "remote.origin.push", "refs/notes/reveries:refs/notes/reveries");
+  await git(directory, "config", "--add", "remote.origin.push", "refs/notes/reveries:refs/notes/reveries");
 
   const result = await (await Reveries.open(directory)).doctor();
   assert.equal(result.state, "damaged");
-  assert.match(result.diagnostics.join("\n"), /lacks the Reveries push refspec/i);
+  assert.match(result.diagnostics.join("\n"), /unsafe non-atomic notes push refspec/i);
 });
 
 test("local-only setup accepts no hosts, publishing remotes, or directive email", async () => {

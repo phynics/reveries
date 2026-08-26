@@ -268,3 +268,51 @@ test("a stale non-fast-forward notes push fails safely", async () => {
   await assert.rejects(() => oldClone.pushAtomically("origin"), /rejected|non-fast-forward|failed/i);
   assert.equal(await git(bare, "rev-parse", "refs/notes/reveries"), remoteTipBefore);
 });
+
+test("publication fails closed when the receiving end lacks atomic support", async () => {
+  const source = await createRepository();
+  const bare = await mkdtemp(join(tmpdir(), "reveries-acceptance-atomic-bare-"));
+  temporaryRepositories.push(bare);
+  await git(bare, "init", "--bare");
+  await git(source, "remote", "add", "origin", bare);
+  await git(source, "push", "origin", "main");
+
+  const reveries = await Reveries.open(source);
+  await adopt(source);
+  await git(bare, "config", "receive.advertiseAtomic", "false");
+  const branchBefore = await git(bare, "rev-parse", "refs/heads/main");
+
+  await assert.rejects(() => reveries.push("origin"), /does not support atomic/i);
+  assert.equal(await git(bare, "rev-parse", "refs/heads/main"), branchBefore);
+  await assert.rejects(() => git(bare, "rev-parse", "refs/notes/reveries"), /exit code|unknown revision|needed a single revision/i);
+});
+
+test("a rejected atomic publication advances neither branch nor notes", async () => {
+  const source = await createRepository();
+  const bare = await mkdtemp(join(tmpdir(), "reveries-acceptance-atomic-reject-bare-"));
+  temporaryRepositories.push(bare);
+  await git(bare, "init", "--bare");
+  await git(source, "remote", "add", "origin", bare);
+  await git(source, "push", "origin", "main");
+
+  const reveries = await Reveries.open(source);
+  await adopt(source);
+  await reveries.repository.pushAtomically("origin");
+  await writeFile(join(source, "state.txt"), "second\n", "utf8");
+  await git(source, "add", "state.txt");
+  await git(source, "commit", "-m", "published change");
+  const commit = await git(source, "rev-parse", "HEAD");
+  await reveries.summarize({ commit, summary: summary() });
+
+  await writeFile(
+    join(bare, "hooks", "update"),
+    "#!/bin/sh\nif [ \"$1\" = \"refs/notes/reveries\" ]; then exit 1; fi\nexit 0\n",
+    { encoding: "utf8", mode: 0o755 },
+  );
+  const branchBefore = await git(bare, "rev-parse", "refs/heads/main");
+  const notesBefore = await git(bare, "rev-parse", "refs/notes/reveries");
+
+  await assert.rejects(() => reveries.push("origin"), /rejected|failed|atomic/i);
+  assert.equal(await git(bare, "rev-parse", "refs/heads/main"), branchBefore);
+  assert.equal(await git(bare, "rev-parse", "refs/notes/reveries"), notesBefore);
+});
