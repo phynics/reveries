@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { blobId, commitId, objectId, type BlobId, type CommitId, type ObjectId } from "./protocol.ts";
 
 export const NOTES_REF = "refs/notes/reveries";
+export const INTERNAL_ATOMIC_PUSH_ENV = "REVERIES_INTERNAL_ATOMIC_PUSH";
 
 export interface GitResult {
   readonly stdout: string;
@@ -16,6 +17,7 @@ export interface GitResult {
 interface RunOptions {
   readonly input?: string;
   readonly allowExitCodes?: readonly number[];
+  readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
 export class GitCommandError extends Error {
@@ -462,7 +464,10 @@ export class GitRepository {
       }
       throw new GitCommandError(probe, result);
     }
-    await this.run(["push", "--atomic", remote, "HEAD", `${NOTES_REF}:${NOTES_REF}`]);
+    await this.run(
+      ["push", "--atomic", remote, "HEAD", `${NOTES_REF}:${NOTES_REF}`],
+      { environment: { [INTERNAL_ATOMIC_PUSH_ENV]: "1" } },
+    );
   }
 }
 
@@ -470,7 +475,7 @@ async function runGit(cwd: string, args: readonly string[], options: RunOptions 
   return new Promise((resolvePromise, reject) => {
     const child = spawn("git", args, {
       cwd,
-      env: process.env,
+      env: { ...process.env, ...options.environment },
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });

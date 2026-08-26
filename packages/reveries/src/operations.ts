@@ -62,9 +62,56 @@ export interface CheckResult {
   readonly diagnostics: readonly string[];
 }
 
-export interface SyncResult extends CheckResult {
-  readonly state: "fetched" | "remote-notes-absent";
+export type SyncConflictType =
+  | "duplicate-session-summary"
+  | "multiple-initialization-boundaries"
+  | "invalid-source"
+  | "invalid-projection"
+  | "invalid-object-attachment"
+  | "invalid-record";
+
+export interface SyncConflictRecord {
+  readonly recordId: string | null;
+  readonly canonicalLine: string;
+  readonly origins: readonly [
+    "local" | "remote",
+    ...("local" | "remote")[],
+  ];
 }
+
+export type SyncResolutionAction =
+  | { readonly kind: "inspect-quarantine"; readonly ref: string }
+  | { readonly kind: "construct-replacement-candidate"; readonly sourceRef: string }
+  | { readonly kind: "retry-sync"; readonly remote: string };
+
+export interface SyncConflict {
+  readonly kind: "invalid-notes-union";
+  readonly conflictType: SyncConflictType;
+  readonly message: string;
+  readonly annotatedObject: ObjectId | null;
+  readonly records: readonly SyncConflictRecord[];
+  readonly provenance: {
+    readonly localNotes: ObjectId | null;
+    readonly remoteNotes: ObjectId;
+    readonly candidate: ObjectId;
+    readonly quarantineRef: string;
+  };
+  readonly resolutionActions: readonly SyncResolutionAction[];
+}
+
+export type SyncResult =
+  | {
+      readonly ok: true;
+      readonly diagnostics: readonly string[];
+      readonly state: "fetched" | "remote-notes-absent";
+      readonly conflicts: readonly [];
+    }
+  | {
+      readonly ok: false;
+      readonly diagnostics: readonly string[];
+      readonly state: "fetched";
+      readonly conflicts: readonly SyncConflict[];
+    };
 
 export interface DoctorResult extends CheckResult {
   readonly state: "prepared" | "adopted" | "damaged";
@@ -112,8 +159,57 @@ interface DiffTransition {
   readonly newPath?: string;
 }
 
+class NotesRefValidationError extends Error {
+  constructor(
+    readonly annotatedObject: ObjectId,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "NotesRefValidationError";
+  }
+}
+
 function isFullObjectId(value: string): boolean {
   return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
+}
+
+function noteLines(note: string | null): readonly string[] {
+  if (note === null) return [];
+  return note.endsWith("\n") ? note.slice(0, -1).split("\n") : note.split("\n");
+}
+
+function recordIdFromCanonicalLine(line: string): string | null {
+  try {
+    const value: unknown = JSON.parse(line);
+    if (typeof value !== "object" || value === null || !("id" in value)) return null;
+    return typeof value.id === "string" ? value.id : null;
+  } catch {
+    return null;
+  }
+}
+
+function recordOrigins(
+  canonicalLine: string,
+  localLines: ReadonlySet<string>,
+  remoteLines: ReadonlySet<string>,
+): SyncConflictRecord["origins"] {
+  const local = localLines.has(canonicalLine);
+  const remote = remoteLines.has(canonicalLine);
+  if (local && remote) return ["local", "remote"];
+  if (local) return ["local"];
+  if (remote) return ["remote"];
+  throw new Error("A candidate record has neither local nor remote provenance");
+}
+
+function syncConflictType(message: string): SyncConflictType {
+  if (/more than one session summary/i.test(message)) return "duplicate-session-summary";
+  if (/more than one Reveries initialization boundary/i.test(message)) {
+    return "multiple-initialization-boundaries";
+  }
+  if (/source|referenced reverie|path source/i.test(message)) return "invalid-source";
+  if (/supersession|conflicting duplicate reverie/i.test(message)) return "invalid-projection";
+  if (/attached|protocol records cannot be attached/i.test(message)) return "invalid-object-attachment";
+  return "invalid-record";
 }
 
 function zeroObject(value: string): boolean {
@@ -527,25 +623,110 @@ export class Reveries {
   async syncPull(remote: string): Promise<SyncResult> {
     const fetched = await this.repository.fetchNotes(remote);
     if (fetched === "absent") {
-      return { ok: true, diagnostics: [], state: "remote-notes-absent" };
+      return { ok: true, diagnostics: [], state: "remote-notes-absent", conflicts: [] };
+    }
+    const localNotes = await this.repository.notesTip();
+    const remoteNotes = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
+    if (remoteNotes === null) {
+      return {
+        ok: false,
+        diagnostics: [`Fetched notes for ${remote} have no remote-tracking tip`],
+        state: "fetched",
+        conflicts: [],
+      };
     }
     let quarantineRef: string | null = null;
+    let conflict: SyncConflict | null = null;
     try {
       await this.repository.mergeFetchedNotes(
         remote,
         (ref) => this.validateNotesRef(ref),
-        async (_candidateRef, candidate) => {
+        async (candidateRef, candidate, error) => {
           quarantineRef = await this.repository.quarantineNotes(remote, candidate);
+          conflict = await this.describeSyncConflict({
+            remote,
+            candidateRef,
+            candidate,
+            error,
+            localNotes,
+            remoteNotes,
+            quarantineRef,
+          });
         },
       );
-      return { ok: true, diagnostics: [], state: "fetched" };
+      return { ok: true, diagnostics: [], state: "fetched", conflicts: [] };
     } catch (error: unknown) {
       const diagnostics = [error instanceof Error ? error.message : String(error)];
       if (quarantineRef !== null) {
         diagnostics.push(`Invalid fetched notes union quarantined at ${quarantineRef}`);
       }
-      return { ok: false, diagnostics, state: "fetched" };
+      return {
+        ok: false,
+        diagnostics,
+        state: "fetched",
+        conflicts: conflict === null ? [] : [conflict],
+      };
     }
+  }
+
+  private async describeSyncConflict(input: {
+    readonly remote: string;
+    readonly candidateRef: string;
+    readonly candidate: ObjectId;
+    readonly error: unknown;
+    readonly localNotes: ObjectId | null;
+    readonly remoteNotes: ObjectId;
+    readonly quarantineRef: string;
+  }): Promise<SyncConflict> {
+    const message = input.error instanceof Error ? input.error.message : String(input.error);
+    const annotatedObject = input.error instanceof NotesRefValidationError
+      ? input.error.annotatedObject
+      : null;
+    const records = annotatedObject === null
+      ? []
+      : await this.describeConflictRecords(
+          annotatedObject,
+          input.candidateRef,
+          input.localNotes,
+          input.remoteNotes,
+        );
+    return {
+      kind: "invalid-notes-union",
+      conflictType: syncConflictType(message),
+      message,
+      annotatedObject,
+      records,
+      provenance: {
+        localNotes: input.localNotes,
+        remoteNotes: input.remoteNotes,
+        candidate: input.candidate,
+        quarantineRef: input.quarantineRef,
+      },
+      resolutionActions: [
+        { kind: "inspect-quarantine", ref: input.quarantineRef },
+        { kind: "construct-replacement-candidate", sourceRef: input.quarantineRef },
+        { kind: "retry-sync", remote: input.remote },
+      ],
+    };
+  }
+
+  private async describeConflictRecords(
+    object: ObjectId,
+    candidateRef: string,
+    localNotes: ObjectId | null,
+    remoteNotes: ObjectId,
+  ): Promise<readonly SyncConflictRecord[]> {
+    const candidate = await this.repository.readNoteFromRef(candidateRef, object);
+    if (candidate === null) return [];
+    const local = localNotes === null ? null : await this.repository.readNoteAt(localNotes, object);
+    const remote = await this.repository.readNoteAt(remoteNotes, object);
+    const localLines = new Set(noteLines(local));
+    const remoteLines = new Set(noteLines(remote));
+    return noteLines(candidate).map((canonicalLine) => ({
+      recordId: recordIdFromCanonicalLine(canonicalLine),
+      canonicalLine,
+      origins: recordOrigins(canonicalLine, localLines, remoteLines),
+    }));
   }
 
   async push(remote: string): Promise<CheckResult> {
@@ -859,25 +1040,29 @@ export class Reveries {
     const entries = await this.repository.listNotes(ref);
     let initialization: ObjectId | null = null;
     for (const entry of entries) {
-      const strict = await this.strictRead(entry.object, ref);
-      const objectType = (await this.repository.run(["cat-file", "-t", entry.object])).stdout.trim();
-      if (strict.records.some((record) => record.type === "reveries-init")) {
-        if (objectType !== "commit") {
-          throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
+      try {
+        const strict = await this.strictRead(entry.object, ref);
+        const objectType = (await this.repository.run(["cat-file", "-t", entry.object])).stdout.trim();
+        if (strict.records.some((record) => record.type === "reveries-init")) {
+          if (objectType !== "commit") {
+            throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
+          }
+          if (initialization !== null) {
+            throw new Error("More than one Reveries initialization boundary exists");
+          }
+          initialization = entry.object;
         }
-        if (initialization !== null) {
-          throw new Error("More than one Reveries initialization boundary exists");
+        if (objectType === "blob" && strict.records.some((record) => record.type !== "reverie")) {
+          throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
         }
-        initialization = entry.object;
-      }
-      if (objectType === "blob" && strict.records.some((record) => record.type !== "reverie")) {
-        throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
-      }
-      if (objectType === "commit" && strict.records.some((record) => record.type === "reverie")) {
-        throw new Error(`Commit ${entry.object} has a file reverie record`);
-      }
-      if (objectType !== "blob" && objectType !== "commit" && strict.records.length > 0) {
-        throw new Error(`Protocol records cannot be attached to ${objectType} object ${entry.object}`);
+        if (objectType === "commit" && strict.records.some((record) => record.type === "reverie")) {
+          throw new Error(`Commit ${entry.object} has a file reverie record`);
+        }
+        if (objectType !== "blob" && objectType !== "commit" && strict.records.length > 0) {
+          throw new Error(`Protocol records cannot be attached to ${objectType} object ${entry.object}`);
+        }
+      } catch (error: unknown) {
+        throw new NotesRefValidationError(entry.object, error);
       }
     }
   }

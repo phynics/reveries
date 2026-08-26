@@ -1225,12 +1225,13 @@ If the helper cannot be used, a lower-grade fallback publishes evidence before c
 
 ```bash
 git push origin refs/notes/reveries:refs/notes/reveries
-git push origin HEAD
+git push --no-verify origin HEAD
 ```
 
 The second command must run only after the first succeeds. This avoids code-before-evidence but is
 not atomic: a later code push can still omit notes, and a failure between the two commands leaves
-the remote with evidence ahead of code. Use receive-side enforcement when this distinction matters.
+the remote with evidence ahead of code. The `--no-verify` flag is an explicit bypass of the local
+raw-publication guard. Use receive-side enforcement when this distinction matters.
 
 ### 18.5 Pre-push enforcement
 
