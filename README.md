@@ -107,6 +107,7 @@ they can be skipped with `--no-verify`. Configure receive-side checks for a stro
 
 - [Approved V1 design](DESIGN.md)
 - [Roadmap and V2 evidence model](ROADMAP.md)
+- [Detailed ticket specifications](docs/tickets.md)
 - [V1 protocol](protocol/v1.md)
 - [Reverie schema](protocol/schemas/reverie.schema.json)
 - [Session-summary schema](protocol/schemas/session-summary.schema.json)

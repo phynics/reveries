@@ -44,7 +44,7 @@ compatibility change. This roadmap does not change the approved V1 design by its
 Strengthen synchronization, publication, retention, validation cost, worktree detection,
 completeness reporting, concurrency, and team-scale testing.
 
-Tickets: [RVR-001](https://github.com/phynics/reveries/issues/1),
+Tickets: [RVR-001](docs/tickets.md#rvr-001-validate-fetched-note-unions-before-promotion),
 [RVR-002](https://github.com/phynics/reveries/issues/2),
 [RVR-006](https://github.com/phynics/reveries/issues/6),
 [RVR-008](https://github.com/phynics/reveries/issues/8),
@@ -92,7 +92,7 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 
 | ID | Priority | Ticket | Feasibility |
 | --- | --- | --- | --- |
-| RVR-001 | P0 | [Validate fetched-note unions before promotion](https://github.com/phynics/reveries/issues/1) | Core / V1 |
+| RVR-001 | P0 | [Validate fetched-note unions before promotion](docs/tickets.md#rvr-001-validate-fetched-note-unions-before-promotion) | Core / V1 |
 | RVR-002 | P0 | [Eliminate unsafe non-atomic publication paths](https://github.com/phynics/reveries/issues/2) | Core / V1 + Boundary |
 | RVR-003 | P0 | [Add receive-side and hosted-merge enforcement](https://github.com/phynics/reveries/issues/3) | Core + Adapter + Boundary |
 | RVR-004 | P0 | [Introduce tree-transition summaries](https://github.com/phynics/reveries/issues/4) | Core / V2 |
