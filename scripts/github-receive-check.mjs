@@ -14,6 +14,9 @@ function run(command, args, input = "") {
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.on("error", reject);
+    child.stdin.on("error", (error) => {
+      if (error.code !== "EPIPE") reject(error);
+    });
     child.on("close", (code) => resolvePromise({
       code: code ?? 128,
       stdout: Buffer.concat(stdout).toString("utf8"),
