@@ -19,6 +19,7 @@
     "acceptance:direct-git": "node scripts/direct-git-acceptance.mjs",
     "acceptance:installer": "node scripts/installer-acceptance.mjs",
     "acceptance:native-evidence": "node scripts/native-skill-evidence.mjs",
+    "acceptance:receive": "node scripts/receive-fixture.mjs",
     "build": "npm run build --workspace @reveries/cli",
     "conformance": "npm run build && node scripts/conformance.mjs",
     "evaluate:local": "node scripts/evaluate-local.mjs",

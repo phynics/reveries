@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "check_name": "Reveries receive-check",
+  "app_slug": "reveries",
+  "app_id_env": "REVERIES_APP_ID",
+  "events": ["pull_request", "merge_group"],
+  "policy": "Branch protection must require this exact check from the installed Reveries App, not an unpinned workflow name."
+}

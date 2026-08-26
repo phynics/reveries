@@ -39,6 +39,8 @@ const criteria = [
   { category: "protocol-git", criterion: "Linked worktrees share notes state and lock", status: "covered", evidence: [evidence("packages/reveries/test/git.integration.ts", "linked worktrees use the same common-directory lock")] },
   { category: "protocol-git", criterion: "Non-fast-forward notes push fails safely", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "a stale non-fast-forward notes push fails safely")] },
   { category: "protocol-git", criterion: "Arbitrary unstaged object write is refused", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "continuity refuses an arbitrary unstaged object")] },
+  { category: "receive", criterion: "Receive fixture validates proposed ref updates", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "receive fixture validates proposed ref updates without moving refs")] },
+  { category: "receive", criterion: "Base-tree changes invalidate earlier receive evidence", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "base tree changed")] },
 
   { category: "initialization", criterion: "Repeated initialization is idempotent", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
   { category: "initialization", criterion: "Existing AGENTS prose is preserved", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
@@ -139,6 +141,7 @@ try {
   gates.push(await run("npm", ["run", "test:full"]));
   gates.push(await run("npm", ["run", "conformance"]));
   gates.push(await run("node", ["scripts/direct-git-acceptance.mjs"]));
+  gates.push(await run("npm", ["run", "acceptance:receive"]));
   gates.push(await run("node", ["scripts/native-skill-evidence.mjs"]));
   gates.push(await run("node", ["scripts/installer-acceptance.mjs"]));
   gates.push(await run("npm", [
