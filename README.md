@@ -95,13 +95,15 @@ When the helper is unavailable, the lower-grade evidence-first fallback is two s
 
 ```bash
 git push origin refs/notes/reveries:refs/notes/reveries
-git push origin HEAD
+git push --no-verify origin HEAD
 ```
 
 Push the notes first and push code only after the evidence succeeds. This ordering avoids publishing
 code before its evidence, but it is not atomic and cannot prevent a later code push from being made
-without the notes. Local hooks are useful accidental-bypass protection, not a security boundary;
-they can be skipped with `--no-verify`. Configure receive-side checks for a stronger boundary.
+without the notes. The second command uses `--no-verify` because the local hook rejects every raw
+branch publication. This explicit bypass is part of the lower-grade fallback. Local hooks are
+accidental-bypass protection, not a security boundary. Configure receive-side checks for a stronger
+boundary.
 
 ## Protocol documentation
 

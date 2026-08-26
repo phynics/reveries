@@ -11,7 +11,7 @@ import {
   type SkillSetup,
   type SupportedHost,
 } from "./install.ts";
-import { NOTES_REF } from "./git.ts";
+import { INTERNAL_ATOMIC_PUSH_ENV, NOTES_REF } from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
 import { Reveries, type PushUpdate } from "./operations.ts";
 import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
@@ -41,6 +41,7 @@ export interface CliIo {
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
   readonly helper?: HelperInvocation;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
 interface ParsedArguments {
@@ -660,7 +661,18 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     if (command === "pre-push") {
       const remote = argv[1];
       if (remote === undefined) throw new UsageError("pre-push requires the remote name from Git");
-      const result = await reveries.checkOutgoingUpdates(remote, parsePushUpdates(await io.stdin()));
+      const updates = parsePushUpdates(await io.stdin());
+      const publishesBranch = updates.some(
+        (update) => update.localRef.startsWith("refs/heads/") && update.localObject !== null,
+      );
+      if (publishesBranch && (io.environment ?? process.env)[INTERNAL_ATOMIC_PUSH_ENV] !== "1") {
+        const diagnostics = [
+          "Raw branch publication is disabled; use reveries push for atomic publication or --no-verify for an explicit bypass",
+        ];
+        emit(io, false, command, undefined, diagnostics);
+        return 1;
+      }
+      const result = await reveries.checkOutgoingUpdates(remote, updates);
       emit(io, false, command, undefined, result.diagnostics);
       return result.ok ? 0 : 1;
     }

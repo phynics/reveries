@@ -328,6 +328,26 @@ test("a rejected atomic publication advances neither branch nor notes", async ()
   assert.equal(await git(bare, "rev-parse", "refs/notes/reveries"), notesBefore);
 });
 
+test("atomic publication marks the real push as helper-owned", async () => {
+  const source = await createRepository();
+  const bare = await mkdtemp(join(tmpdir(), "reveries-acceptance-helper-marker-bare-"));
+  temporaryRepositories.push(bare);
+  await git(bare, "init", "--bare");
+  await git(source, "remote", "add", "origin", bare);
+  await writeFile(
+    join(source, ".git", "hooks", "pre-push"),
+    "#!/bin/sh\ntest \"$REVERIES_INTERNAL_ATOMIC_PUSH\" = \"1\"\n",
+    { encoding: "utf8", mode: 0o755 },
+  );
+
+  const repository = await GitRepository.open(source);
+  const commit = await repository.resolveCommit("HEAD");
+  await repository.withNotesWrite((notes) => notes.append(commit, "{\"marker\":true}\n"));
+  await repository.pushAtomically("origin");
+
+  assert.equal(await git(bare, "rev-parse", "refs/heads/main"), await git(source, "rev-parse", "HEAD"));
+});
+
 test("sync quarantines an invalid fetched union without promoting or losing records", async () => {
   const source = await createRepository();
   const bare = await mkdtemp(join(tmpdir(), "reveries-acceptance-quarantine-bare-"));
@@ -374,6 +394,22 @@ test("sync quarantines an invalid fetched union without promoting or losing reco
   assert.equal(result.ok, false, JSON.stringify(result));
   assert.match(result.diagnostics.join("\n"), /more than one session summary/i);
   assert.match(result.diagnostics.join("\n"), /quarantined at refs\/reveries\/quarantine\/origin\//i);
+  assert.equal(result.conflicts.length, 1);
+  const conflict = result.conflicts[0]!;
+  assert.equal(conflict.kind, "invalid-notes-union");
+  assert.equal(conflict.conflictType, "duplicate-session-summary");
+  assert.equal(conflict.annotatedObject, commit);
+  assert.equal(conflict.provenance.localNotes, canonicalBefore);
+  assert.match(conflict.provenance.remoteNotes, /^[0-9a-f]{40}$/);
+  assert.match(conflict.provenance.candidate, /^[0-9a-f]{40}$/);
+  assert.match(conflict.provenance.quarantineRef, /^refs\/reveries\/quarantine\/origin\/[0-9a-f]{40}$/);
+  assert.deepEqual(
+    conflict.records.map((record) => record.origins),
+    [["local"], ["remote"]],
+  );
+  assert.match(conflict.records[0]!.canonicalLine, /Keep the local summary/);
+  assert.match(conflict.records[1]!.canonicalLine, /Keep the remote summary/);
+  assert.ok(conflict.resolutionActions.some((action) => action.kind === "construct-replacement-candidate"));
   assert.equal(await localRepository.notesTip(), canonicalBefore);
 
   const quarantine = await git(local, "for-each-ref", "--format=%(refname)", "refs/reveries/quarantine/origin");

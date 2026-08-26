@@ -29,7 +29,11 @@ async function createRepository(): Promise<string> {
   return directory;
 }
 
-function captureIo(cwd: string, stdin = ""): { readonly io: CliIo; readonly stdout: () => string; readonly stderr: () => string } {
+function captureIo(
+  cwd: string,
+  stdin = "",
+  environment?: Readonly<Record<string, string | undefined>>,
+): { readonly io: CliIo; readonly stdout: () => string; readonly stderr: () => string } {
   let out = "";
   let error = "";
   return {
@@ -38,6 +42,7 @@ function captureIo(cwd: string, stdin = ""): { readonly io: CliIo; readonly stdo
       stdin: async () => stdin,
       stdout: (text) => { out += text; },
       stderr: (text) => { error += text; },
+      ...(environment === undefined ? {} : { environment }),
     },
     stdout: () => out,
     stderr: () => error,
@@ -279,10 +284,29 @@ test("pre-push validates every pushed branch tip rather than HEAD", async () => 
     `refs/notes/reveries ${adoption.notes} refs/notes/reveries ${zero}`,
     "",
   ].join("\n");
-  const prePush = captureIo(directory, stdin);
+  const prePush = captureIo(directory, stdin, { REVERIES_INTERNAL_ATOMIC_PUSH: "1" });
 
   assert.equal(await runCli(["pre-push", "origin"], prePush.io), 1);
   assert.match(prePush.stderr(), /session summary/i);
+});
+
+test("pre-push rejects raw branch-and-notes publication without the helper marker", async () => {
+  const directory = await createRepository();
+  const adoption = await adopt(directory);
+  const zero = "0".repeat(40);
+  const stdin = [
+    `refs/heads/main ${adoption.commit} refs/heads/main ${zero}`,
+    `refs/notes/reveries ${adoption.notes} refs/notes/reveries ${zero}`,
+    "",
+  ].join("\n");
+
+  const rawPush = captureIo(directory, stdin, {});
+  assert.equal(await runCli(["pre-push", "origin"], rawPush.io), 1);
+  assert.match(rawPush.stderr(), /reveries push|non-atomic|raw push/i);
+
+  const helperPush = captureIo(directory, stdin, { REVERIES_INTERNAL_ATOMIC_PUSH: "1" });
+  assert.equal(await runCli(["pre-push", "origin"], helperPush.io), 0);
+  assert.equal(helperPush.stderr(), "");
 });
 
 test("pre-push rejects a remote notes history not incorporated locally", async () => {
@@ -297,7 +321,7 @@ test("pre-push rejects a remote notes history not incorporated locally", async (
     `refs/notes/reveries ${adoption.notes} refs/notes/reveries ${remoteNotes}`,
     "",
   ].join("\n");
-  const prePush = captureIo(directory, stdin);
+  const prePush = captureIo(directory, stdin, { REVERIES_INTERNAL_ATOMIC_PUSH: "1" });
 
   assert.equal(await runCli(["pre-push", "origin"], prePush.io), 1);
   assert.match(prePush.stderr(), /remote notes|incorporated/i);
@@ -313,7 +337,7 @@ test("pre-push does not treat a disappeared established remote notes ref as firs
     `refs/notes/reveries ${adoption.notes} refs/notes/reveries ${zero}`,
     "",
   ].join("\n");
-  const prePush = captureIo(directory, stdin);
+  const prePush = captureIo(directory, stdin, { REVERIES_INTERNAL_ATOMIC_PUSH: "1" });
 
   assert.equal(await runCli(["pre-push", "origin"], prePush.io), 1);
   assert.match(prePush.stderr(), /remote notes ref is absent|established remote notes/i);
