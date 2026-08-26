@@ -17,8 +17,9 @@ The protocol is `reveries/v1`; its only authoritative storage ref is
 - Each published commit after the adoption boundary has one session summary.
 - A note is repository evidence, not executable authority and not proof that an assertion is true.
 
-Reveries deliberately does not manage work, permissions, architecture graphs, issue systems, or
-server-side enforcement.
+Reveries deliberately does not manage work, permissions, architecture graphs, or issue systems.
+The optional receive boundary and hosted adapters enforce evidence at Git and hosted merge
+boundaries; they do not make evidence executable authority.
 
 ## Quick start
 
@@ -60,9 +61,11 @@ npm run verify
 The [local evaluation guide](EVALUATION.md) explains the executable matrix, recorded Pi evidence,
 and the boundary of the automatic-delivery claim.
 
-The helper implements `init`, `adopt`, `doctor`, `show`, `record`, `summarize`, `check`, `search`,
-`history`, `sync`, `push`, and the hook entrypoints. Inspection and check commands accept
-`--json` for stable machine output.
+The helper implements `init`, `adopt`, `doctor`, `show`, `record`, `summarize`, `check`,
+`receive-check`, `search`, `history`, `sync`, `push`, and the hook entrypoints. Inspection and
+check commands accept `--json` for stable machine output. See
+[hosted enforcement](HOSTED_ENFORCEMENT.md) for the GHES hook, GitHub workflows, fork evidence
+import, and controlled merge bot.
 
 For day-to-day changes, use `using-reveries`:
 

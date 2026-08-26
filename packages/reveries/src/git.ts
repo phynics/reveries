@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { blobId, commitId, type BlobId, type CommitId, type ObjectId } from "./protocol.ts";
+import { blobId, commitId, objectId, type BlobId, type CommitId, type ObjectId } from "./protocol.ts";
 
 export const NOTES_REF = "refs/notes/reveries";
 
@@ -114,6 +114,7 @@ export class GitRepository {
   private constructor(
     readonly root: string,
     private readonly commonDir: string,
+    private readonly commandCwd = root,
   ) {}
 
   static async open(cwd: string): Promise<GitRepository> {
@@ -125,8 +126,16 @@ export class GitRepository {
     return new GitRepository(root, commonDir);
   }
 
+  /** Open a repository from a receive hook without assuming a worktree exists. */
+  static async openBare(cwd: string): Promise<GitRepository> {
+    const gitDirectory = (await runGit(cwd, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
+    const commonOutput = (await runGit(cwd, ["rev-parse", "--git-common-dir"])).stdout.trim();
+    const commonDir = isAbsolute(commonOutput) ? commonOutput : resolve(cwd, commonOutput);
+    return new GitRepository(gitDirectory, commonDir, cwd);
+  }
+
   async run(args: readonly string[], options: RunOptions = {}): Promise<GitResult> {
-    return runGit(this.root, args, options);
+    return runGit(this.commandCwd, args, options);
   }
 
   async commonDirectory(): Promise<string> {
@@ -173,6 +182,19 @@ export class GitRepository {
     return commitId(parseObjectId(result.stdout, `git rev-parse ${revision}`));
   }
 
+  async treeForCommit(revision: string): Promise<ObjectId> {
+    const commit = await this.resolveCommit(revision);
+    const result = await this.run(["rev-parse", "--verify", `${commit}^{tree}`]);
+    return parseObjectId(result.stdout, `git rev-parse ${commit}^{tree}`);
+  }
+
+  async objectType(object: ObjectId): Promise<"blob" | "tree" | "commit" | "tag" | null> {
+    const result = await this.run(["cat-file", "-t", object], { allowExitCodes: [0, 1, 128] });
+    if (result.exitCode !== 0) return null;
+    const type = result.stdout.trim();
+    return type === "blob" || type === "tree" || type === "commit" || type === "tag" ? type : null;
+  }
+
   async objectExists(kind: "blob" | "commit", object: ObjectId): Promise<boolean> {
     const result = await this.run(["cat-file", "-e", `${object}^{${kind}}`], { allowExitCodes: [0, 1, 128] });
     return result.exitCode === 0;
@@ -185,6 +207,14 @@ export class GitRepository {
   async readNoteFromRef(ref: string, object: ObjectId): Promise<string | null> {
     const result = await this.run(["notes", `--ref=${ref}`, "show", object], { allowExitCodes: [0, 1] });
     return result.exitCode === 0 ? result.stdout : null;
+  }
+
+  async readNoteAt(revision: ObjectId, object: ObjectId): Promise<string | null> {
+    for (const path of [object, `${object.slice(0, 2)}/${object.slice(2)}`]) {
+      const result = await this.run(["show", `${revision}:${path}`], { allowExitCodes: [0, 1, 128] });
+      if (result.exitCode === 0) return result.stdout;
+    }
+    return null;
   }
 
   async notesTip(ref = NOTES_REF): Promise<ObjectId | null> {
@@ -222,6 +252,24 @@ export class GitRepository {
           note: parseObjectId(noteValue, "git notes list note"),
           object: parseObjectId(objectValue, "git notes list object"),
         };
+      });
+  }
+
+  async listNotesAt(revision: ObjectId): Promise<readonly NoteListEntry[]> {
+    return (await this.listTree(revision))
+      .filter((entry) => entry.type === "blob")
+      .map((entry) => {
+        const separator = entry.path.indexOf("/");
+        if (separator < 0 && (entry.path.length === 40 || entry.path.length === 64) && /^[0-9a-f]+$/.test(entry.path)) {
+          return { note: entry.object, object: objectId(entry.path) };
+        }
+        const prefix = entry.path.slice(0, separator);
+        const suffix = entry.path.slice(separator + 1);
+        if (separator !== 2 || !/^[0-9a-f]{2}$/.test(prefix) || !/^[0-9a-f]+$/.test(suffix)
+          || (suffix.length !== 38 && suffix.length !== 62)) {
+          throw new Error(`Malformed Git notes tree path: ${entry.path}`);
+        }
+        return { note: entry.object, object: objectId(`${prefix}${suffix}`) };
       });
   }
 

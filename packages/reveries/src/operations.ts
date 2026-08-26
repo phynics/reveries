@@ -152,10 +152,21 @@ function emptySummary(): SessionSummary {
 }
 
 export class Reveries {
-  private constructor(readonly repository: GitRepository) {}
+  private constructor(
+    readonly repository: GitRepository,
+    private readonly proposedNotesTip?: ObjectId,
+  ) {}
 
   static async open(cwd: string): Promise<Reveries> {
     return new Reveries(await GitRepository.open(cwd));
+  }
+
+  static async openBareForReceive(cwd: string, notesTip: ObjectId): Promise<Reveries> {
+    const repository = await GitRepository.openBare(cwd);
+    if (await repository.objectType(notesTip) !== "commit") {
+      throw new Error(`Proposed Reveries notes object is not a commit: ${notesTip}`);
+    }
+    return new Reveries(repository, notesTip);
   }
 
   async recordNew(input: RecordNewInput): Promise<RecordResult> {
@@ -221,7 +232,7 @@ export class Reveries {
 
   async show(input: ShowInput): Promise<ShowResult> {
     const target = await this.resolveTarget(input.target, input.revision ?? "HEAD");
-    const note = await this.repository.readNote(target.object);
+    const note = await this.readEvidenceNote(target.object);
     if (note === null) {
       return { ...target, records: [], active: [], historical: [], diagnostics: [], paths: target.paths };
     }
@@ -356,6 +367,39 @@ export class Reveries {
     return { ok: diagnostics.length === 0, diagnostics };
   }
 
+  async checkProposedRef(
+    localObject: CommitId,
+    remoteObject: ObjectId | null,
+    remoteRef: string,
+  ): Promise<CheckResult> {
+    const initialization = await this.findInitialization();
+    if (initialization === null) {
+      return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
+    }
+    const diagnostics = await this.checkOutgoingRange(
+      initialization.commit,
+      localObject,
+      remoteObject,
+      remoteRef,
+    );
+    return { ok: diagnostics.length === 0, diagnostics };
+  }
+
+  async checkProposedEvidence(): Promise<CheckResult> {
+    if (this.proposedNotesTip === undefined) {
+      throw new Error("Proposed evidence is available only to a receive checker");
+    }
+    const diagnostics: string[] = [];
+    for (const entry of await this.evidenceNotes()) {
+      try {
+        await this.strictRead(entry.object);
+      } catch (error: unknown) {
+        diagnostics.push(`${entry.object}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { ok: diagnostics.length === 0, diagnostics };
+  }
+
   async checkOutgoing(remote: string): Promise<CheckResult> {
     const initialization = await this.findInitialization();
     if (initialization === null) {
@@ -428,11 +472,11 @@ export class Reveries {
   async search(input: SearchInput): Promise<readonly SearchHit[]> {
     const revision = input.revision ?? "HEAD";
     const candidates = input.all === true
-      ? await this.repository.listNotes()
+      ? await this.evidenceNotes()
       : await this.currentNoteTargets(revision);
     const hits: SearchHit[] = [];
     for (const candidate of candidates) {
-      const note = await this.repository.readNote(candidate.object);
+      const note = await this.readEvidenceNote(candidate.object);
       if (note === null) continue;
       const parsed = parseNote(note, "tolerant", { verifyIds: false });
       for (const record of parsed.records) {
@@ -460,7 +504,7 @@ export class Reveries {
         const key = `${commit}:${blob}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const note = await this.repository.readNote(blob);
+        const note = await this.readEvidenceNote(blob);
         history.push({
           commit,
           blob,
@@ -716,11 +760,23 @@ export class Reveries {
     return type === "blob" ? this.repository.pathsForBlob(blobId(object), revision) : [];
   }
 
+  private async evidenceNotes(ref = "refs/notes/reveries"): Promise<readonly NoteListEntry[]> {
+    return this.proposedNotesTip !== undefined && ref === "refs/notes/reveries"
+      ? this.repository.listNotesAt(this.proposedNotesTip)
+      : this.repository.listNotes(ref);
+  }
+
+  private async readEvidenceNote(object: ObjectId, ref = "refs/notes/reveries"): Promise<string | null> {
+    return this.proposedNotesTip !== undefined && ref === "refs/notes/reveries"
+      ? this.repository.readNoteAt(this.proposedNotesTip, object)
+      : this.repository.readNoteFromRef(ref, object);
+  }
+
   private async strictRead(object: ObjectId, ref = "refs/notes/reveries"): Promise<{
     readonly records: readonly NoteRecord[];
     readonly projection: ActiveProjection;
   }> {
-    const note = await this.repository.readNoteFromRef(ref, object);
+    const note = await this.readEvidenceNote(object, ref);
     if (note === null) {
       return { records: [], projection: projectActiveReveries([]) };
     }
@@ -790,8 +846,8 @@ export class Reveries {
   }
 
   private async findReverie(id: string, ref: string): Promise<boolean> {
-    for (const entry of await this.repository.listNotes(ref)) {
-      const note = await this.repository.readNoteFromRef(ref, entry.object);
+    for (const entry of await this.evidenceNotes(ref)) {
+      const note = await this.readEvidenceNote(entry.object, ref);
       if (note === null) continue;
       const parsed = parseNote(note, "tolerant", { verifyIds: false });
       if (parsed.records.some((record) => record.type === "reverie" && record.id === id)) return true;
@@ -801,8 +857,8 @@ export class Reveries {
 
   private async findInitialization(): Promise<{ readonly commit: CommitId; readonly record: ReveriesInit } | null> {
     let found: { readonly commit: CommitId; readonly record: ReveriesInit } | null = null;
-    for (const entry of await this.repository.listNotes()) {
-      const note = await this.repository.readNote(entry.object);
+    for (const entry of await this.evidenceNotes()) {
+      const note = await this.readEvidenceNote(entry.object);
       if (note === null) continue;
       const parsed = parseNote(note, "tolerant", { verifyIds: false });
       for (const record of parsed.records) {
@@ -820,7 +876,7 @@ export class Reveries {
   private async currentNoteTargets(revision: string): Promise<readonly NoteListEntry[]> {
     const tree = await this.repository.listTree(revision);
     const notes = new Map<string, NoteListEntry>();
-    const available = new Map((await this.repository.listNotes()).map((entry) => [entry.object, entry]));
+    const available = new Map((await this.evidenceNotes()).map((entry) => [entry.object, entry]));
     for (const entry of tree) {
       const note = available.get(entry.object);
       if (note !== undefined) notes.set(note.object, note);
@@ -897,7 +953,7 @@ export class Reveries {
     const predecessors = new Map<BlobId, ActiveProjection>();
     const successors = new Map<BlobId, ActiveProjection>();
     for (const transition of transitions) {
-      if (await this.repository.readNote(transition.from) !== null) {
+      if (await this.readEvidenceNote(transition.from) !== null) {
         predecessors.set(transition.from, await this.projectionFor(transition.from));
       }
       if (transition.to !== undefined) {

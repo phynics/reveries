@@ -1,0 +1,42 @@
+name: Reveries controlled merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to merge
+        required: true
+        type: string
+      base_tree:
+        description: Base tree bound to the successful Reveries receive-check
+        required: true
+        type: string
+      merge_method:
+        description: GitHub merge method
+        required: true
+        default: squash
+        type: choice
+        options: [merge, squash, rebase]
+
+permissions:
+  checks: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  merge:
+    name: Merge after app-owned receive-check
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVERIES_REQUIRED_CHECK: Reveries receive-check
+      REVERIES_REQUIRED_APP_SLUG: reveries
+      REVERIES_REQUIRED_APP_ID: ${{ vars.REVERIES_APP_ID }}
+      REVERIES_PULL_REQUEST: ${{ inputs.pull_request }}
+      REVERIES_BASE_TREE: ${{ inputs.base_tree }}
+      REVERIES_MERGE_METHOD: ${{ inputs.merge_method }}
+    steps:
+      - name: Check out the merge bot
+        uses: actions/checkout@v7
+      - name: Verify and merge
+        run: node scripts/controlled-merge.mjs

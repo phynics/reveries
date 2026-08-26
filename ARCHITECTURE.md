@@ -25,7 +25,7 @@ const strict = validateNote(parsed);
 const projection = projectActiveReveries(strict.reveries);
 ```
 
-Host adapters translate native events into `HookEvent` and pass them to one shared hook handler. Adapters do not parse notes or decide continuity.
+Host adapters translate native events into `HookEvent` and pass them to one shared hook handler. Receive adapters translate proposed refs and hosted events into the same receive-check contract; neither adapter parses notes or decides continuity.
 
 ## Shape
 
@@ -33,7 +33,7 @@ The package has four modules grouped by the knowledge they own:
 
 - `protocol` owns record types, canonical JSONL, semantic IDs, strict and tolerant parsing, source syntax, and active projection.
 - `git` owns argv-based Git execution, object resolution, notes transactions, tree and history facts, remotes, and the common-directory lock.
-- `operations` owns complete user actions such as record, summarize, check, search, sync, push, doctor, and initialization.
+- `operations` owns complete user actions such as record, summarize, check, receive-check, search, sync, push, doctor, and initialization. Receive checks reuse these operations against a proposed notes snapshot opened from a bare repository.
 - `cli` and `hooks` parse external inputs and render typed outcomes.
 
 External JSON, CLI arguments, Git output, and host events are `unknown` until their boundary parser returns domain values. Blob IDs, commit IDs, object IDs, and reverie IDs use separate branded types. Protocol functions do not import process, filesystem, or child-process modules.

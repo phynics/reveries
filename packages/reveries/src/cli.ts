@@ -11,8 +11,10 @@ import {
   type SkillSetup,
   type SupportedHost,
 } from "./install.ts";
+import { NOTES_REF } from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
 import { Reveries, type PushUpdate } from "./operations.ts";
+import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
 import {
   blobId,
   commitId,
@@ -75,6 +77,7 @@ Commands:
   sync       Inspect or pull a publishing remote's notes
   push       Atomically push HEAD and refs/notes/reveries
   hook       Handle one host-neutral adapter event from standard input
+  receive-check Validate proposed refs and evidence without a worktree
   remove     Remove owned integration without deleting evidence
 
 Init requires an explicit choice for hosts, publishing, directive email, and
@@ -155,6 +158,86 @@ function parsePushUpdates(input: string): PushUpdate[] {
         remoteObject: /^0+$/.test(remoteValue) ? null : objectId(remoteValue),
       };
     });
+}
+
+function parseReceiveObject(value: unknown, label: string): ReturnType<typeof objectId> | null {
+  const raw = expectString(value, label);
+  if (/^0+$/.test(raw)) return null;
+  try {
+    return objectId(raw);
+  } catch (error: unknown) {
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function parseReceiveUpdate(value: unknown, index: number): ReceiveRefUpdate {
+  const update = expectObject(value, `receive update ${index + 1}`);
+  return {
+    ref: expectString(update.ref, `receive update ${index + 1}.ref`),
+    oldObject: parseReceiveObject(update.old ?? update.oldObject, `receive update ${index + 1}.old`),
+    newObject: parseReceiveObject(update.new ?? update.newObject, `receive update ${index + 1}.new`),
+  };
+}
+
+function parseReceiveEvidence(value: unknown, index: number): ReceiveEvidence {
+  if (typeof value === "string") {
+    try {
+      return { object: objectId(value) };
+    } catch (error: unknown) {
+      throw new UsageError(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const evidence = expectObject(value, `evidence ${index + 1}`);
+  const object = parseReceiveObject(evidence.object, `evidence ${index + 1}.object`);
+  if (object === null) throw new UsageError(`evidence ${index + 1}.object cannot be zero`);
+  const baseTree = evidence.base_tree === undefined
+    ? undefined
+    : parseReceiveObject(evidence.base_tree, `evidence ${index + 1}.base_tree`);
+  return { object, ...(baseTree === undefined || baseTree === null ? {} : { baseTree }) };
+}
+
+async function parseReceiveInput(input: string): Promise<ReceiveCheckInput> {
+  const trimmed = input.trim();
+  if (trimmed.startsWith("{")) {
+    let value: unknown;
+    try {
+      value = JSON.parse(trimmed) as unknown;
+    } catch (error: unknown) {
+      throw new UsageError(`receive-check input is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const proposal = expectObject(value, "receive proposal");
+    if (!Array.isArray(proposal.updates)) throw new UsageError("receive proposal updates must be an array");
+    const evidence = proposal.evidence === undefined
+      ? []
+      : !Array.isArray(proposal.evidence)
+        ? (() => { throw new UsageError("receive proposal evidence must be an array"); })()
+        : proposal.evidence.map(parseReceiveEvidence);
+    const baseTree = proposal.base_tree === undefined
+      ? undefined
+      : parseReceiveObject(proposal.base_tree, "receive proposal.base_tree");
+    return {
+      updates: proposal.updates.map(parseReceiveUpdate),
+      evidence,
+      ...(baseTree === undefined || baseTree === null ? {} : { baseTree }),
+    };
+  }
+  const updates: ReceiveRefUpdate[] = [];
+  for (const [index, line] of trimmed.split("\n").entries()) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length !== 3 || fields.some((field) => field.length === 0 || field.includes("\0"))) {
+      throw new UsageError(`receive-check received a malformed ref update on line ${index + 1}`);
+    }
+    const [oldValue, newValue, ref] = fields;
+    if (oldValue === undefined || newValue === undefined || ref === undefined) {
+      throw new UsageError(`receive-check received a malformed ref update on line ${index + 1}`);
+    }
+    updates.push({
+      ref,
+      oldObject: parseReceiveObject(oldValue, `receive update ${index + 1}.old`),
+      newObject: parseReceiveObject(newValue, `receive update ${index + 1}.new`),
+    });
+  }
+  return { updates, evidence: [] };
 }
 
 function one(parsed: ParsedArguments, name: string, required = false): string | undefined {
@@ -332,7 +415,7 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
   const command = argv[0];
   try {
     if (command === undefined) throw new UsageError("a command is required");
-    const reveries = command === "init" || command === "adopt" || command === "remove" || command === "hook" || command === "help" || command === "--help" || command === "--version"
+    const reveries = command === "init" || command === "adopt" || command === "remove" || command === "hook" || command === "receive-check" || command === "help" || command === "--help" || command === "--version"
       ? null
       : await Reveries.open(io.cwd);
     if (command === "--version") {
@@ -403,6 +486,39 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       const result = await handleHookEvent(event, { cwd: io.cwd });
       io.stdout(`${JSON.stringify(result)}\n`);
       return 0;
+    }
+    if (command === "receive-check") {
+      const parsed = parseArguments(
+        argv.slice(1),
+        ["--evidence", "--base-tree", "--notes-tip"],
+        ["--json"],
+      );
+      const input = await parseReceiveInput(await io.stdin());
+      const evidence = [
+        ...(input.evidence ?? []),
+        ...(parsed.values.get("--evidence") ?? []).map((value, index) => parseReceiveEvidence(value, index)),
+      ];
+      const baseTreeValue = one(parsed, "--base-tree");
+      const baseTree = baseTreeValue === undefined
+        ? input.baseTree
+        : parseReceiveObject(baseTreeValue, "--base-tree");
+      const notesTipValue = one(parsed, "--notes-tip");
+      const updates = [...input.updates];
+      if (notesTipValue !== undefined) {
+        const notesTip = parseReceiveObject(notesTipValue, "--notes-tip");
+        if (notesTip === null) throw new UsageError("--notes-tip cannot be zero");
+        const existing = updates.findIndex((update) => update.ref === NOTES_REF);
+        const notesUpdate = { ref: NOTES_REF, oldObject: null, newObject: notesTip };
+        if (existing < 0) updates.push(notesUpdate);
+        else updates.splice(existing, 1, notesUpdate);
+      }
+      const receive = await checkReceive(io.cwd, {
+        updates,
+        evidence,
+        ...(baseTree === undefined || baseTree === null ? {} : { baseTree }),
+      });
+      emit(io, json, command, receive, receive.diagnostics);
+      return receive.ok ? 0 : 1;
     }
     if (reveries === null) throw new Error("Reveries service was not opened");
     if (command === "show") {
