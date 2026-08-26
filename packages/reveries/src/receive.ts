@@ -174,12 +174,10 @@ export async function checkReceive(cwd: string, input: ReceiveCheckInput): Promi
       const currentBaseTree = update.oldObject === null
         ? null
         : await repository.treeForCommit(update.oldObject);
-      if (baseTree !== null && currentBaseTree !== null && baseTree !== currentBaseTree) {
-        diagnostics.push(`${update.ref}: base tree changed; prior evidence is invalid`);
-      }
       if (baseTree === null && currentBaseTree !== null) baseTree = currentBaseTree;
+      const evidenceBaseTree = baseTree ?? currentBaseTree;
       for (const item of evidence) {
-        if (item.baseTree !== undefined && currentBaseTree !== null && item.baseTree !== currentBaseTree) {
+        if (item.baseTree !== undefined && evidenceBaseTree !== null && item.baseTree !== evidenceBaseTree) {
           diagnostics.push(`${update.ref}: evidence base tree changed; rerun the receive check`);
         }
       }

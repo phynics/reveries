@@ -49,9 +49,12 @@ if (event.pull_request !== undefined) {
 }
 
 const baseTree = await git("rev-parse", `${baseSha}^{tree}`);
+const transitionBaseSha = event.pull_request === undefined
+  ? baseSha
+  : await git("merge-base", baseSha, headSha);
 const proposal = {
   updates: [
-    { ref, old: baseSha, new: headSha },
+    { ref, old: transitionBaseSha, new: headSha },
     { ref: "refs/notes/reveries", old: notesTip, new: notesTip },
   ],
   base_tree: baseTree,
