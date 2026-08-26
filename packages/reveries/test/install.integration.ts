@@ -403,7 +403,7 @@ test("doctor reports a prepared installation as successful before the adoption c
 test("initialization removes legacy managed generic push refspecs", async () => {
   const directory = await createRepository();
   await git(directory, "config", "--add", "remote.origin.push", "HEAD");
-  await git(directory, "config", "--add", "remote.origin.push", "refs/notes/reveries:refs/notes/reveries");
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
   await git(directory, "config", "reveries.managed-origin.pushHead", "true");
   await git(directory, "config", "reveries.managed-origin.pushNotes", "true");
 
@@ -478,7 +478,8 @@ test("doctor validates selected remote config before adoption", async () => {
 
   const result = await (await Reveries.open(directory)).doctor();
   assert.equal(result.state, "damaged");
-  assert.match(result.diagnostics.join("\n"), /unsafe non-atomic notes push refspec/i);
+  assert.match(result.diagnostics.join("\n"), /unsafe generic push refspecs/i);
+  assert.equal(result.protection.local, "partial");
 });
 
 test("local-only setup accepts no hosts, publishing remotes, or directive email", async () => {

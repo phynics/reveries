@@ -552,6 +552,7 @@ export class Reveries {
       ? (await this.repository.run(["config", "--get-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1] }))
           .stdout.trim().split("\n").filter(Boolean)
       : initialization.record.publishing_remotes;
+    const remotes = (await this.repository.run(["remote"])).stdout.trimEnd().split("\n").filter(Boolean);
     if (initialization === null) {
       notices.push("Reveries is prepared; the adoption boundary has not been committed and annotated yet");
       const localOnly = await this.repository.run(["config", "--get", "reveries.localOnly"], { allowExitCodes: [0, 1] });
@@ -559,20 +560,26 @@ export class Reveries {
         diagnostics.push("Prepared publishing choice is missing");
       }
     }
-    for (const remote of configuredRemotes) {
+    let unsafeGenericPush = false;
+    for (const remote of new Set([...configuredRemotes, ...remotes])) {
+        const push = await this.repository.run(
+          ["config", "--get-all", `remote.${remote}.push`],
+          { allowExitCodes: [0, 1] },
+        );
+        const pushValues = push.stdout.split("\n")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0 && !value.startsWith("^"));
+        if (pushValues.length > 0) {
+          diagnostics.push(`Remote ${remote} has unsafe generic push refspecs; use reveries push`);
+          unsafeGenericPush = true;
+        }
+        if (!configuredRemotes.includes(remote)) continue;
         const fetch = await this.repository.run(
           ["config", "--get-all", `remote.${remote}.fetch`],
           { allowExitCodes: [0, 1] },
         );
         if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries*`)) {
           diagnostics.push(`Publishing remote ${remote} lacks the Reveries fetch refspec`);
-        }
-        const push = await this.repository.run(
-          ["config", "--get-all", `remote.${remote}.push`],
-          { allowExitCodes: [0, 1] },
-        );
-        if (push.stdout.split("\n").some((value) => value.trim() === `${NOTES_REF}:${NOTES_REF}`)) {
-          diagnostics.push(`Publishing remote ${remote} has an unsafe non-atomic notes push refspec; use reveries push`);
         }
         const remoteTip = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
         const localTip = await this.repository.notesTip();
@@ -600,7 +607,7 @@ export class Reveries {
     const requiredHooks = configuredRemotes.length === 0
       ? ["post-commit"] as const
       : ["pre-push", "post-commit"] as const;
-    let localHookComplete = configuredRemotes.length > 0;
+    let localHookComplete = configuredRemotes.length > 0 && !unsafeGenericPush;
     for (const name of requiredHooks) {
       try {
         const hook = await readFile(join(commonDirectory, "hooks", name), "utf8");
@@ -637,7 +644,13 @@ export class Reveries {
     }
     const protection: DoctorProtection = {
       helper: helperAvailable ? "available" : "unavailable",
-      local: configuredRemotes.length === 0 ? "not-configured" : localHookComplete ? "complete" : "partial",
+      local: unsafeGenericPush
+        ? "partial"
+        : configuredRemotes.length === 0
+          ? "not-configured"
+          : localHookComplete
+            ? "complete"
+            : "partial",
       receiveSide: "unknown",
     };
     notices.push(
