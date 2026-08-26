@@ -24,6 +24,17 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
+async function quarantinedNote(cwd: string, ref: string, object: string): Promise<string> {
+  const tree = await git(cwd, "ls-tree", "-r", ref);
+  const line = tree.split("\n").find((candidate) => {
+    const path = candidate.slice(candidate.indexOf("\t") + 1).replaceAll("/", "");
+    return path === object;
+  });
+  assert.ok(line, `quarantine candidate does not contain a note for ${object}`);
+  const path = line.slice(line.indexOf("\t") + 1);
+  return git(cwd, "cat-file", "blob", `${ref}:${path}`);
+}
+
 async function createRepository(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "reveries-acceptance-"));
   temporaryRepositories.push(directory);
@@ -315,4 +326,62 @@ test("a rejected atomic publication advances neither branch nor notes", async ()
   await assert.rejects(() => reveries.push("origin"), /rejected|failed|atomic/i);
   assert.equal(await git(bare, "rev-parse", "refs/heads/main"), branchBefore);
   assert.equal(await git(bare, "rev-parse", "refs/notes/reveries"), notesBefore);
+});
+
+test("sync quarantines an invalid fetched union without promoting or losing records", async () => {
+  const source = await createRepository();
+  const bare = await mkdtemp(join(tmpdir(), "reveries-acceptance-quarantine-bare-"));
+  const local = await mkdtemp(join(tmpdir(), "reveries-acceptance-quarantine-local-"));
+  const remote = await mkdtemp(join(tmpdir(), "reveries-acceptance-quarantine-remote-"));
+  temporaryRepositories.push(bare, local, remote);
+  await git(bare, "init", "--bare");
+  await git(source, "remote", "add", "origin", bare);
+  await git(source, "push", "origin", "main");
+  await git(local, "clone", source, ".");
+  await git(remote, "clone", source, ".");
+  for (const clone of [local, remote]) {
+    await git(clone, "remote", "set-url", "origin", bare);
+    await git(clone, "config", "user.name", "Reveries Test");
+    await git(clone, "config", "user.email", "reveries@example.com");
+  }
+
+  const localReveries = await Reveries.open(local);
+  const remoteReveries = await Reveries.open(remote);
+  const localRepository = await GitRepository.open(local);
+  const remoteRepository = await GitRepository.open(remote);
+  const commit = await localRepository.resolveCommit("HEAD");
+  const blob = await localRepository.resolvePath({ path: "state.txt", revision: "HEAD" });
+  const localRecord = await localReveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const remoteRecord = await remoteReveries.recordNew({
+    path: "state.txt",
+    revision: "HEAD",
+    semantic: { ...semantic, decision: "Use the remote guarded boundary because it owns the merged transition format." },
+    metadata,
+  });
+  await localRepository.withNotesWrite((notes) => notes.append(commit, canonicalRecord({
+    ...summary(),
+    entries: [{ ...summary().entries[0]!, decision: "Keep the local summary while the union is unresolved." }],
+  })));
+  await remoteRepository.withNotesWrite((notes) => notes.append(commit, canonicalRecord({
+    ...summary(),
+    entries: [{ ...summary().entries[0]!, decision: "Keep the remote summary while the union is unresolved." }],
+  })));
+  await git(remote, "push", "origin", "refs/notes/reveries:refs/notes/reveries");
+
+  const canonicalBefore = await localRepository.notesTip();
+  const result = await localReveries.syncPull("origin");
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.match(result.diagnostics.join("\n"), /more than one session summary/i);
+  assert.match(result.diagnostics.join("\n"), /quarantined at refs\/reveries\/quarantine\/origin\//i);
+  assert.equal(await localRepository.notesTip(), canonicalBefore);
+
+  const quarantine = await git(local, "for-each-ref", "--format=%(refname)", "refs/reveries/quarantine/origin");
+  assert.match(quarantine, /^refs\/reveries\/quarantine\/origin\/[0-9a-f]{40}$/);
+  const quarantinedBlobNote = await quarantinedNote(local, quarantine, blob);
+  assert.match(quarantinedBlobNote, new RegExp(localRecord.record.id));
+  assert.match(quarantinedBlobNote, new RegExp(remoteRecord.record.id));
+  const quarantinedSummaryNote = await quarantinedNote(local, quarantine, commit);
+  assert.match(quarantinedSummaryNote, /Keep the local summary/);
+  assert.match(quarantinedSummaryNote, /Keep the remote summary/);
 });

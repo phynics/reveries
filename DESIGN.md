@@ -1120,10 +1120,16 @@ It does not automatically merge that state into the local writable notes ref.
 ### 17.2 Explicit merge
 
 ```bash
-git notes --ref=refs/notes/reveries \
+git notes --ref=refs/notes/reveries-txn/<candidate> \
   merge -s cat_sort_uniq \
   refs/notes/remotes/origin/reveries
 ```
+
+The helper merges the local and fetched notes into a private candidate, loads and validates one
+complete snapshot, and compare-and-swaps the candidate into `refs/notes/reveries` only after the
+snapshot is valid. An invalid candidate remains available at
+`refs/reveries/quarantine/<remote>/<oid>` so a later resolver can inspect and replace it without
+losing either source history.
 
 The helper provides:
 
@@ -1134,10 +1140,10 @@ reveries sync --pull origin
 It performs:
 
 1. fetch;
-2. notes merge;
-3. canonical validation;
-4. semantic-conflict analysis;
-5. status report.
+2. private candidate notes merge;
+3. complete-snapshot validation, including syntax, IDs, sources, projections, and global invariants;
+4. compare-and-swap promotion only for a valid candidate;
+5. quarantine and status report for an invalid candidate.
 
 Agent startup never performs network access automatically.
 
