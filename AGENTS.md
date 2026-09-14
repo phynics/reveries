@@ -7,9 +7,9 @@ This repository stores engineering decisions in Git notes at
 Before interpreting or changing tracked code, use `using-reveries`.
 For rationale and history questions, use `reveries-git-notes-search`.
 
-This repository vendors `using-reveries` at
-`.agents/skills/using-reveries/SKILL.md`. If the host did not load the Skill,
-read that file before continuing.
+This repository exposes linked project Skills under `.agents/skills`. If the
+host did not load them, read `.agents/skills/using-reveries/SKILL.md` before
+continuing.
 
 Automatic note delivery is best-effort. When needed, inspect a file directly:
 

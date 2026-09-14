@@ -17,12 +17,13 @@ jobs:
     env:
       REVERIES_REQUIRED_CHECK: Reveries receive-check
     steps:
-      - name: Check out proposed code
+      - name: Check out the trusted base revision
         uses: actions/checkout@v7
         with:
-          # Keep workflow code on the trusted base revision. Proposed objects
-          # are fetched below and are never executed as a package.
-          ref: ${{ github.sha }}
+          # github.sha is the proposed merge commit for pull_request and the
+          # queued head for merge_group, so it would run the proposal's own
+          # checker. Proposed objects are fetched below and never executed.
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           fetch-depth: 0
 
       - name: Set up Node.js
