@@ -163,10 +163,11 @@ git push --no-verify origin HEAD
 
 Push the notes first and push code only after the evidence succeeds. This ordering avoids publishing
 code before its evidence, but it is not atomic and cannot prevent a later code push from being made
-without the notes. The second command uses `--no-verify` because the local hook rejects every raw
-branch publication. This explicit bypass is part of the lower-grade fallback. Local hooks are
-accidental-bypass protection, not a security boundary. Configure receive-side checks for a stronger
-boundary.
+without the notes. The second command uses `--no-verify` because the Reveries pre-push hook rejects
+raw branch publication. The flag skips the entire configured pre-push hook, including unrelated
+checks. Inspect the hook first. Run any other required checks separately, or do not use this fallback.
+Local hooks are accidental-bypass protection, not a security boundary. Configure receive-side
+checks for a stronger boundary.
 
 ## Protocol documentation
 

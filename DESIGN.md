@@ -1230,8 +1230,10 @@ git push --no-verify origin HEAD
 
 The second command must run only after the first succeeds. This avoids code-before-evidence but is
 not atomic: a later code push can still omit notes, and a failure between the two commands leaves
-the remote with evidence ahead of code. The `--no-verify` flag is an explicit bypass of the local
-raw-publication guard. Use receive-side enforcement when this distinction matters.
+the remote with evidence ahead of code. The `--no-verify` flag skips the entire configured pre-push
+hook, not only Reveries' raw-publication guard. Inspect the hook first. Run other required checks
+separately, or do not use this fallback. Require receive-side enforcement because local hooks can be
+bypassed.
 
 ### 18.5 Pre-push enforcement
 

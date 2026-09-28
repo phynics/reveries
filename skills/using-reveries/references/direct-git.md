@@ -157,10 +157,13 @@ When available, prefer `reveries push origin`: it checks atomic-push support and
 and notes refs in one transaction. With Git alone, first confirm the notes and code are ready, then
 push the notes ref before the code ref as a lower-grade fallback. These pushes are separate and are
 not atomic; the second can fail after notes have reached the remote. Do not force either ref.
+The branch command uses `--no-verify` because the Reveries pre-push hook rejects raw branch
+publication. That flag skips the entire configured `pre-push` hook, including other checks. Inspect
+the hook first. Run any other required checks separately, or do not use this fallback.
 
 ```bash
 branch="$(git branch --show-current)"
-git push --no-verify origin refs/notes/reveries:refs/notes/reveries
+git push origin refs/notes/reveries:refs/notes/reveries
 git push --no-verify origin "$branch:refs/heads/$branch"
 ```
 

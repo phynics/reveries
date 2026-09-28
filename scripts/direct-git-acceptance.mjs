@@ -144,6 +144,7 @@ async function checkCookbook(recipe) {
       "## Publish changes",
       "refs/notes/reveries:refs/notes/reveries",
       "--no-verify",
+      "Run any other required checks separately",
       "lower-grade",
     ],
   };
@@ -155,7 +156,7 @@ async function checkCookbook(recipe) {
     }
   }
   if (selected.includes("publish")) {
-    const notesPush = cookbook.indexOf("git push --no-verify origin refs/notes/reveries:refs/notes/reveries");
+    const notesPush = cookbook.indexOf("git push origin refs/notes/reveries:refs/notes/reveries");
     const branchPush = cookbook.indexOf('git push --no-verify origin "$branch:refs/heads/$branch"');
     assert.ok(notesPush >= 0 && branchPush > notesPush, "publish recipe must push notes before the code ref");
   }
