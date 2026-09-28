@@ -1,10 +1,8 @@
 name: Reveries receive-check
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
-  merge_group:
-    types: [checks_requested]
 
 permissions:
   contents: read
@@ -20,11 +18,11 @@ jobs:
       - name: Check out the trusted base revision
         uses: actions/checkout@v7
         with:
-          # github.sha is the proposed merge commit for pull_request and the
-          # queued head for merge_group, so it would run the proposal's own
-          # checker. Proposed objects are fetched below and never executed.
-          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          # Keep the workflow, scripts, package metadata, and dependencies on
+          # the trusted base revision. Proposed objects are fetched below.
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -41,8 +39,8 @@ jobs:
       - name: Fetch proposed code and evidence objects
         shell: bash
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           git fetch --no-tags "https://github.com/${HEAD_REPOSITORY}.git" "+${HEAD_SHA}:refs/reveries/proposed-head"

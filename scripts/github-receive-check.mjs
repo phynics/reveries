@@ -4,7 +4,6 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, "utf8"));
 
 function run(command, args, input = "") {
   return new Promise((resolvePromise, reject) => {
@@ -32,39 +31,48 @@ async function git(...args) {
   return result.stdout.trim();
 }
 
-const notesTip = await git("rev-parse", "refs/notes/reveries");
-let baseSha;
-let headSha;
-let ref;
-if (event.pull_request !== undefined) {
-  baseSha = event.pull_request.base.sha;
-  headSha = event.pull_request.head.sha;
-  ref = `refs/pull/${event.pull_request.number}/head`;
-} else if (event.merge_group !== undefined) {
-  baseSha = event.merge_group.base_sha;
-  headSha = event.merge_group.head_sha;
-  ref = event.merge_group.base_ref;
-} else {
-  throw new Error("Reveries receive check only supports pull_request and merge_group events");
+export async function createReceiveProposal(event, git) {
+  const notesTip = await git("rev-parse", "refs/notes/reveries");
+  let baseSha;
+  let headSha;
+  let ref;
+  if (event.pull_request !== undefined) {
+    baseSha = event.pull_request.base.sha;
+    headSha = event.pull_request.head.sha;
+    ref = `refs/pull/${event.pull_request.number}/head`;
+  } else if (event.merge_group !== undefined) {
+    baseSha = event.merge_group.base_sha;
+    headSha = event.merge_group.head_sha;
+    ref = event.merge_group.base_ref;
+  } else {
+    throw new Error("Reveries receive check only supports pull_request and merge_group events");
+  }
+
+  const baseTree = await git("rev-parse", `${baseSha}^{tree}`);
+  const transitionBaseSha = event.pull_request === undefined
+    ? baseSha
+    : await git("merge-base", baseSha, headSha);
+  return {
+    updates: [
+      { ref, old: transitionBaseSha, new: headSha },
+      { ref: "refs/notes/reveries", old: notesTip, new: notesTip },
+    ],
+    base_tree: baseTree,
+    evidence: [
+      { object: headSha, base_tree: baseTree },
+      { object: notesTip },
+    ],
+  };
 }
 
-const baseTree = await git("rev-parse", `${baseSha}^{tree}`);
-const transitionBaseSha = event.pull_request === undefined
-  ? baseSha
-  : await git("merge-base", baseSha, headSha);
-const proposal = {
-  updates: [
-    { ref, old: transitionBaseSha, new: headSha },
-    { ref: "refs/notes/reveries", old: notesTip, new: notesTip },
-  ],
-  base_tree: baseTree,
-  evidence: [
-    { object: headSha, base_tree: baseTree },
-    { object: notesTip },
-  ],
-};
-const cli = join(workspace, "packages", "reveries", "dist", "src", "main.js");
-const result = await run(process.execPath, [cli, "receive-check", "--json"], `${JSON.stringify(proposal)}\n`);
-process.stdout.write(result.stdout);
-process.stderr.write(result.stderr);
-process.exitCode = result.code;
+async function main() {
+  const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, "utf8"));
+  const proposal = await createReceiveProposal(event, git);
+  const cli = join(workspace, "packages", "reveries", "dist", "src", "main.js");
+  const result = await run(process.execPath, [cli, "receive-check", "--json"], `${JSON.stringify(proposal)}\n`);
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  process.exitCode = result.code;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
