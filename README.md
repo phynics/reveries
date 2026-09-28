@@ -45,6 +45,13 @@ the usual Git submodule checkout step on fresh clones. The Skills and direct Git
 require the helper. After adoption, publish with `reveries push <remote>`. Do not use a generic
 multi-ref `git push`: only the helper verifies and requests an atomic branch-plus-notes update.
 
+### Adopt without the helper
+
+When the helper is unavailable, follow the [Git-only manual setup guide](skills/reveries-git-notes-init/references/manual-setup.md).
+It creates the same tracked instruction blocks and adoption records. After the helper is available,
+run `reveries init` with the same answers to install local hooks without rewriting tracked setup.
+Git-only setup does not provide strict checking or atomic publication.
+
 Build and run the helper from this repository:
 
 ```bash

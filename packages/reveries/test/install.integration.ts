@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { commitAdoption, initializeRepository, removeIntegration } from "../src/install.ts";
 import { Reveries } from "../src/operations.ts";
@@ -12,6 +13,7 @@ import { Reveries } from "../src/operations.ts";
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
 let previousGlobalConfig: string | undefined;
+const manualSetupGuide = join(dirname(fileURLToPath(import.meta.url)), "../../../skills/reveries-git-notes-init/references/manual-setup.md");
 const helper = {
   command: "/bin/sh",
   args: ["-c", "if [ \"$1\" = --version ]; then echo 'reveries 1.0.1'; fi", "reveries-test-helper"],
@@ -733,4 +735,75 @@ test("removal keeps the notes ref and unknown prose", async () => {
   assert.equal(await git(directory, "config", "--get-all", "remote.origin.push"), "HEAD");
   assert.match(await readFile(hook, "utf8"), /retained-custom-step/);
   assert.doesNotMatch(await readFile(hook, "utf8"), /reveries:begin/);
+});
+
+function documentedTemplate(markdown: string, label: string): string {
+  const marker = `<!-- manual-template:${label} -->`;
+  const markerOffset = markdown.indexOf(marker);
+  assert.notEqual(markerOffset, -1, `manual setup guide is missing template ${label}`);
+  const fence = "```markdown\n";
+  const fenceOffset = markdown.indexOf(fence, markerOffset + marker.length);
+  assert.notEqual(fenceOffset, -1, `manual setup template ${label} has no markdown fence`);
+  const contentStart = fenceOffset + fence.length;
+  const contentEnd = markdown.indexOf("\n```", contentStart);
+  assert.notEqual(contentEnd, -1, `manual setup template ${label} has no closing fence`);
+  return markdown.slice(contentStart, contentEnd).replaceAll(
+    "{{SKILL_REPOSITORY}}",
+    "https://github.com/phynics/reveries",
+  );
+}
+
+function ownedInstructionBlock(text: string): string {
+  const begin = "<!-- reveries:begin -->";
+  const end = "<!-- reveries:end -->";
+  const start = text.indexOf(begin);
+  assert.notEqual(start, -1, "helper output is missing its Reveries begin marker");
+  const endOffset = text.indexOf(end, start);
+  assert.notEqual(endOffset, -1, "helper output is missing its Reveries end marker");
+  return text.slice(start, endOffset + end.length);
+}
+
+test("manual setup blocks match every helper Skill and host template byte-for-byte", async () => {
+  const guide = await readFile(manualSetupGuide, "utf8");
+  const repositoryUrl = "https://github.com/phynics/reveries";
+  const setups = [
+    { label: "agents-reminder", setup: { kind: "reminder" } as const },
+    { label: "agents-pull", setup: { kind: "pull", repository: repositoryUrl } as const },
+    { label: "agents-vendored", setup: { kind: "vendored", sourceRoot: "skills" } as const },
+    { label: "agents-symlink", setup: { kind: "symlink", sourceRoot: "skills" } as const },
+    { label: "agents-submodule", setup: { kind: "submodule", repository: repositoryUrl } as const },
+  ];
+
+  for (const { label, setup } of setups) {
+    const directory = await createRepository();
+    if (setup.kind === "vendored" || setup.kind === "symlink") await createSkillSource(directory);
+    if (setup.kind === "submodule") {
+      const source = await createSkillRepository();
+      await configureLocalSubmoduleSource(directory, source);
+    }
+    await initializeRepository(directory, {
+      hosts: ["claude", "gemini"],
+      publishingRemotes: ["origin"],
+      directiveEmail: "user@example.com",
+      skillSetup: setup,
+      helper,
+    });
+
+    const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
+    assert.equal(
+      documentedTemplate(guide, label),
+      ownedInstructionBlock(agents),
+      `${label} differs from the helper-owned AGENTS.md block`,
+    );
+    assert.equal(
+      documentedTemplate(guide, "host-claude"),
+      ownedInstructionBlock(await readFile(join(directory, "CLAUDE.md"), "utf8")),
+      "Claude host block differs from helper output",
+    );
+    assert.equal(
+      documentedTemplate(guide, "host-gemini"),
+      ownedInstructionBlock(await readFile(join(directory, "GEMINI.md"), "utf8")),
+      "Gemini host block differs from helper output",
+    );
+  }
 });
