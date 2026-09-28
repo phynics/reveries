@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { blobId, commitId, objectId, type BlobId, type CommitId, type ObjectId } from "./protocol.ts";
@@ -76,6 +76,12 @@ export type NotesValidationFailure = (
   candidate: ObjectId,
   error: unknown,
 ) => Promise<void>;
+
+interface GitStateFileSnapshot {
+  readonly name: string;
+  readonly path: string;
+  readonly contents: Buffer | null;
+}
 
 function isObjectId(value: string): value is ObjectId {
   return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
@@ -350,28 +356,89 @@ export class GitRepository {
     return result.stdout.split("\n").some((line) => line === object || line.startsWith(`${object} `));
   }
 
+  async commitWithNote(input: {
+    readonly message: string;
+    readonly note: string;
+    readonly validateNotesRef: NotesRefValidator;
+  }): Promise<CommitId> {
+    if (input.message.trim().length === 0) throw new Error("Commit message must be nonempty");
+
+    const commit = await this.withNotesLock(async () => {
+      const branchRef = await this.currentBranchRef();
+      const branchTip = await this.refTip(branchRef);
+      const notesTip = await this.notesTip();
+      const mergeHead = await this.readGitStateFile("MERGE_HEAD");
+      const mergeState = mergeHead.contents === null
+        ? []
+        : [mergeHead, await this.readGitStateFile("MERGE_MSG"), await this.readGitStateFile("MERGE_MODE")];
+      const temporaryRef = `refs/notes/reveries-txn/${process.pid}-${randomUUID()}`;
+      const messagePath = join(dirname(this.writeLockPath()), `commit-message-${randomUUID()}.txt`);
+
+      try {
+        if (notesTip !== null) await this.run(["update-ref", temporaryRef, notesTip]);
+        await writeFile(messagePath, `${input.message.replace(/\n*$/, "")}\n`, { encoding: "utf8", flag: "wx" });
+        await this.run(["hook", "run", "--ignore-missing", "pre-commit"]);
+        await this.run([
+          "hook",
+          "run",
+          "--ignore-missing",
+          "prepare-commit-msg",
+          "--",
+          messagePath,
+          "message",
+        ]);
+        await this.run(["hook", "run", "--ignore-missing", "commit-msg", "--", messagePath]);
+        const tree = parseObjectId((await this.run(["write-tree"])).stdout, "git write-tree");
+        const parents = this.commitParents(branchTip, mergeHead.contents);
+        const message = await readFile(messagePath, "utf8");
+        if (message.trim().length === 0) throw new Error("Commit message hook produced an empty message");
+        const signing = await this.run(["config", "--bool", "--get", "commit.gpgSign"], {
+          allowExitCodes: [0, 1],
+        });
+        const argumentsList = ["commit-tree", tree];
+        for (const parent of parents) argumentsList.push("-p", parent);
+        if (signing.stdout.trim() === "true") argumentsList.push("-S");
+        argumentsList.push("-F", "-");
+        const commit = commitId(parseObjectId(
+          (await this.run(argumentsList, { input: message })).stdout,
+          "git commit-tree",
+        ));
+
+        const notes = new TemporaryNotesTransaction(this, temporaryRef);
+        await notes.append(commit, input.note);
+        const newNotesTip = await this.notesTip(temporaryRef);
+        if (newNotesTip === null) throw new Error("Prepared Reveries notes transaction has no tip");
+        await input.validateNotesRef(temporaryRef);
+        const currentHead = await this.run(["symbolic-ref", "--quiet", "HEAD"], { allowExitCodes: [0, 1] });
+        if (currentHead.exitCode !== 0 || currentHead.stdout.trim() !== branchRef) {
+          throw new Error("The current branch changed concurrently during commit preparation");
+        }
+
+        await this.updateRefsAtomically([
+          { ref: branchRef, next: commit, expected: branchTip },
+          { ref: NOTES_REF, next: newNotesTip, expected: notesTip },
+        ]);
+        await this.clearMergeState(mergeState);
+        return commit;
+      } finally {
+        await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
+        await rm(messagePath, { force: true });
+      }
+    });
+    try {
+      await this.run(["hook", "run", "--ignore-missing", "post-commit"]);
+    } catch {
+      // A post-commit hook cannot undo a commit after its refs have been published.
+    }
+    return commit;
+  }
+
   async withNotesWrite<T>(
     operation: (notes: NotesTransaction) => Promise<T>,
     validate: NotesRefValidator = async () => undefined,
     onValidationFailure?: NotesValidationFailure,
   ): Promise<T> {
-    const lockPath = this.writeLockPath();
-    await mkdir(dirname(lockPath), { recursive: true });
-    try {
-      await mkdir(lockPath);
-    } catch (error: unknown) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        throw new NotesLockError(lockPath);
-      }
-      throw error;
-    }
-    await writeFile(
-      join(lockPath, "owner.json"),
-      `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`,
-      { encoding: "utf8", flag: "wx" },
-    );
-
-    try {
+    return this.withNotesLock(async () => {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const expectedTip = await this.notesTip();
         const temporaryRef = `refs/notes/reveries-txn/${process.pid}-${randomUUID()}`;
@@ -409,9 +476,97 @@ export class GitRepository {
         }
       }
       throw new Error("Unreachable notes transaction state");
+    });
+  }
+
+  private async withNotesLock<T>(operation: () => Promise<T>): Promise<T> {
+    const lockPath = this.writeLockPath();
+    await mkdir(dirname(lockPath), { recursive: true });
+    try {
+      await mkdir(lockPath);
+    } catch (error: unknown) {
+      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+        throw new NotesLockError(lockPath);
+      }
+      throw error;
+    }
+    try {
+      await writeFile(
+        join(lockPath, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`,
+        { encoding: "utf8", flag: "wx" },
+      );
+      return await operation();
     } finally {
       await rm(lockPath, { recursive: true, force: true });
     }
+  }
+
+  private async currentBranchRef(): Promise<string> {
+    const result = await this.run(["symbolic-ref", "--quiet", "HEAD"], { allowExitCodes: [0, 1] });
+    const ref = result.stdout.trim();
+    if (result.exitCode !== 0 || !ref.startsWith("refs/heads/")) {
+      throw new Error("Atomic commit-and-summary creation requires an attached branch");
+    }
+    return ref;
+  }
+
+  private async refTip(ref: string): Promise<CommitId | null> {
+    const result = await this.run(["rev-parse", "--verify", ref], { allowExitCodes: [0, 128] });
+    return result.exitCode === 0 ? commitId(parseObjectId(result.stdout, `git rev-parse ${ref}`)) : null;
+  }
+
+  private commitParents(branchTip: CommitId | null, mergeHead: Buffer | null): readonly CommitId[] {
+    const parents: CommitId[] = branchTip === null ? [] : [branchTip];
+    if (mergeHead !== null) {
+      const additional = mergeHead.toString("utf8").trim().split("\n").filter(Boolean);
+      for (const parent of additional) parents.push(commitId(parseObjectId(parent, "MERGE_HEAD")));
+    }
+    return parents;
+  }
+
+  private async readGitStateFile(name: string): Promise<GitStateFileSnapshot> {
+    const result = await this.run(["rev-parse", "--git-path", name]);
+    const path = result.stdout.trim();
+    const absolutePath = isAbsolute(path) ? path : join(this.commandCwd, path);
+    try {
+      return { name, path: absolutePath, contents: await readFile(absolutePath) };
+    } catch (error: unknown) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return { name, path: absolutePath, contents: null };
+      }
+      throw error;
+    }
+  }
+
+  private async clearMergeState(snapshots: readonly GitStateFileSnapshot[]): Promise<void> {
+    for (const snapshot of snapshots) {
+      const current = await this.readGitStateFile(snapshot.name);
+      const unchanged = snapshot.contents === null
+        ? current.contents === null
+        : current.contents !== null && snapshot.contents.equals(current.contents);
+      if (!unchanged) return;
+    }
+    for (const snapshot of snapshots) {
+      if (snapshot.contents !== null) await rm(snapshot.path, { force: true });
+    }
+  }
+
+  private async updateRefsAtomically(updates: readonly {
+    readonly ref: string;
+    readonly next: ObjectId;
+    readonly expected: ObjectId | null;
+  }[]): Promise<void> {
+    const format = await this.objectFormat();
+    const absent = "0".repeat(format === "sha1" ? 40 : 64);
+    const transaction = [
+      "start",
+      ...updates.map(({ ref, next, expected }) => `update ${ref} ${next} ${expected ?? absent}`),
+      "prepare",
+      "commit",
+      "",
+    ].join("\n");
+    await this.run(["update-ref", "--stdin"], { input: transaction });
   }
 
   async fetchNotes(remote: string): Promise<"fetched" | "absent"> {

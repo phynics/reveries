@@ -385,6 +385,18 @@ export class Reveries {
     }, (ref) => this.validateNotesRef(ref));
   }
 
+  async commitWithSummary(input: {
+    readonly message: string;
+    readonly summary: SessionSummary;
+  }): Promise<CommitId> {
+    validateNote([input.summary], { verifyIds: false });
+    return this.repository.commitWithNote({
+      message: input.message,
+      note: canonicalRecord(input.summary),
+      validateNotesRef: (ref) => this.validateNotesRef(ref),
+    });
+  }
+
   async attachInitialization(input: { readonly commit: string; readonly record: ReveriesInit }): Promise<void> {
     const commit = await this.repository.resolveCommit(input.commit);
     await this.repository.withNotesWrite(async (notes) => {
