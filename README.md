@@ -68,6 +68,62 @@ check commands accept `--json` for stable machine output. See
 [hosted enforcement](HOSTED_ENFORCEMENT.md) for the GHES hook, GitHub workflows, fork evidence
 import, and controlled merge bot.
 
+Create decisions from a partial JSON draft or directly from command-line fields:
+
+```bash
+cat > reverie.json <<'JSON'
+{
+  "driving_event": "Two callers can race to update the same state.",
+  "decision": "Use one guarded mutation boundary.",
+  "impact": "Every state transition passes through the guard."
+}
+JSON
+
+reveries record new src/state.ts --from reverie.json \
+  --alternative "Keep independent mutation paths" \
+  --source implements:issue:github:owner/repository#32
+
+cat > summary.json <<'JSON'
+{
+  "entries": [{
+    "driving_event": "A transition exposed two writers.",
+    "decision": "Keep one guarded mutation boundary.",
+    "impact": "All writers use the same transition check."
+  }]
+}
+JSON
+
+cat summary.json | reveries summarize HEAD --from -
+reveries summarize HEAD --from summary.json --edit
+
+# Supply causal fields without a draft file.
+reveries record new src/state.ts \
+  --driving-event "A state transition must be auditable." \
+  --decision "Attach its rationale to the blob." \
+  --impact "Future readers can inspect the decision."
+
+# Replace the placeholders with full reverie, blob, and commit IDs.
+reveries summarize HEAD \
+  --driving-event "A prior decision no longer applies." \
+  --decision "Retire the old reverie with a replacement." \
+  --impact "The new summary links both decisions." \
+  --no-recurrence-control \
+  --reverie 'rv:<reverie-id>' \
+  --retire 'rv:<reverie-id>:<blob-id>:The source changed: use the new boundary.'
+```
+
+The CLI fills missing author, timestamp, and session metadata from Git configuration, the current
+UTC time, and `--session` or `REVERIES_SESSION`. For `push` and `sync`, Reveries uses the current
+branch's upstream or the sole configured publishing remote. Pass a remote explicitly when those
+settings are ambiguous:
+
+```bash
+reveries sync --status
+reveries sync --pull
+reveries push
+reveries push origin
+```
+
 For day-to-day changes, use `using-reveries`:
 
 ```text

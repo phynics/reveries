@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
@@ -125,6 +125,453 @@ test("record and show expose stable JSON output", async () => {
   assert.equal(await runCli(["show", "state.txt", "--json"], show.io), 0);
   const shown = JSON.parse(show.stdout()) as { result: { active: Array<{ id: string }> } };
   assert.equal(shown.result.active[0]?.id, recorded.result.record.id);
+});
+
+test("record completes a partial JSON draft and overlays causal flags", async () => {
+  const directory = await createRepository();
+  const draftPath = join(directory, "partial-reverie.json");
+  await writeFile(draftPath, JSON.stringify({
+    driving_event: "A repeated state transition needs one decision.",
+    decision: "Use a guarded mutation boundary.",
+    impact: "Every transition uses the same guard.",
+  }), "utf8");
+  const output = captureIo(directory, "", {});
+
+  assert.equal(await runCli([
+    "record", "new", "state.txt", "--committed", "--from", draftPath,
+    "--session", "cli:record-test",
+    "--alternative", "Keep the guard in each caller",
+    "--alternative", "Allow unguarded transitions",
+    "--source", "implements:issue:github:phynics/reveries#32",
+    "--json",
+  ], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const recorded = JSON.parse(output.stdout()) as {
+    result: { record: {
+      author_email: string;
+      created_at: string;
+      session: string | null;
+      alternatives: string[];
+      sources: Array<{ relation: string; kind: string; ref: string }>;
+      supersedes: string[];
+    } };
+  };
+
+  assert.equal(recorded.result.record.author_email, "reveries@example.com");
+  assert.match(recorded.result.record.created_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/);
+  assert.equal(recorded.result.record.session, "cli:record-test");
+  assert.deepEqual(recorded.result.record.alternatives, [
+    "Allow unguarded transitions",
+    "Keep the guard in each caller",
+  ]);
+  assert.deepEqual(recorded.result.record.sources, [{
+    relation: "implements",
+    kind: "issue",
+    ref: "github:phynics/reveries#32",
+  }]);
+  assert.deepEqual(recorded.result.record.supersedes, []);
+});
+
+test("record supersede accepts a partial draft and links the predecessor", async () => {
+  const directory = await createRepository();
+  const firstDraft = JSON.stringify({
+    driving_event: "The current decision needs a successor.",
+    decision: "Use the original guard.",
+    impact: "Existing callers share one check.",
+  });
+  const first = captureIo(directory, firstDraft, {});
+  assert.equal(await runCli(["record", "new", "state.txt", "--committed", "--from", "-", "--json"], first.io), 0);
+  const oldId = (JSON.parse(first.stdout()) as { result: { record: { id: string } } }).result.record.id;
+
+  const successor = captureIo(directory, JSON.stringify({
+    driving_event: "A second invariant must also be guarded.",
+    decision: "Extend the existing guard.",
+    impact: "The single mutation boundary covers both invariants.",
+  }), {});
+  assert.equal(await runCli([
+    "record", "supersede", "state.txt", "--committed", "--from", "-", "--old", oldId, "--json",
+  ], successor.io), 0, `${successor.stdout()}${successor.stderr()}`);
+  const result = JSON.parse(successor.stdout()) as { result: { record: { supersedes: string[] } } };
+  assert.deepEqual(result.result.record.supersedes, [oldId]);
+});
+
+test("summarize completes a partial draft from stdin and overlays entry flags", async () => {
+  const directory = await createRepository();
+  const input = JSON.stringify({ entries: [{
+    driving_event: "An API needs a causal account.",
+    decision: "Capture the choice in a session summary.",
+    impact: "The commit can be reviewed from its evidence.",
+  }] });
+  const output = captureIo(directory, input, { REVERIES_SESSION: "env:summary-test" });
+
+  assert.equal(await runCli([
+    "summarize", "HEAD", "--from", "-", "--session", "cli:summary-test",
+    "--alternative", "Rely on the commit message alone",
+    "--source", "caused-by:issue:github:phynics/reveries#32",
+    "--json",
+  ], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const commit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  const note = await (await Reveries.open(directory)).show({ target: commit });
+  const summary = note.records.find((record): record is SessionSummary => record.type === "session-summary");
+
+  assert.ok(summary);
+  assert.equal(summary.author_email, "reveries@example.com");
+  assert.match(summary.created_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/);
+  assert.equal(summary.session, "cli:summary-test");
+  assert.deepEqual(summary.entries[0]?.alternatives, ["Rely on the commit message alone"]);
+  assert.deepEqual(summary.entries[0]?.sources, [{
+    relation: "caused-by",
+    kind: "issue",
+    ref: "github:phynics/reveries#32",
+  }]);
+});
+
+test("summary metadata falls back to REVERIES_SESSION and then null", async () => {
+  const directory = await createRepository();
+  const draft = JSON.stringify({
+    entries: [{ driving_event: "Event.", decision: "Decision.", impact: "Impact." }],
+  });
+  const draftPath = join(directory, "summary-draft.json");
+  await writeFile(draftPath, draft, "utf8");
+  const fromEnvironment = captureIo(directory, "", { REVERIES_SESSION: "env:session" });
+
+  assert.equal(await runCli(["summarize", "HEAD", "--from", draftPath, "--json"], fromEnvironment.io), 0);
+  const commit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  const notes = await Reveries.open(directory);
+  const withEnvironment = (await notes.show({ target: commit })).records.find(
+    (record): record is SessionSummary => record.type === "session-summary",
+  );
+  assert.equal(withEnvironment?.session, "env:session");
+
+  const withoutSession = captureIo(directory, JSON.stringify({
+    session: null,
+    entries: [{ driving_event: "Second event.", decision: "Second decision.", impact: "Second impact." }],
+  }), { REVERIES_SESSION: "env:must-not-overwrite-explicit-null" });
+  assert.equal(await runCli(["summarize", "HEAD", "--from", "-", "--replace", "--json"], withoutSession.io), 0);
+  const withoutEnvironment = (await notes.show({ target: commit })).records.find(
+    (record): record is SessionSummary => record.type === "session-summary",
+  );
+  assert.equal(withoutEnvironment?.session, null);
+});
+
+test("causal flags cover recurrence control, path sources, reveries, and retirements", async () => {
+  const directory = await createRepository();
+  const commit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  const blob = (await execFileAsync("git", ["rev-parse", "HEAD:state.txt"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  const reverieId = `rv:${"a".repeat(40)}`;
+  const input = JSON.stringify({ entries: [{
+    driving_event: "A source path needs a revision.",
+    decision: "Bind the path reference to a commit.",
+    impact: "The reference remains reproducible.",
+    recurrence_control: "Draft recurrence statement.",
+  }] });
+  const output = captureIo(directory, input, {});
+
+  assert.equal(await runCli([
+    "summarize", "HEAD", "--from", "-", "--no-recurrence-control",
+    "--source", `derived-from:path:state.txt@${commit}`,
+    "--reverie", reverieId,
+    "--retire", `${reverieId}:${blob}:The decision was replaced: use the new source.`,
+    "--json",
+  ], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const note = await (await Reveries.open(directory)).show({ target: commit });
+  const summary = note.records.find((record): record is SessionSummary => record.type === "session-summary");
+
+  assert.equal(summary?.entries[0]?.recurrence_control, null);
+  assert.deepEqual(summary?.entries[0]?.sources, [{
+    relation: "derived-from",
+    kind: "path",
+    ref: "state.txt",
+    at: commit,
+  }]);
+  assert.deepEqual(summary?.entries[0]?.reveries, [reverieId]);
+  assert.deepEqual(summary?.entries[0]?.retirements, [{
+    reverie: reverieId,
+    from_blob: blob,
+    reason: "The decision was replaced: use the new source.",
+  }]);
+});
+
+test("record supports flags without a draft and rejects contradictory recurrence flags", async () => {
+  const directory = await createRepository();
+  const record = captureIo(directory, "", {});
+
+  assert.equal(await runCli([
+    "record", "new", "state.txt", "--committed",
+    "--driving-event", "A CLI flag supplies the event.",
+    "--decision", "Use the CLI as a draft editor.",
+    "--impact", "Users can record without a JSON file.",
+    "--recurrence-control", "A focused CLI test verifies the invariant.",
+    "--source", "requested-by:git-email:reviewer@example.com",
+    "--json",
+  ], record.io), 0, `${record.stdout()}${record.stderr()}`);
+  const created = JSON.parse(record.stdout()) as { result: { record: { sources: Array<{ ref: string }> } } };
+  assert.deepEqual(created.result.record.sources, [{
+    relation: "requested-by",
+    kind: "git-email",
+    ref: "reviewer@example.com",
+  }]);
+
+  const contradictory = captureIo(directory);
+  assert.equal(await runCli([
+    "record", "new", "state.txt", "--committed",
+    "--driving-event", "Event.", "--decision", "Decision.", "--impact", "Impact.",
+    "--recurrence-control", "Control.", "--no-recurrence-control",
+  ], contradictory.io), 3);
+  assert.match(contradictory.stderr(), /choose only one/i);
+});
+
+test("summarize --init remains a separate full initialization-record path", async () => {
+  const directory = await createRepository();
+  const commit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  await (await Reveries.open(directory)).summarize({ commit, summary: adoptionSummary() });
+  const input = JSON.stringify({
+    v: 1,
+    type: "reveries-init",
+    protocol: 1,
+    notes_ref: "refs/notes/reveries",
+    publishing_remotes: [],
+    hosts: [],
+    author_email: "reveries@example.com",
+    created_at: "2026-08-25T03:05:00Z",
+  });
+  const output = captureIo(directory, input, {});
+
+  assert.equal(await runCli(["summarize", "HEAD", "--from", "-", "--init", "--json"], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const records = (await Reveries.open(directory)).show({ target: commit });
+  assert.deepEqual((await records).records.map((record) => record.type).sort(), ["reveries-init", "session-summary"]);
+});
+
+test("summarize opens VISUAL and records a valid edited draft", async () => {
+  const directory = await createRepository();
+  const editor = join(directory, "editor.mjs");
+  await writeFile(editor, `import { writeFile } from "node:fs/promises";
+await writeFile(process.argv[2], JSON.stringify({ entries: [{
+  driving_event: "The editor supplied the causal event.",
+  decision: "Summarize the decision after editing.",
+  impact: "The edited draft becomes commit evidence."
+}] }));
+`, "utf8");
+  const output = captureIo(directory, "", {
+    VISUAL: `${process.execPath} ${editor}`,
+    EDITOR: "missing-editor-should-not-run",
+  });
+
+  assert.equal(await runCli(["summarize", "HEAD", "--edit", "--json"], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const commit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  const summary = (await (await Reveries.open(directory)).show({ target: commit })).records.find(
+    (record): record is SessionSummary => record.type === "session-summary",
+  );
+  assert.equal(summary?.entries[0]?.decision, "Summarize the decision after editing.");
+});
+
+test("an empty editor result aborts without changing notes", async () => {
+  const directory = await createRepository();
+  const editor = join(directory, "empty-editor.mjs");
+  await writeFile(editor, `import { writeFile } from "node:fs/promises";
+await writeFile(process.argv[2], "  ");
+`, "utf8");
+  const output = captureIo(directory, "", { EDITOR: `${process.execPath} ${editor}` });
+
+  assert.equal(await runCli(["summarize", "HEAD", "--edit"], output.io), 1);
+  assert.match(output.stderr(), /empty|cancel/i);
+  assert.equal((await execFileAsync("git", ["notes", "--ref=refs/notes/reveries", "list"], {
+    cwd: directory,
+    encoding: "utf8",
+  })).stdout, "");
+});
+
+test("an invalid edited draft is retained with its repair path", async () => {
+  const directory = await createRepository();
+  const editor = join(directory, "invalid-editor.mjs");
+  await writeFile(editor, `import { writeFile } from "node:fs/promises";
+await writeFile(process.argv[2], JSON.stringify({ entries: [{
+  driving_event: "The event is present.",
+  decision: "The decision is present."
+}] }));
+`, "utf8");
+  const output = captureIo(directory, "", { EDITOR: `${process.execPath} ${editor}` });
+
+  assert.equal(await runCli(["summarize", "HEAD", "--edit"], output.io), 3);
+  const retained = /Draft retained at (.+?draft\.json):/i.exec(output.stderr())?.[1];
+  assert.ok(retained, output.stderr());
+  const retainedContent = await readFile(retained, "utf8");
+  assert.match(retainedContent, /The decision is present/);
+  await rm(dirname(retained), { recursive: true, force: true });
+});
+
+test("sync defaults to the upstream before configured publishers", async () => {
+  const directory = await createRepository();
+  const upstreamTip = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  await git(directory, "commit", "--allow-empty", "-m", "second commit");
+  const publisherTip = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" })).stdout.trim();
+  await git(directory, "config", "branch.main.remote", "upstream");
+  await git(directory, "config", "--add", "reveries.publishingRemote", "publisher");
+  await git(directory, "update-ref", "refs/notes/remotes/upstream/reveries", upstreamTip);
+  await git(directory, "update-ref", "refs/notes/remotes/publisher/reveries", publisherTip);
+  const output = captureIo(directory);
+
+  assert.equal(await runCli(["sync", "--status", "--json"], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const status = JSON.parse(output.stdout()) as { result: { remote: string } };
+  assert.equal(status.result.remote, upstreamTip);
+});
+
+test("push defaults to upstream even when a different publisher is configured", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  const upstream = join(directory, "upstream.git");
+  const publisher = join(directory, "publisher.git");
+  await git(directory, "init", "--bare", upstream);
+  await git(directory, "init", "--bare", publisher);
+  await git(directory, "remote", "add", "upstream", upstream);
+  await git(directory, "remote", "add", "publisher", publisher);
+  await git(directory, "push", "-u", "upstream", "main");
+  await git(directory, "config", "--add", "reveries.publishingRemote", "publisher");
+  const output = captureIo(directory);
+
+  assert.equal(await runCli(["push", "--json"], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const upstreamRefs = (await execFileAsync("git", ["--git-dir", upstream, "for-each-ref", "--format=%(refname)"], {
+    cwd: directory,
+    encoding: "utf8",
+  })).stdout;
+  const publisherRefs = (await execFileAsync("git", ["--git-dir", publisher, "for-each-ref", "--format=%(refname)"], {
+    cwd: directory,
+    encoding: "utf8",
+  })).stdout;
+  assert.match(upstreamRefs, /refs\/notes\/reveries/);
+  assert.doesNotMatch(publisherRefs, /refs\/notes\/reveries/);
+});
+
+test("push defaults to the sole configured publisher without an upstream", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  const publisher = join(directory, "publisher.git");
+  await git(directory, "init", "--bare", publisher);
+  await git(directory, "remote", "add", "publisher", publisher);
+  await git(directory, "config", "--add", "reveries.publishingRemote", "publisher");
+  const output = captureIo(directory);
+
+  assert.equal(await runCli(["push", "--json"], output.io), 0, `${output.stdout()}${output.stderr()}`);
+  const refs = (await execFileAsync("git", ["--git-dir", publisher, "for-each-ref", "--format=%(refname)"], {
+    cwd: directory,
+    encoding: "utf8",
+  })).stdout;
+  assert.match(refs, /refs\/notes\/reveries/);
+  assert.match(refs, /refs\/heads\/main/);
+});
+
+test("sync explains missing and ambiguous default publishers", async () => {
+  const directory = await createRepository();
+  const missing = captureIo(directory);
+  assert.equal(await runCli(["sync", "--status"], missing.io), 3);
+  assert.match(missing.stderr(), /upstream|publishing remote|pass a remote/i);
+
+  await git(directory, "config", "--add", "reveries.publishingRemote", "alpha");
+  await git(directory, "config", "--add", "reveries.publishingRemote", "beta");
+  const ambiguous = captureIo(directory);
+  assert.equal(await runCli(["sync", "--status"], ambiguous.io), 3);
+  assert.match(ambiguous.stderr(), /alpha.*beta|beta.*alpha/i);
+  assert.match(ambiguous.stderr(), /ambiguous|pass a remote|upstream/i);
+});
+
+test("search --json keeps its exact serialized envelope", async () => {
+  const directory = await createRepository();
+  const output = captureIo(directory);
+
+  assert.equal(await runCli(["search", "no matching record", "--json"], output.io), 0);
+  assert.equal(output.stdout(), '{"ok":true,"command":"search","result":[],"diagnostics":[]}\n');
+});
+
+test("inspection and publication commands use readable default output", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  const remote = join(directory, "origin.git");
+  await git(directory, "init", "--bare", remote);
+  await git(directory, "remote", "add", "origin", remote);
+  await git(directory, "push", "-u", "origin", "main");
+
+  const check = captureIo(directory);
+  assert.equal(await runCli(["check", "HEAD"], check.io), 0);
+  assert.match(check.stdout(), /continuity check passed/i);
+  assert.doesNotMatch(check.stdout(), /^\{/m);
+
+  const doctor = captureIo(directory);
+  await runCli(["doctor"], doctor.io);
+  assert.match(doctor.stdout(), /reveries.*(prepared|adopted|damaged|doctor)/i);
+  assert.doesNotMatch(doctor.stdout(), /^\{/m);
+
+  const show = captureIo(directory);
+  assert.equal(await runCli(["show", "state.txt"], show.io), 0);
+  assert.match(show.stdout(), /state\.txt|evidence/i);
+  assert.doesNotMatch(show.stdout(), /^\{/m);
+
+  const record = captureIo(directory);
+  assert.equal(await runCli([
+    "record", "new", "state.txt", "--committed",
+    "--driving-event", "The user needs a human-readable result.",
+    "--decision", "Render the evidence as plain text.",
+    "--impact", "Search and history show the decision without JSON.",
+  ], record.io), 0);
+  assert.match(record.stdout(), /recorded reverie rv:/i);
+
+  const evidence = captureIo(directory);
+  assert.equal(await runCli(["show", "state.txt"], evidence.io), 0);
+  assert.match(evidence.stdout(), /Render the evidence as plain text/i);
+
+  const push = captureIo(directory);
+  assert.equal(await runCli(["push", "origin"], push.io), 0, `${push.stdout()}${push.stderr()}`);
+  assert.match(push.stdout(), /origin.*atomically|atomically.*origin/i);
+  assert.doesNotMatch(push.stdout(), /^\{/m);
+
+  const sync = captureIo(directory);
+  assert.equal(await runCli(["sync", "--status", "origin"], sync.io), 0);
+  assert.match(sync.stdout(), /origin/i);
+  assert.doesNotMatch(sync.stdout(), /^\{/m);
+
+  const search = captureIo(directory);
+  assert.equal(await runCli(["search", "human-readable result"], search.io), 0);
+  assert.match(search.stdout(), /found 1 matching record/i);
+  assert.match(search.stdout(), /Render the evidence as plain text/i);
+  assert.doesNotMatch(search.stdout(), /^\{/m);
+
+  const history = captureIo(directory);
+  assert.equal(await runCli(["history", "state.txt"], history.io), 0);
+  assert.match(history.stdout(), /history.*state\.txt/i);
+  assert.match(history.stdout(), /Render the evidence as plain text/i);
+  assert.doesNotMatch(history.stdout(), /^\{/m);
+});
+
+test("record and summarize report readable success by default", async () => {
+  const directory = await createRepository();
+  const record = captureIo(directory);
+  assert.equal(await runCli([
+    "record", "new", "state.txt", "--committed",
+    "--driving-event", "A user needs to understand the CLI result.",
+    "--decision", "Report the created reverie in plain text.",
+    "--impact", "Users can continue without reading JSON.",
+  ], record.io), 0);
+  assert.match(record.stdout(), /recorded reverie rv:/i);
+
+  const summary = captureIo(directory, JSON.stringify({
+    entries: [{ driving_event: "Event.", decision: "Decision.", impact: "Impact." }],
+  }), {});
+  assert.equal(await runCli(["summarize", "HEAD", "--from", "-"], summary.io), 0);
+  assert.match(summary.stdout(), /summarized commit/i);
+  assert.doesNotMatch(summary.stdout(), /^\{/m);
+});
+
+test("command help includes a synopsis, options, and examples", async () => {
+  const output = captureIo("/tmp");
+  assert.equal(await runCli(["help", "record"], output.io), 0);
+  assert.match(output.stdout(), /Usage: reveries record/);
+  assert.match(output.stdout(), /--from|--driving-event/);
+  assert.match(output.stdout(), /Examples:/);
+});
+
+test("usage errors include command-specific help", async () => {
+  const directory = await createRepository();
+  const output = captureIo(directory);
+  assert.equal(await runCli(["record", "new", "state.txt", "--unknown"], output.io), 3);
+  assert.match(output.stderr(), /reveries help record/i);
 });
 
 test("semantic failures use exit code 1 and usage errors use exit code 3", async () => {

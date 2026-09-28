@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import {
   commitAdoption,
@@ -26,7 +29,9 @@ import {
   type NoteRecord,
   type ReverieInput,
   type ReverieMetadata,
+  type ReverieRecord,
   type ReveriesInit,
+  type Retirement,
   type SessionSummary,
   type Source,
   type SourceKind,
@@ -34,6 +39,8 @@ import {
 } from "./protocol.ts";
 
 export type ExitCode = 0 | 1 | 2 | 3;
+
+const execFileAsync = promisify(execFile);
 
 export interface CliIo {
   readonly cwd: string;
@@ -57,6 +64,8 @@ class UsageError extends Error {
   }
 }
 
+class EditorCancelledError extends Error {}
+
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
@@ -66,6 +75,7 @@ const VERSION = "1.0.2";
 const HELP = `reveries <command>
 
 Commands:
+  help       Show general or command-specific help
   init       Prepare project instructions, Git configuration, and hooks
   adopt      Verify the prepared files and create the adoption commit
   doctor     Diagnose the local installation and notes state
@@ -88,6 +98,123 @@ Vendored and symlink setups require --skill-source.
 
 Use --json on inspection and check commands for stable machine output.
 `;
+
+const COMMAND_HELP: Readonly<Record<string, string>> = {
+  help: `Usage: reveries help [<command>]
+
+Show general help or usage for one command.
+Examples:
+  reveries help
+  reveries help record
+`,
+  init: `Usage: reveries init --hosts <list>|--no-hosts --remote <list>|--no-publish --directive-email <email>|--no-directive-email --skill-setup <kind> [options]
+
+Prepare the repository's instructions, Git configuration, and hooks.
+Options: --skill-repository <url>, --skill-source <path>, --json
+Examples:
+  reveries init --hosts codex --remote origin --directive-email me@example.com --skill-setup reminder
+  reveries init --no-hosts --no-publish --no-directive-email --skill-setup reminder
+`,
+  adopt: `Usage: reveries adopt --plan <path> --message <message> [--json]
+
+Verify the prepared adoption plan and create its adoption commit.
+Examples:
+  reveries adopt --plan .reveries/adoption.json --message "Adopt Reveries"
+`,
+  doctor: `Usage: reveries doctor [--json]
+
+Diagnose repository setup, enforcement, and notes state.
+Examples:
+  reveries doctor
+  reveries doctor --json
+`,
+  show: `Usage: reveries show <path|blob|commit> [--staged] [--json]
+
+Show active and historical evidence for a Git object.
+Examples:
+  reveries show src/state.ts
+  reveries show src/state.ts --staged
+`,
+  record: `Usage: reveries record <new|supersede> <path> [--from <file|->] [causal options]
+       reveries record continue --from-blob <blob> --to-blob <blob> --id <reverie-id>
+
+Create or supersede a reverie. Missing metadata defaults to Git's user.email,
+the current UTC time, and --session, REVERIES_SESSION, or null.
+Options: --driving-event <text>, --decision <text>, --impact <text>,
+         --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
+         --source <relation:kind:ref[@at]>, --session <name>, --edit,
+         --committed, --staged, --old <reverie-id>, --json
+Examples:
+  reveries record new src/state.ts --driving-event "A transition failed" --decision "Guard it" --impact "All writers are checked"
+  reveries record new src/state.ts --from draft.json --edit
+  cat draft.json | reveries record new src/state.ts --from -
+`,
+  summarize: `Usage: reveries summarize <commit> [--from <file|->] [causal options] [--replace]
+       reveries summarize <commit> --from <reveries-init.json> --init
+
+Attach a session summary. Missing metadata defaults to Git's user.email,
+the current UTC time, and --session, REVERIES_SESSION, or null.
+Options: --driving-event <text>, --decision <text>, --impact <text>,
+         --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
+         --source <relation:kind:ref[@at]>, --reverie <id>, --retire <rv:id:blob:reason>,
+         --session <name>, --edit, --because <reason>, --replace, --init, --json
+Examples:
+  reveries summarize HEAD --from summary.json --edit
+  cat summary.json | reveries summarize HEAD --from -
+`,
+  check: `Usage: reveries check [<commit>|--staged|--outgoing <remote>] [--successor old/path=new/path] [--json]
+
+Check continuity and summary coverage.
+Examples:
+  reveries check --staged
+  reveries check HEAD
+  reveries check --outgoing origin
+`,
+  search: `Usage: reveries search [<query>] [--source <ref>] [--author <email>] [--at <revision>] [--all] [--json]
+
+Search current or historical engineering evidence.
+Examples:
+  reveries search "transition authority"
+  reveries search --source github:owner/repository#417
+`,
+  history: `Usage: reveries history <path|reverie-id> [--json]
+
+Trace evidence attached to a path or reverie through history.
+Examples:
+  reveries history src/state.ts
+  reveries history rv:<full-id>
+`,
+  sync: `Usage: reveries sync [<remote>] (--status|--pull) [--json]
+
+Inspect or fetch a publishing remote's notes. Without a remote, use the
+branch upstream or the sole configured publishing remote.
+Examples:
+  reveries sync --status
+  reveries sync --pull origin
+`,
+  push: `Usage: reveries push [<remote>] [--json]
+
+Atomically publish HEAD and refs/notes/reveries. Without a remote, use the
+branch upstream or the sole configured publishing remote.
+Examples:
+  reveries push
+  reveries push origin
+`,
+  hook: `Usage: reveries hook <event> < event.json
+
+Handle one host-neutral adapter event from standard input.
+Examples:
+  reveries hook session-start < event.json
+`,
+  "receive-check": `Usage: reveries receive-check [--evidence <object>] [--base-tree <tree>] < proposal.json
+
+Validate proposed refs and evidence without a worktree.
+`,
+  remove: `Usage: reveries remove [--remote <name>]... [--json]
+
+Remove owned integration without deleting historical evidence.
+`,
+};
 
 function defaultIo(): CliIo {
   const script = process.argv[1];
@@ -288,51 +415,362 @@ function parseSource(value: unknown): Source {
   };
 }
 
-async function readJson(path: string): Promise<unknown> {
+function parseSourceValue(value: unknown): Source {
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    return parseSource(value);
   } catch (error: unknown) {
-    throw new UsageError(`cannot read JSON from ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    if (error instanceof UsageError) throw error;
+    throw new UsageError(error instanceof Error ? error.message : String(error));
   }
 }
 
-async function parseReverieDraft(path: string): Promise<{
-  readonly semantic: ReverieInput;
-  readonly metadata: ReverieMetadata;
-}> {
-  const value = expectObject(await readJson(path), "reverie draft");
-  const sources = value.sources;
-  if (!Array.isArray(sources)) throw new UsageError("sources must be an array");
-  const session = value.session;
-  if (session !== null && typeof session !== "string") throw new UsageError("session must be a string or null");
+function parseReverieId(value: string): ReturnType<typeof reverieId> {
+  try {
+    return reverieId(value);
+  } catch (error: unknown) {
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function readDraft(from: string | undefined, io: CliIo): Promise<unknown> {
+  if (from === undefined) return {};
+  let input: string;
+  try {
+    input = from === "-" ? await io.stdin() : await readFile(resolve(io.cwd, from), "utf8");
+  } catch (error: unknown) {
+    throw new UsageError(`cannot read JSON from ${from}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    return JSON.parse(input) as unknown;
+  } catch (error: unknown) {
+    throw new UsageError(`cannot read JSON from ${from}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function flagSources(parsed: ParsedArguments): Source[] {
+  return (parsed.values.get("--source") ?? []).map((value) => {
+    const first = value.indexOf(":");
+    const second = first < 0 ? -1 : value.indexOf(":", first + 1);
+    if (first <= 0 || second <= first + 1 || second === value.length - 1) {
+      throw new UsageError("--source must use relation:kind:ref[@at]");
+    }
+    const relation = value.slice(0, first);
+    const kind = value.slice(first + 1, second);
+    let ref = value.slice(second + 1);
+    let at: string | undefined;
+    const separator = ref.lastIndexOf("@");
+    if (separator >= 0) {
+      const candidate = ref.slice(separator + 1);
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(candidate)) {
+        ref = ref.slice(0, separator);
+        at = candidate;
+      }
+    }
+    return parseSourceValue({ relation, kind, ref, ...(at === undefined ? {} : { at }) });
+  });
+}
+
+function flagRetirements(parsed: ParsedArguments): Retirement[] {
+  return (parsed.values.get("--retire") ?? []).map((value) => {
+    const match = /^(rv:[^:]+):([^:]+):(.*)$/s.exec(value);
+    if (match === null) throw new UsageError("--retire must use rv:<id>:<blob>:<reason>");
+    const [, reverie, blob, reason] = match;
+    if (reverie === undefined || blob === undefined || reason === undefined) {
+      throw new UsageError("--retire must use rv:<id>:<blob>:<reason>");
+    }
+    try {
+      return { reverie: reverieId(reverie), from_blob: blobId(blob), reason };
+    } catch (error: unknown) {
+      throw new UsageError(error instanceof Error ? error.message : String(error));
+    }
+  });
+}
+
+function overlayRecurrence(
+  value: unknown,
+  parsed: ParsedArguments,
+): string | null {
+  const noRecurrence = parsed.flags.has("--no-recurrence-control");
+  const recurrence = one(parsed, "--recurrence-control");
+  if (noRecurrence && recurrence !== undefined) {
+    throw new UsageError("choose only one of --recurrence-control or --no-recurrence-control");
+  }
+  if (noRecurrence) return null;
+  const selected = recurrence ?? value;
+  return selected === undefined || selected === null
+    ? null
+    : expectString(selected, "recurrence_control");
+}
+
+function overlayAlternatives(value: unknown, parsed: ParsedArguments): string[] {
+  const existing = value === undefined ? [] : expectStringArray(value, "alternatives");
+  return [...existing, ...(parsed.values.get("--alternative") ?? [])];
+}
+
+function overlaySources(value: unknown, parsed: ParsedArguments): Source[] {
+  const existing = value === undefined
+    ? []
+    : !Array.isArray(value)
+      ? (() => { throw new UsageError("sources must be an array"); })()
+      : value.map(parseSourceValue);
+  return [...existing, ...flagSources(parsed)];
+}
+
+async function parseMetadata(
+  value: Record<string, unknown>,
+  reveries: Reveries,
+  io: CliIo,
+  parsed: ParsedArguments,
+): Promise<ReverieMetadata> {
+  let authorEmail = value.author_email;
+  if (authorEmail === undefined) {
+    const configured = await reveries.repository.run(["config", "--get", "user.email"], { allowExitCodes: [0, 1] });
+    authorEmail = configured.exitCode === 0 ? configured.stdout.trim() : undefined;
+  }
+  if (authorEmail === undefined || authorEmail === "") {
+    throw new UsageError("author_email is missing; configure git user.email or supply it in the draft");
+  }
+  const environment = io.environment ?? process.env;
+  const sessionFlag = one(parsed, "--session");
+  const sessionValue = sessionFlag ?? (value.session === undefined ? environment.REVERIES_SESSION ?? null : value.session);
+  if (sessionValue !== null && typeof sessionValue !== "string") {
+    throw new UsageError("session must be a string or null");
+  }
   return {
-    semantic: {
-      v: value.v === 1 ? 1 : (() => { throw new UsageError("v must be 1"); })(),
-      driving_event: expectString(value.driving_event, "driving_event"),
-      decision: expectString(value.decision, "decision"),
-      impact: expectString(value.impact, "impact"),
-      recurrence_control: value.recurrence_control === null
-        ? null
-        : expectString(value.recurrence_control, "recurrence_control"),
-      alternatives: expectStringArray(value.alternatives, "alternatives"),
-      sources: sources.map(parseSource),
-      supersedes: expectStringArray(value.supersedes, "supersedes").map(reverieId),
-    },
-    metadata: {
-      author_email: expectString(value.author_email, "author_email"),
-      session,
-      created_at: expectString(value.created_at, "created_at"),
-    },
+    author_email: expectString(authorEmail, "author_email"),
+    session: sessionValue,
+    created_at: value.created_at === undefined
+      ? new Date().toISOString()
+      : expectString(value.created_at, "created_at"),
   };
 }
 
-async function parseProtocolRecord(path: string, type: "session-summary"): Promise<SessionSummary>;
-async function parseProtocolRecord(path: string, type: "reveries-init"): Promise<ReveriesInit>;
-async function parseProtocolRecord(path: string, type: "session-summary" | "reveries-init"): Promise<SessionSummary | ReveriesInit> {
-  const value = await readJson(path);
-  return type === "session-summary"
-    ? parseProtocolRecordValue(value, "session-summary", path)
-    : parseProtocolRecordValue(value, "reveries-init", path);
+async function parseReverieDraft(
+  raw: unknown,
+  reveries: Reveries,
+  io: CliIo,
+  parsed: ParsedArguments,
+): Promise<{
+  readonly semantic: ReverieInput;
+  readonly metadata: ReverieMetadata;
+}> {
+  const value = expectObject(raw, "reverie draft");
+  if (value.type !== undefined && value.type !== "reverie") throw new UsageError("reverie draft type must be reverie");
+  const drivingEvent = one(parsed, "--driving-event") ?? value.driving_event;
+  const decision = one(parsed, "--decision") ?? value.decision;
+  const impact = one(parsed, "--impact") ?? value.impact;
+  const supersedes = value.supersedes === undefined ? [] : expectStringArray(value.supersedes, "supersedes");
+  const semantic: ReverieInput = {
+    v: value.v === undefined || value.v === 1 ? 1 : (() => { throw new UsageError("v must be 1"); })(),
+    driving_event: expectString(drivingEvent, "driving_event"),
+    decision: expectString(decision, "decision"),
+    impact: expectString(impact, "impact"),
+    recurrence_control: overlayRecurrence(value.recurrence_control, parsed),
+    alternatives: overlayAlternatives(value.alternatives, parsed),
+    sources: overlaySources(value.sources, parsed),
+    supersedes: supersedes.map(parseReverieId),
+  };
+  const metadata = await parseMetadata(value, reveries, io, parsed);
+  const candidate: ReverieRecord = {
+    ...semantic,
+    ...metadata,
+    type: "reverie",
+    id: parseReverieId(`rv:${"0".repeat(40)}`),
+  };
+  try {
+    validateNote([candidate], { verifyIds: false });
+  } catch (error: unknown) {
+    throw new UsageError(errorText(error));
+  }
+  return { semantic, metadata };
+}
+
+async function parseSummaryDraft(
+  raw: unknown,
+  reveries: Reveries,
+  io: CliIo,
+  parsed: ParsedArguments,
+): Promise<SessionSummary> {
+  const value = expectObject(raw, "session-summary draft");
+  if (value.type !== undefined && value.type !== "session-summary") {
+    throw new UsageError("session-summary draft type must be session-summary");
+  }
+  const rawEntries = value.entries === undefined ? [] : value.entries;
+  if (!Array.isArray(rawEntries)) throw new UsageError("entries must be an array");
+  const noEntryFlags: ParsedArguments = { positionals: [], values: new Map(), flags: new Set() };
+  const summaryOptions = parsed.values.has("--driving-event")
+    || parsed.values.has("--decision")
+    || parsed.values.has("--impact")
+    || parsed.values.has("--recurrence-control")
+    || parsed.flags.has("--no-recurrence-control")
+    || parsed.values.has("--alternative")
+    || parsed.values.has("--source")
+    || parsed.values.has("--reverie")
+    || parsed.values.has("--retire")
+    || ["driving_event", "decision", "impact", "recurrence_control", "alternatives", "sources", "reveries", "retirements"]
+      .some((key) => value[key] !== undefined);
+  const entries = rawEntries.map((entry, index) => {
+    const rawEntry = expectObject(entry, `entries[${index}]`);
+    const source = index === 0 ? { ...value, ...rawEntry } : rawEntry;
+    const entryFlags = index === 0 ? parsed : noEntryFlags;
+    const drivingEvent = one(entryFlags, "--driving-event") ?? source.driving_event;
+    const decision = one(entryFlags, "--decision") ?? source.decision;
+    const impact = one(entryFlags, "--impact") ?? source.impact;
+    const existingReveries = source.reveries === undefined ? [] : expectStringArray(source.reveries, "reveries");
+    const existingRetirements = source.retirements === undefined
+      ? []
+      : !Array.isArray(source.retirements)
+        ? (() => { throw new UsageError("retirements must be an array"); })()
+        : source.retirements;
+    const flaggedReveries = (entryFlags.values.get("--reverie") ?? []).map(parseReverieId);
+    return {
+      driving_event: expectString(drivingEvent, `entries[${index}].driving_event`),
+      decision: expectString(decision, `entries[${index}].decision`),
+      impact: expectString(impact, `entries[${index}].impact`),
+      recurrence_control: overlayRecurrence(source.recurrence_control, entryFlags),
+      alternatives: overlayAlternatives(source.alternatives, entryFlags),
+      sources: overlaySources(source.sources, entryFlags),
+      reveries: [...existingReveries.map(parseReverieId), ...flaggedReveries],
+      retirements: [...existingRetirements, ...flagRetirements(entryFlags)],
+    };
+  });
+  if (entries.length === 0 && summaryOptions) {
+    const source = value;
+    const initial = {
+      driving_event: one(parsed, "--driving-event") ?? source.driving_event,
+      decision: one(parsed, "--decision") ?? source.decision,
+      impact: one(parsed, "--impact") ?? source.impact,
+      recurrence_control: overlayRecurrence(source.recurrence_control, parsed),
+      alternatives: overlayAlternatives(source.alternatives, parsed),
+      sources: overlaySources(source.sources, parsed),
+      reveries: (parsed.values.get("--reverie") ?? []).map(parseReverieId),
+      retirements: flagRetirements(parsed),
+    };
+    entries.push({
+      driving_event: expectString(initial.driving_event, "driving_event"),
+      decision: expectString(initial.decision, "decision"),
+      impact: expectString(initial.impact, "impact"),
+      recurrence_control: initial.recurrence_control,
+      alternatives: initial.alternatives,
+      sources: initial.sources,
+      reveries: initial.reveries,
+      retirements: initial.retirements,
+    });
+  }
+  const metadata = await parseMetadata(value, reveries, io, parsed);
+  const summary: SessionSummary = {
+    v: value.v === undefined || value.v === 1 ? 1 : (() => { throw new UsageError("v must be 1"); })(),
+    type: "session-summary",
+    ...metadata,
+    entries,
+    ...(value.correction_reason === undefined ? {} : { correction_reason: expectString(value.correction_reason, "correction_reason") }),
+  };
+  try {
+    validateNote([summary], { verifyIds: false });
+  } catch (error: unknown) {
+    throw new UsageError(errorText(error));
+  }
+  return summary;
+}
+
+type PreparedDraft = {
+  readonly kind: "unchanged";
+  readonly value: unknown;
+  readonly cleanup: () => Promise<void>;
+} | {
+  readonly kind: "edited";
+  readonly value: unknown;
+  readonly cleanup: () => Promise<void>;
+  readonly retainedPath: string;
+};
+
+function editorArguments(command: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let started = false;
+  for (const character of command) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      else current += character;
+      started = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) args.push(current);
+      current = "";
+      started = false;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (escaped || quote !== null) throw new UsageError("editor command has an unterminated quote or escape");
+  if (started) args.push(current);
+  if (args.length === 0 || args[0] === "") throw new UsageError("set VISUAL or EDITOR to edit this draft");
+  return args;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function prepareDraft(raw: unknown, edit: boolean, io: CliIo): Promise<PreparedDraft> {
+  if (!edit) return { kind: "unchanged", value: raw, cleanup: async () => {} };
+  const environment = io.environment ?? process.env;
+  const editor = environment.VISUAL?.trim() || environment.EDITOR?.trim();
+  if (editor === undefined || editor.length === 0) throw new UsageError("set VISUAL or EDITOR to edit this draft");
+  const command = editorArguments(editor);
+  const directory = await mkdtemp(join(tmpdir(), "reveries-draft-"));
+  const path = join(directory, "draft.json");
+  const cleanup = async () => rm(directory, { recursive: true, force: true });
+  await writeFile(path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+  try {
+    await execFileAsync(command[0]!, [...command.slice(1), path], {
+      cwd: io.cwd,
+      env: { ...process.env, ...(io.environment ?? {}) },
+    });
+  } catch (error: unknown) {
+    throw new UsageError(`Draft retained at ${path}: editor failed: ${errorText(error)}`);
+  }
+  const edited = await readFile(path, "utf8");
+  if (edited.trim().length === 0) {
+    await cleanup();
+    throw new EditorCancelledError("Draft editing cancelled because the editor left the draft empty");
+  }
+  try {
+    return { kind: "edited", value: JSON.parse(edited) as unknown, cleanup, retainedPath: path };
+  } catch (error: unknown) {
+    throw new UsageError(`Draft retained at ${path}: ${errorText(error)}`);
+  }
+}
+
+async function usePreparedDraft<T>(draft: PreparedDraft, action: (value: unknown) => Promise<T>): Promise<T> {
+  try {
+    const result = await action(draft.value);
+    await draft.cleanup();
+    return result;
+  } catch (error: unknown) {
+    if (draft.kind === "unchanged") throw error;
+    throw new UsageError(`Draft retained at ${draft.retainedPath}: ${errorText(error)}`);
+  }
 }
 
 function parseProtocolRecordValue(value: unknown, type: "session-summary", label: string): SessionSummary;
@@ -345,12 +783,180 @@ function parseProtocolRecordValue(
   const value = expectObject(raw, type);
   if (value.type !== type) throw new UsageError(`${label} must contain a ${type} record`);
   const candidate = value as NoteRecord;
-  if (type === "session-summary") validateNote([candidate], { verifyIds: false });
-  else {
-    const parsed = parseNote(canonicalRecord(candidate), "tolerant", { verifyIds: false });
-    if (parsed.diagnostics.length > 0) throw new UsageError(parsed.diagnostics.map((item) => item.message).join("; "));
+  try {
+    if (type === "session-summary") validateNote([candidate], { verifyIds: false });
+    else {
+      const parsed = parseNote(canonicalRecord(candidate), "tolerant", { verifyIds: false });
+      if (parsed.diagnostics.length > 0) throw new UsageError(parsed.diagnostics.map((item) => item.message).join("; "));
+    }
+  } catch (error: unknown) {
+    if (error instanceof UsageError) throw error;
+    throw new UsageError(errorText(error));
   }
   return candidate as SessionSummary | ReveriesInit;
+}
+
+type HumanContext = {
+  readonly remote?: string;
+  readonly target?: string;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringField(value: Record<string, unknown>, field: string, fallback = "unknown"): string {
+  const item = value[field];
+  return typeof item === "string" ? item : fallback;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function formatRecord(record: unknown, indent = "  "): string[] {
+  const value = asRecord(record);
+  if (value === null) return [`${indent}${String(record)}`];
+  if (value.type === "reverie") {
+    return [
+      `${indent}${stringField(value, "id")}: ${stringField(value, "decision")}`,
+      `${indent}  Event: ${stringField(value, "driving_event")}`,
+      `${indent}  Impact: ${stringField(value, "impact")}`,
+    ];
+  }
+  if (value.type === "session-summary") {
+    const entries = Array.isArray(value.entries) ? value.entries : [];
+    return [
+      `${indent}Session summary by ${stringField(value, "author_email")}`,
+      ...entries.flatMap((entry, index) => {
+        const item = asRecord(entry);
+        if (item === null) return [];
+        return [
+          `${indent}  ${index + 1}. ${stringField(item, "decision")}`,
+          `${indent}     Event: ${stringField(item, "driving_event")}`,
+          `${indent}     Impact: ${stringField(item, "impact")}`,
+        ];
+      }),
+    ];
+  }
+  if (value.type === "reveries-init") {
+    return [`${indent}Initialization record for ${stringList(value.publishing_remotes).join(", ") || "local-only use"}`];
+  }
+  return [`${indent}${JSON.stringify(value)}`];
+}
+
+function humanOutput(
+  command: string,
+  result: unknown,
+  context: HumanContext,
+): string {
+  const value = asRecord(result);
+  if (command === "check" || command === "receive-check") {
+    return `${value?.ok === true ? "Continuity check passed." : "Continuity check failed."}\n`;
+  }
+  if (command === "doctor") {
+    const protection = asRecord(value?.protection);
+    const lines = [`Reveries doctor: ${stringField(value ?? {}, "state")}.`];
+    if (protection !== null) {
+      lines.push(
+        `Protection: helper ${stringField(protection, "helper")}, local ${stringField(protection, "local")}, receive-side ${stringField(protection, "receiveSide")}.`,
+      );
+    }
+    for (const notice of stringList(value?.notices)) lines.push(`Notice: ${notice}`);
+    return `${lines.join("\n")}\n`;
+  }
+  if (command === "show") {
+    const target = context.target ?? stringField(value ?? {}, "object");
+    const records = Array.isArray(value?.records) ? value.records : [];
+    const active = Array.isArray(value?.active) ? value.active : [];
+    const historical = Array.isArray(value?.historical) ? value.historical : [];
+    if (records.length === 0) return `No Reveries evidence is attached to ${target}.\n`;
+    return [
+      `Evidence for ${target}:`,
+      ...(active.length === 0 ? [] : ["Active decisions:", ...active.flatMap((record) => formatRecord(record))]),
+      ...(historical.length === 0 ? [] : ["Historical decisions:", ...historical.flatMap((record) => formatRecord(record))]),
+      ...(active.length + historical.length > 0 ? [] : records.flatMap((record) => formatRecord(record))),
+      "",
+    ].join("\n");
+  }
+  if (command === "push") {
+    return value?.ok === true
+      ? `Published HEAD and ${NOTES_REF} to ${context.remote ?? "the remote"} atomically.\n`
+      : `Push to ${context.remote ?? "the remote"} was not performed.\n`;
+  }
+  if (command === "sync") {
+    const state = stringField(value ?? {}, "state");
+    if (state === "equal" || state === "diverged" || state === "unknown") {
+      return `Notes status for ${context.remote ?? "the remote"}: ${state} (local ${String(value?.local ?? "none")}, remote ${String(value?.remote ?? "none")}).\n`;
+    }
+    return state === "remote-notes-absent"
+      ? `No Reveries notes are published on ${context.remote ?? "the remote"}.\n`
+      : `Fetched Reveries notes from ${context.remote ?? "the remote"}.\n`;
+  }
+  if (command === "search") {
+    const hits = Array.isArray(result) ? result : [];
+    if (hits.length === 0) return "No matching Reveries evidence found.\n";
+    return [
+      `Found ${hits.length} matching ${hits.length === 1 ? "record" : "records"}:`,
+      ...hits.flatMap((hit) => {
+        const item = asRecord(hit);
+        if (item === null) return [];
+        const paths = stringList(item.paths);
+        return [
+          `- ${paths.length === 0 ? String(item.object) : paths.join(", ")} (${String(item.object)})`,
+          ...formatRecord(item.record, "  "),
+        ];
+      }),
+      "",
+    ].join("\n");
+  }
+  if (command === "history") {
+    const entries = Array.isArray(result) ? result : [];
+    if (entries.length === 0) return `No history found for ${context.target ?? "the requested target"}.\n`;
+    return [
+      `History for ${context.target ?? "the requested target"}:`,
+      ...entries.flatMap((entry) => {
+        const item = asRecord(entry);
+        if (item === null) return [];
+        const records = Array.isArray(item.records)
+          ? item.records
+          : item.record === undefined
+            ? []
+            : [item.record];
+        const object = item.commit ?? item.object ?? "unknown object";
+        const blob = item.blob === undefined ? "" : ` (${String(item.blob)})`;
+        const paths = stringList(item.paths);
+        return [
+          `- ${paths.length === 0 ? String(object) : `${paths.join(", ")} at ${String(object)}`}${blob}`,
+          ...(records.length === 0 ? ["  No records attached."] : records.flatMap((record) => formatRecord(record, "  "))),
+        ];
+      }),
+      "",
+    ].join("\n");
+  }
+  if (command.startsWith("record ")) {
+    const record = asRecord(value?.record);
+    const id = record === null ? "the reverie" : stringField(record, "id", "the reverie");
+    const paths = stringList(value?.paths);
+    return `Recorded reverie ${id}${paths.length === 0 ? "" : ` for ${paths.join(", ")}`}.\n`;
+  }
+  if (command === "summarize") {
+    return `Summarized commit ${stringField(value ?? {}, "commit", context.target ?? "unknown")}.\n`;
+  }
+  if (command === "init") {
+    return `Reveries setup ${stringField(value ?? {}, "state", "completed")}.\n`;
+  }
+  if (command === "adopt") {
+    return `Adopted commit ${stringField(value ?? {}, "commit")}.\n`;
+  }
+  if (command === "remove") {
+    return value?.removed === true ? "Removed Reveries integration. Evidence was preserved.\n" : "No Reveries integration was removed.\n";
+  }
+  if (typeof result === "string") return `${result}\n`;
+  if (result === undefined) return "";
+  return `${JSON.stringify(result, null, 2)}\n`;
 }
 
 function emit(
@@ -359,17 +965,55 @@ function emit(
   command: string,
   result: unknown,
   diagnostics: readonly string[] = [],
+  context: HumanContext = {},
 ): void {
   if (json) {
     io.stdout(`${JSON.stringify({ ok: diagnostics.length === 0, command, result, diagnostics })}\n`);
     return;
   }
-  if (result !== undefined) io.stdout(`${typeof result === "string" ? result : JSON.stringify(result, null, 2)}\n`);
+  const output = humanOutput(command, result, context);
+  if (output.length > 0) io.stdout(output);
   for (const diagnostic of diagnostics) io.stderr(`${diagnostic}\n`);
 }
 
 function splitList(values: readonly string[]): string[] {
   return [...new Set(values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean))];
+}
+
+async function defaultRemote(reveries: Reveries): Promise<string> {
+  const branchResult = await reveries.repository.run(
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    { allowExitCodes: [0, 1] },
+  );
+  if (branchResult.exitCode === 0) {
+    const branch = branchResult.stdout.trim();
+    const upstream = await reveries.repository.run(
+      ["config", "--get", `branch.${branch}.remote`],
+      { allowExitCodes: [0, 1] },
+    );
+    const remote = upstream.stdout.trim();
+    if (upstream.exitCode === 0 && remote.length > 0 && remote !== ".") return remote;
+  }
+
+  const configured = await reveries.repository.run(
+    ["config", "--get-all", "reveries.publishingRemote"],
+    { allowExitCodes: [0, 1] },
+  );
+  const publishers = [...new Set(configured.stdout.split("\n").map((remote) => remote.trim()).filter(Boolean))];
+  if (publishers.length === 1) return publishers[0]!;
+  if (publishers.length === 0) {
+    throw new UsageError(
+      "No default remote is available; set an upstream or configure one publishing remote, or pass a remote explicitly",
+    );
+  }
+  throw new UsageError(
+    `Default publishing remote is ambiguous (${publishers.join(", ")}); set an upstream or pass a remote explicitly`,
+  );
+}
+
+async function remoteArgument(parsed: ParsedArguments, reveries: Reveries): Promise<string> {
+  if (parsed.positionals.length > 1) throw new UsageError("only one remote may be specified");
+  return parsed.positionals[0] ?? defaultRemote(reveries);
 }
 
 function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
@@ -423,7 +1067,17 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       io.stdout(`reveries ${VERSION}\n`);
       return 0;
     }
-    if (command === "help" || command === "--help") {
+    if (command === "help") {
+      const topic = argv[1];
+      if (topic === undefined) io.stdout(HELP);
+      else {
+        const help = COMMAND_HELP[topic];
+        if (help === undefined) throw new UsageError(`no help is available for ${topic}`);
+        io.stdout(help);
+      }
+      return 0;
+    }
+    if (command === "--help") {
       io.stdout(HELP);
       return 0;
     }
@@ -524,29 +1178,37 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     if (reveries === null) throw new Error("Reveries service was not opened");
     if (command === "show") {
       const parsed = parseArguments(argv.slice(1), [], ["--staged", "--json"]);
+      const target = requirePositional(parsed, 0, "path or object");
       const result = await reveries.show({
-        target: requirePositional(parsed, 0, "path or object"),
+        target,
         revision: parsed.flags.has("--staged") ? "index" : "HEAD",
       });
-      emit(io, json, command, result, result.diagnostics);
+      emit(io, json, command, result, result.diagnostics, { target });
       return result.diagnostics.length === 0 ? 0 : 1;
     }
     if (command === "record") {
       const action = argv[1];
       if (action === "new" || action === "supersede") {
-        const parsed = parseArguments(argv.slice(2), ["--from", "--old"], ["--staged", "--committed", "--json"]);
+        const parsed = parseArguments(
+          argv.slice(2),
+          ["--from", "--old", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
+          ["--staged", "--committed", "--json", "--no-recurrence-control", "--edit"],
+        );
         const path = requirePositional(parsed, 0, "path");
-        const from = one(parsed, "--from", true) ?? "";
-        const draft = await parseReverieDraft(from);
+        const from = one(parsed, "--from");
+        const draftSource = await prepareDraft(await readDraft(from, io), parsed.flags.has("--edit"), io);
         const revision = parsed.flags.has("--committed") ? "HEAD" : "index";
-        const result = action === "new"
-          ? await reveries.recordNew({ path, revision, ...draft })
-          : await reveries.recordSupersede({
-              path,
-              revision,
-              ...draft,
-              old: reverieId(one(parsed, "--old", true) ?? ""),
-            });
+        const result = await usePreparedDraft(draftSource, async (raw) => {
+          const draft = await parseReverieDraft(raw, reveries, io, parsed);
+          return action === "new"
+            ? reveries.recordNew({ path, revision, ...draft })
+            : reveries.recordSupersede({
+                path,
+                revision,
+                ...draft,
+                old: parseReverieId(one(parsed, "--old", true) ?? ""),
+              });
+        });
         emit(io, json, `${command} ${action}`, result);
         return 0;
       }
@@ -563,18 +1225,38 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       throw new UsageError("record action must be new, continue, or supersede");
     }
     if (command === "summarize") {
-      const parsed = parseArguments(argv.slice(1), ["--from", "--because"], ["--replace", "--init", "--json"]);
+      const parsed = parseArguments(
+        argv.slice(1),
+        ["--from", "--because", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source", "--reverie", "--retire"],
+        ["--replace", "--init", "--json", "--no-recurrence-control", "--edit"],
+      );
       const commit = requirePositional(parsed, 0, "commit");
-      const from = one(parsed, "--from", true) ?? "";
+      const from = one(parsed, "--from");
       if (parsed.flags.has("--init")) {
-        await reveries.attachInitialization({ commit, record: await parseProtocolRecord(from, "reveries-init") });
+        if (parsed.flags.has("--edit")) throw new UsageError("--edit does not apply with --init");
+        if (from === undefined) throw new UsageError("--init requires --from reveries-init.json");
+        if (parsed.values.has("--session") || parsed.values.has("--driving-event") || parsed.values.has("--decision")
+          || parsed.values.has("--impact") || parsed.values.has("--recurrence-control") || parsed.flags.has("--no-recurrence-control")
+          || parsed.values.has("--alternative") || parsed.values.has("--source") || parsed.values.has("--reverie")
+          || parsed.values.has("--retire")) {
+          throw new UsageError("causal summary options do not apply with --init");
+        }
+      }
+      const draftSource = await prepareDraft(await readDraft(from, io), parsed.flags.has("--edit"), io);
+      if (parsed.flags.has("--init")) {
+        await usePreparedDraft(draftSource, async (raw) => {
+          const init = parseProtocolRecordValue(raw, "reveries-init", from ?? "reveries-init draft");
+          await reveries.attachInitialization({ commit, record: init });
+        });
       } else {
-        const summary = await parseProtocolRecord(from, "session-summary");
         const because = one(parsed, "--because");
-        await reveries.summarize({
-          commit,
-          summary: because === undefined ? summary : { ...summary, correction_reason: because },
-          replace: parsed.flags.has("--replace"),
+        await usePreparedDraft(draftSource, async (raw) => {
+          const summary = await parseSummaryDraft(raw, reveries, io, parsed);
+          await reveries.summarize({
+            commit,
+            summary: because === undefined ? summary : { ...summary, correction_reason: because },
+            replace: parsed.flags.has("--replace"),
+          });
         });
       }
       emit(io, json, command, { commit });
@@ -622,15 +1304,18 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
             (hit) => hit.record.type === "reverie" && hit.record.id === target,
           )
         : await reveries.history(target);
-      emit(io, json, command, result);
+      emit(io, json, command, result, [], { target });
       return 0;
     }
     if (command === "sync") {
       const parsed = parseArguments(argv.slice(1), [], ["--pull", "--status", "--json"]);
-      const remote = requirePositional(parsed, 0, "remote");
+      if (parsed.flags.has("--pull") === parsed.flags.has("--status")) {
+        throw new UsageError("choose exactly one of --pull or --status");
+      }
+      const remote = await remoteArgument(parsed, reveries);
       if (parsed.flags.has("--pull")) {
         const result = await reveries.syncPull(remote);
-        emit(io, json, command, result, result.diagnostics);
+        emit(io, json, command, result, result.diagnostics, { remote });
         return result.ok ? 0 : 1;
       }
       if (parsed.flags.has("--status")) {
@@ -641,15 +1326,15 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
           remote: tracked,
           state: local === null || tracked === null ? "unknown" : local === tracked ? "equal" : "diverged",
         };
-        emit(io, json, command, result);
+        emit(io, json, command, result, [], { remote });
         return 0;
       }
-      throw new UsageError("sync requires --pull or --status");
     }
     if (command === "push") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);
-      const result = await reveries.push(requirePositional(parsed, 0, "remote"));
-      emit(io, json, command, result, result.diagnostics);
+      const remote = await remoteArgument(parsed, reveries);
+      const result = await reveries.push(remote);
+      emit(io, json, command, result, result.diagnostics, { remote });
       return result.ok ? 0 : 1;
     }
     if (command === "doctor") {
@@ -684,8 +1369,13 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     throw new UsageError(`unknown command ${command}`);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    if (error instanceof UsageError) {
+    if (error instanceof EditorCancelledError) {
       io.stderr(`${message}\n`);
+      return 1;
+    }
+    if (error instanceof UsageError) {
+      const hint = command === "help" ? "reveries --help" : `reveries help ${command ?? "<command>"}`;
+      io.stderr(`${message}\nTry '${hint}' for usage.\n`);
       return 3;
     }
     if (json) io.stdout(`${JSON.stringify({ ok: false, command: command ?? null, diagnostics: [message] })}\n`);
