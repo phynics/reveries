@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -96,6 +96,17 @@ async function run(command, args) {
   });
 }
 
+async function markdownFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const paths = [];
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) paths.push(...await markdownFiles(path));
+    else if (entry.isFile() && path.endsWith(".md")) paths.push(path);
+  }
+  return paths;
+}
+
 async function validateSkills() {
   const names = [
     "reveries-git-notes-init",
@@ -113,7 +124,29 @@ async function validateSkills() {
     if (!frontmatter?.[1].includes("description:")) failures.push(`${name}: missing description`);
     if (content.split("\n").length > 120) failures.push(`${name}: main Skill exceeds 120 lines`);
   }
-  await readFile(join(workspace, "skills", "using-reveries", "references", "direct-git.md"), "utf8");
+  const skillDirectory = join(workspace, "skills", "using-reveries");
+  for (const path of await markdownFiles(skillDirectory)) {
+    const content = await readFile(path, "utf8");
+    for (const match of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+      const link = match[1].trim().match(/^<([^>]*)>|^(\S+)/);
+      if (link === null) continue;
+      const target = (link[1] ?? link[2]).split(/[?#]/, 1)[0];
+      if (target.length === 0 || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(target)) continue;
+
+      const resolved = resolve(dirname(path), decodeURIComponent(target));
+      const relativeTarget = relative(skillDirectory, resolved);
+      if (relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) {
+        failures.push(`${relative(skillDirectory, path)}: link escapes the using-reveries Skill folder`);
+        continue;
+      }
+      try {
+        await readFile(resolved, "utf8");
+      } catch {
+        failures.push(`${relative(skillDirectory, path)}: link target does not exist (${target})`);
+      }
+    }
+  }
+  await readFile(join(skillDirectory, "references", "direct-git.md"), "utf8");
   return failures;
 }
 

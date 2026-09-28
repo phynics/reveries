@@ -35,5 +35,7 @@ A reverie ID covers only its causal semantic payload. Do not edit causal content
 A correction or changed rationale creates a new reverie and names the old ID in `supersedes`.
 Continue copies the original canonical record exactly, preserving its ID and attestations.
 
-Read [the protocol](../../../protocol/v1.md) for defined key order, canonical bytes, identity, and
-source validation.
+For the V1 key order, canonical bytes, identity derivation, and direct Git write sequence, use the
+[canonical record recipe](direct-git.md#add-a-canonical-record) in this Skill. Strict schema and
+source validation require a validator. A JSON line that looks valid does not prove that the record
+is a valid reverie.
