@@ -789,3 +789,99 @@ test("pre-push does not treat a disappeared established remote notes ref as firs
   assert.equal(await runCli(["pre-push", "origin"], prePush.io), 1);
   assert.match(prePush.stderr(), /remote notes ref is absent|established remote notes/i);
 });
+
+test("ledger status reports an absent envelope without failing", async () => {
+  const directory = await createRepository();
+  const status = captureIo(directory);
+
+  assert.equal(await runCli(["ledger", "status"], status.io), 0);
+  assert.match(status.stdout(), /^Ledger: absent/m);
+  assert.doesNotMatch(status.stdout(), /^\{/m);
+});
+
+test("ledger status has stable machine output", async () => {
+  const directory = await createRepository();
+  const status = captureIo(directory);
+
+  assert.equal(await runCli(["ledger", "status", "--json"], status.io), 0);
+  const payload = JSON.parse(status.stdout()) as { command: string; ok: boolean; result: { state: string } };
+  assert.equal(payload.command, "ledger status");
+  assert.equal(payload.ok, true);
+  assert.equal(payload.result.state, "absent");
+});
+
+test("ledger requires a known action", async () => {
+  const directory = await createRepository();
+
+  const missing = captureIo(directory);
+  assert.equal(await runCli(["ledger"], missing.io), 3);
+  assert.match(missing.stderr(), /status, build, or materialize/);
+
+  const unknown = captureIo(directory);
+  assert.equal(await runCli(["ledger", "frobnicate"], unknown.io), 3);
+  assert.match(unknown.stderr(), /status, build, or materialize/);
+});
+
+test("help documents the ledger command", async () => {
+  const directory = await createRepository();
+  const general = captureIo(directory);
+  assert.equal(await runCli(["help"], general.io), 0);
+  assert.match(general.stdout(), /^ {2}ledger {3}/m);
+
+  const topic = captureIo(directory);
+  assert.equal(await runCli(["help", "ledger"], topic.io), 0);
+  assert.match(topic.stdout(), /reveries ledger <status\|build\|materialize>/);
+});
+
+test("ledger build advances the envelope over the current notes", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  const build = captureIo(directory);
+
+  assert.equal(await runCli(["ledger", "build"], build.io), 0);
+  assert.match(build.stdout(), /Ledger checkpoint/);
+  await git(directory, "rev-parse", "--verify", "refs/heads/reveries-ledger");
+  const first = (await (await Reveries.open(directory)).ledgerStatus()).tip;
+
+  // A second build with no new evidence still advances the branch: the manifest
+  // names the previous checkpoint as its own parent, so a rebuild is never
+  // byte-identical to its predecessor. That is append-only and always valid, but
+  // it means `ledger build` must not be run unconditionally from a hook.
+  const again = captureIo(directory);
+  assert.equal(await runCli(["ledger", "build", "--json"], again.io), 0);
+  const payload = JSON.parse(again.stdout()) as { result: { state: string; checkpoint: string } };
+  assert.equal(payload.result.state, "created");
+  const status = await (await Reveries.open(directory)).ledgerStatus();
+  assert.equal(status.state, "valid", status.diagnostics.join("; "));
+  assert.notEqual(status.tip, first, "the second build did not advance the branch");
+  assert.equal(await (await Reveries.open(directory)).verifyLedgerEnvelope().then((r) => r.ok), true);
+});
+
+test("ledger status reports a valid envelope after a build", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  await runCli(["ledger", "build"], captureIo(directory).io);
+
+  const status = captureIo(directory);
+  assert.equal(await runCli(["ledger", "status"], status.io), 0);
+  assert.match(status.stdout(), /^Ledger: valid/m);
+});
+
+test("doctor reads the ledger block as its own line", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  await runCli(["ledger", "build"], captureIo(directory).io);
+
+  const doctor = captureIo(directory);
+  await runCli(["doctor"], doctor.io);
+  const lines = doctor.stdout().split("\n");
+  const ledger = lines.find((line) => line.startsWith("Ledger: "));
+  assert.ok(ledger !== undefined, `doctor has no Ledger line:\n${doctor.stdout()}`);
+  assert.match(ledger, /^Ledger: valid; tip [0-9a-f]{40}/);
+  // The generic notice loop must not also print it as "Notice: Ledger:".
+  assert.equal(
+    lines.some((line) => line.startsWith("Notice: Ledger:") || line.includes("Notice: Ledger:")),
+    false,
+    `the ledger line is still emitted as a generic notice:\n${doctor.stdout()}`,
+  );
+});

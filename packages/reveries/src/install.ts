@@ -5,8 +5,17 @@ import { access, chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath,
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { GitRepository } from "./git.ts";
+import { GitRepository, LEDGER_REF } from "./git.ts";
 import { parseNote, type ReveriesInit } from "./protocol.ts";
+
+/**
+ * The ledger envelope branch name, without its `refs/heads/` prefix.
+ *
+ * `LEDGER_REF` owns the full ref name; setup needs the bare branch name to build
+ * fetch refspecs for both ends of the mapping. Deriving it from the owned
+ * constant keeps the two from drifting apart.
+ */
+const LEDGER_BRANCH = LEDGER_REF.slice("refs/heads/".length);
 
 const BEGIN = "<!-- reveries:begin -->";
 const END = "<!-- reveries:end -->";
@@ -1069,12 +1078,33 @@ async function rememberManagedValue(
   }
 }
 
+/**
+ * The fetch refspecs Reveries owns for one publishing remote.
+ *
+ * Both the converge path and the removal path read this single list, so a
+ * refspec can never be installed without a matching way to take it back out.
+ *
+ * The ledger refspec is a glob, not an exact name, for the same reason the notes
+ * one is: an exact refspec makes an ordinary `git fetch` fail hard with
+ * "couldn't find remote ref" until the remote has published a checkpoint. A glob
+ * that matches nothing is not an error, so a fresh collaborator can fetch before
+ * any envelope exists.
+ */
+function managedFetchRefspecs(remote: string): readonly string[] {
+  return [
+    `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
+    `+refs/heads/${LEDGER_BRANCH}*:refs/remotes/${remote}/${LEDGER_BRANCH}*`,
+  ];
+}
+
+/** The exact refspec an earlier managed setup may have left behind. */
+function legacyManagedFetchRefspecs(remote: string): readonly string[] {
+  return [`+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`];
+}
+
 async function removeManagedRemoteConfig(repository: GitRepository, remote: string): Promise<void> {
   if (await managedFlag(repository, `reveries.managed-${remote}.fetch`)) {
-    for (const value of [
-      `+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`,
-      `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
-    ]) {
+    for (const value of [...legacyManagedFetchRefspecs(remote), ...managedFetchRefspecs(remote)]) {
       await unsetConfigValue(repository, `remote.${remote}.fetch`, value);
     }
   }
@@ -1193,18 +1223,15 @@ async function convergeLocalIntegration(
   }
   for (const remote of remotes) {
     if (await managedFlag(repository, `reveries.managed-${remote}.fetch`)) {
-      await unsetConfigValue(
-        repository,
-        `remote.${remote}.fetch`,
-        `+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`,
-      );
+      for (const value of legacyManagedFetchRefspecs(remote)) {
+        await unsetConfigValue(repository, `remote.${remote}.fetch`, value);
+      }
     }
     await removeManagedPushConfig(repository, remote);
-    const fetchAdded = await ensureConfigValue(
-      repository,
-      `remote.${remote}.fetch`,
-      `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
-    );
+    let fetchAdded = false;
+    for (const value of managedFetchRefspecs(remote)) {
+      fetchAdded = await ensureConfigValue(repository, `remote.${remote}.fetch`, value) || fetchAdded;
+    }
     await rememberManagedValue(repository, `reveries.managed-${remote}.fetch`, fetchAdded);
   }
 

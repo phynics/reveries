@@ -828,3 +828,70 @@ test("initialization without a helper emits Git-only contributor guidance", asyn
   });
   assert.deepEqual(withHelper.noHelperGuidance, []);
 });
+
+test("initialization manages the ledger fetch refspec alongside the notes refspec", async () => {
+  const directory = await createRepository();
+  await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+
+  // The envelope is a normal branch, so a plain `git fetch` must be able to
+  // refresh its mirror the same way it refreshes the notes ref. The refspec is a
+  // glob so that a remote which has not published a checkpoint yet can still be
+  // fetched from, which is the state a new collaborator starts in.
+  const fetchValues = await configValues(directory, "remote.origin.fetch");
+  assert.ok(
+    fetchValues.includes("+refs/heads/reveries-ledger*:refs/remotes/origin/reveries-ledger*"),
+    `the ledger refspec is not managed: ${JSON.stringify(fetchValues)}`,
+  );
+  assert.ok(fetchValues.includes("+refs/notes/reveries*:refs/notes/remotes/origin/reveries*"));
+});
+
+test("removal takes the ledger refspec with the notes refspec", async () => {
+  const directory = await createRepository();
+  await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+  assert.ok((await configValues(directory, "remote.origin.fetch")).length > 0);
+
+  const result = await removeIntegration(directory, { publishingRemotes: ["origin"] });
+
+  assert.equal(result.removed, true);
+  const remaining = await configValues(directory, "remote.origin.fetch");
+  assert.equal(
+    remaining.some((value) => value.includes("reveries-ledger")),
+    false,
+    `reveries remove left the ledger refspec behind: ${JSON.stringify(remaining)}`,
+  );
+  assert.equal(
+    remaining.some((value) => value.includes("refs/notes/reveries")),
+    false,
+    `reveries remove left the notes refspec behind: ${JSON.stringify(remaining)}`,
+  );
+});
+
+test("the ledger refspec stays idempotent across repeated convergence", async () => {
+  const directory = await createRepository();
+  const options = {
+    hosts: ["pi"] as const,
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" as const },
+    helper,
+  };
+  await initializeRepository(directory, options);
+  const first = await configValues(directory, "remote.origin.fetch");
+
+  await initializeRepository(directory, options);
+  const second = await configValues(directory, "remote.origin.fetch");
+
+  assert.deepEqual(second, first, "re-running setup duplicated a refspec");
+});

@@ -15,7 +15,7 @@ import {
   type SkillSetup,
   type SupportedHost,
 } from "./install.ts";
-import { INTERNAL_ATOMIC_PUSH_ENV, NOTES_REF } from "./git.ts";
+import { INTERNAL_ATOMIC_PUSH_ENV, LEDGER_REF, NOTES_REF } from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
 import { Reveries, type PushUpdate } from "./operations.ts";
 import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
@@ -25,9 +25,11 @@ import {
   canonicalRecord,
   objectId,
   parseNote,
+  readLedgerManifest,
   reverieId,
   validateNote,
   type NoteRecord,
+  type ObjectId,
   type ReverieInput,
   type ReverieMetadata,
   type ReverieRecord,
@@ -87,6 +89,7 @@ Commands:
   search     Search current or historical engineering evidence
   history    Trace a path or reverie through history
   sync       Inspect or pull a publishing remote's notes
+  ledger     Inspect, advance, or materialize the protected ledger envelope
   push       Atomically push HEAD and refs/notes/reveries
   hook       Handle one host-neutral adapter event from standard input
   receive-check Validate proposed refs and evidence without a worktree
@@ -196,6 +199,26 @@ branch upstream or the sole configured publishing remote.
 Examples:
   reveries sync --status
   reveries sync --pull origin
+`,
+  ledger: `Usage: reveries ledger <status|build|materialize> [<revision>] [--json]
+
+Inspect, advance, or materialize the protected ledger envelope on
+refs/heads/reveries-ledger. The envelope carries the exact notes commit as a
+typed parent, so a clone can recover its evidence from an ordinary branch fetch.
+
+  status       Report how the envelope relates to the local notes ref.
+  build        Advance the envelope over the current notes tip. Only ever
+               appends: a line the previous envelope carried cannot be dropped.
+  materialize  Recreate refs/notes/reveries from a verified envelope. Refuses
+               when the local notes ref carries records the envelope does not.
+
+materialize never overwrites local notes it cannot prove the envelope already
+contains. Pass <revision> to name a remote envelope, such as
+refs/remotes/origin/reveries-ledger in a fresh clone.
+Examples:
+  reveries ledger status
+  reveries ledger build
+  reveries ledger materialize refs/remotes/origin/reveries-ledger
 `,
   push: `Usage: reveries push [<remote>] [--json]
 
@@ -862,12 +885,58 @@ function formatRecord(record: unknown, indent = "  "): string[] {
   return [`${indent}${JSON.stringify(value)}`];
 }
 
+/**
+ * One human-readable line for a ledger block, whether it came from `doctor`,
+ * `sync`, or `ledger status`.
+ *
+ * The state is spelled out rather than reduced to a notice, because the four
+ * states mean different things: `absent` is a repository that never adopted the
+ * envelope, `stale` is a healthy repository that has not rebuilt it over its
+ * newest notes, and only `invalid` is damage.
+ */
+function describeLedger(block: unknown): string | null {
+  const ledger = asRecord(block);
+  if (ledger === null) return null;
+  const state = stringField(ledger, "state", "absent");
+  const tip = ledger.tip === null || ledger.tip === undefined ? "none" : String(ledger.tip);
+  const subjects = ledger.annotatedSubjects === undefined
+    ? "0"
+    : String(ledger.annotatedSubjects);
+  const relation = state === "valid"
+    ? "the local notes ref matches it"
+    : state === "stale"
+      ? "the local notes ref is ahead of it"
+      : state === "invalid"
+        ? "the envelope failed verification"
+        : "no checkpoint exists";
+  return `Ledger: ${state}; tip ${tip}; ${subjects} annotated subject(s) transported; ${relation}.`;
+}
+
 function humanOutput(
   command: string,
   result: unknown,
   context: HumanContext,
 ): string {
   const value = asRecord(result);
+  if (command === "ledger status") {
+    return `${describeLedger(value) ?? "No Reveries ledger envelope is available."}\n`;
+  }
+  if (command === "ledger build" || command === "ledger materialize") {
+    const state = stringField(value ?? {}, "state");
+    const tip = value?.checkpoint === null || value?.checkpoint === undefined
+      ? "none"
+      : String(value.checkpoint);
+    const sentences: Record<string, string> = {
+      created: `Ledger checkpoint advanced to ${tip}.`,
+      unchanged: `The ledger envelope already describes the current notes tip (${tip}).`,
+      "up-to-date": `The notes ref already matches the envelope ${tip}.`,
+      materialized: `Materialized ${NOTES_REF} from the ledger envelope ${tip}.`,
+      absent: "No Reveries ledger envelope is available.",
+      "local-ahead": "The local notes ref was left unchanged; it carries records the envelope does not.",
+      refused: `The ledger envelope was refused; the notes ref was left unchanged (${tip}).`,
+    };
+    return `${sentences[state] ?? `Ledger ${state} (${tip}).`}\n`;
+  }
   if (command === "check" || command === "receive-check") {
     return `${value?.ok === true ? "Continuity check passed." : "Continuity check failed."}\n`;
   }
@@ -879,6 +948,8 @@ function humanOutput(
         `Protection: helper ${stringField(protection, "helper")}, local ${stringField(protection, "local")}, receive-side ${stringField(protection, "receiveSide")}.`,
       );
     }
+    const ledgerLine = describeLedger(value?.ledger);
+    if (ledgerLine !== null) lines.push(ledgerLine);
     const repair = asRecord(value?.repair);
     if (repair !== null) {
       lines.push(`Repair: ${stringField(repair, "state")}.`);
@@ -886,7 +957,12 @@ function humanOutput(
         lines.push(`Add this to the ${/(\S+)\s+"\$@"$/.exec(snippet)?.[1] ?? "matching"} hook: ${snippet}`);
       }
     }
-    for (const notice of stringList(value?.notices)) lines.push(`Notice: ${notice}`);
+    for (const notice of stringList(value?.notices)) {
+      // The envelope already has its own line; repeating it inside a generic
+      // notice would print "Notice: Ledger:" and read as two different things.
+      if (notice.startsWith("Ledger:")) continue;
+      lines.push(`Notice: ${notice}`);
+    }
     return `${lines.join("\n")}\n`;
   }
   if (command === "show") {
@@ -910,12 +986,28 @@ function humanOutput(
   }
   if (command === "sync") {
     const state = stringField(value ?? {}, "state");
+    const ledger = asRecord(value?.ledger);
+    const ledgerLine = ledger === null
+      ? null
+      : `Ledger: ${stringField(ledger, "state")}${
+        ledger.notesCommit === null || ledger.notesCommit === undefined
+          ? "."
+          : `; notes tip ${String(ledger.notesTip ?? "none")}.`
+      }`;
     if (state === "equal" || state === "diverged" || state === "unknown") {
-      return `Notes status for ${context.remote ?? "the remote"}: ${state} (local ${String(value?.local ?? "none")}, remote ${String(value?.remote ?? "none")}).\n`;
+      return [
+        `Notes status for ${context.remote ?? "the remote"}: ${state} (local ${String(value?.local ?? "none")}, remote ${String(value?.remote ?? "none")}).`,
+        ...(ledgerLine === null ? [] : [ledgerLine]),
+        "",
+      ].join("\n");
     }
-    return state === "remote-notes-absent"
-      ? `No Reveries notes are published on ${context.remote ?? "the remote"}.\n`
-      : `Fetched Reveries notes from ${context.remote ?? "the remote"}.\n`;
+    return [
+      state === "remote-notes-absent"
+        ? `No Reveries notes are published on ${context.remote ?? "the remote"}.`
+        : `Fetched Reveries notes from ${context.remote ?? "the remote"}.`,
+      ...(ledgerLine === null ? [] : [ledgerLine]),
+      "",
+    ].join("\n");
   }
   if (command === "search") {
     const hits = Array.isArray(result) ? result : [];
@@ -1036,6 +1128,215 @@ async function defaultRemote(reveries: Reveries): Promise<string> {
 async function remoteArgument(parsed: ParsedArguments, reveries: Reveries): Promise<string> {
   if (parsed.positionals.length > 1) throw new UsageError("only one remote may be specified");
   return parsed.positionals[0] ?? defaultRemote(reveries);
+}
+
+/**
+ * Whether the local notes ref may be replaced by a verified envelope.
+ *
+ * `materializeNotesFromLedger` moves the ref with `update-ref`, so it REPLACES
+ * rather than unions. Anything the envelope does not already contain would be
+ * lost, so the only safe moves are an absent notes ref and a fast-forward from a
+ * local tip that is a strict ancestor of the envelope's notes commit. Every
+ * other case is `local-ahead` and must be refused.
+ */
+type LedgerGate =
+  | { readonly kind: "proceed"; readonly expectedNotes: ObjectId | null }
+  | { readonly kind: "up-to-date"; readonly notesTip: ObjectId }
+  | { readonly kind: "local-ahead"; readonly notesTip: ObjectId; readonly notesCommit: ObjectId };
+
+async function ledgerGate(reveries: Reveries, notesCommit: ObjectId): Promise<LedgerGate> {
+  const notesTip = await reveries.repository.notesTip();
+  // No local notes ref at all is the fresh-clone case the envelope exists for.
+  if (notesTip === null) return { kind: "proceed", expectedNotes: null };
+  if (notesTip === notesCommit) return { kind: "up-to-date", notesTip };
+  // Ancestry runs envelope -> local in the ordinary case, because a checkpoint
+  // is built from the notes tip as it stood and notes only grow. The local tip
+  // is therefore normally ahead, which is stale-but-healthy, not a fast-forward.
+  const ancestor = await reveries.repository.run(
+    ["merge-base", "--is-ancestor", notesTip, notesCommit],
+    { allowExitCodes: [0, 1] },
+  );
+  return ancestor.exitCode === 0
+    ? { kind: "proceed", expectedNotes: notesTip }
+    : { kind: "local-ahead", notesTip, notesCommit };
+}
+
+/** A ledger step as reported to humans and to `--json`. */
+interface LedgerReport {
+  readonly ok: boolean;
+  readonly state:
+    | "absent"
+    | "status"
+    | "valid"
+    | "stale"
+    | "invalid"
+    | "created"
+    | "unchanged"
+    | "refused"
+    | "materialized"
+    | "up-to-date"
+    | "local-ahead";
+  readonly checkpoint: ObjectId | null;
+  readonly notesTip: ObjectId | null;
+  readonly notesCommit: ObjectId | null;
+  /** Failures only. An `absent` or `local-ahead` envelope is not a failure. */
+  readonly diagnostics: readonly string[];
+}
+
+const LEDGER_ABSENT_REPORT: LedgerReport = {
+  ok: true,
+  state: "absent",
+  checkpoint: null,
+  notesTip: null,
+  notesCommit: null,
+  diagnostics: [],
+};
+
+/**
+ * Verify an envelope, then move the notes ref onto it when that is safe.
+ *
+ * The gate runs first and refuses rather than replacing, so a local notes tip
+ * carrying records the envelope lacks is never destroyed. Callers choose the
+ * severity of a refusal, because the same refusal is routine on a sync and a
+ * failure on an explicit request.
+ */
+async function materializeLedger(
+  reveries: Reveries,
+  revision: string | undefined,
+): Promise<LedgerReport> {
+  const notesTip = await reveries.repository.notesTip();
+  const stored = await (async () => {
+    const checkpoint = revision === undefined
+      ? await reveries.repository.ledgerTip()
+      : await reveries.repository.resolveCommit(revision);
+    if (checkpoint === null) return null;
+    return { checkpoint, manifest: await reveries.repository.readLedgerManifestAt(checkpoint) };
+  })();
+  if (stored === null) {
+    return { ...LEDGER_ABSENT_REPORT, ok: false, diagnostics: [`No Reveries ledger envelope is available${revision === undefined ? "" : ` at ${revision}`}`] };
+  }
+  const verification = await reveries.verifyLedgerEnvelope(stored.checkpoint);
+  if (!verification.ok) {
+    return {
+      ok: false,
+      state: "refused",
+      checkpoint: stored.checkpoint,
+      notesTip,
+      notesCommit: null,
+      diagnostics: verification.diagnostics,
+    };
+  }
+  const notesCommit = (await reveries.repository.readLedgerManifestAt(stored.checkpoint)) === null
+    ? null
+    : readEnvelopeNotesCommit(await reveries.repository.readLedgerManifestAt(stored.checkpoint) as string);
+  if (notesCommit === null) {
+    return {
+      ok: false,
+      state: "refused",
+      checkpoint: stored.checkpoint,
+      notesTip,
+      notesCommit: null,
+      diagnostics: ["The verified ledger envelope transports no notes commit"],
+    };
+  }
+  const gate = await ledgerGate(reveries, notesCommit);
+  if (gate.kind === "local-ahead") {
+    return {
+      ok: false,
+      state: "local-ahead",
+      checkpoint: stored.checkpoint,
+      notesTip: gate.notesTip,
+      notesCommit,
+      diagnostics: [
+        `The local ${NOTES_REF} carries notes the ledger envelope does not contain, so it was left unchanged`,
+      ],
+    };
+  }
+  if (gate.kind === "up-to-date") {
+    return {
+      ok: true,
+      state: "up-to-date",
+      checkpoint: stored.checkpoint,
+      notesTip: gate.notesTip,
+      notesCommit,
+      diagnostics: [],
+    };
+  }
+  const result = await reveries.materializeNotesFromLedger({
+    expectedNotes: gate.expectedNotes,
+    ...(revision === undefined ? {} : { revision }),
+  });
+  return {
+    ok: result.ok,
+    state: result.state,
+    checkpoint: stored.checkpoint,
+    notesTip: result.notesTip,
+    notesCommit,
+    diagnostics: result.diagnostics,
+  };
+}
+
+/** The notes commit a verified envelope transports, or null if it names none. */
+function readEnvelopeNotesCommit(stored: string): ObjectId | null {
+  try {
+    return readLedgerManifest(stored)?.notes_commit ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a publishing remote carries a ledger envelope.
+ *
+ * The envelope is optional by design, so its absence is `absent` and never a
+ * failure. The probe runs before any fetch so a remote without one costs a
+ * single round trip.
+ */
+async function remoteHasLedger(reveries: Reveries, remote: string): Promise<boolean> {
+  const probe = await reveries.repository.run(
+    ["ls-remote", "--refs", remote, LEDGER_REF],
+    { allowExitCodes: [0, 1, 128] },
+  );
+  if (probe.exitCode !== 0) return false;
+  return probe.stdout.split("\n").some((line) => line.endsWith(`\t${LEDGER_REF}`));
+}
+
+/** Fetch an envelope into its remote-tracking mirror. */
+async function fetchLedger(reveries: Reveries, remote: string): Promise<{ readonly ok: boolean; readonly diagnostics: readonly string[] }> {
+  try {
+    await reveries.repository.run([
+      "fetch",
+      remote,
+      `+${LEDGER_REF}:refs/remotes/${remote}/reveries-ledger`,
+    ]);
+    return { ok: true, diagnostics: [] };
+  } catch (error: unknown) {
+    return { ok: false, diagnostics: [`Could not fetch the Reveries ledger from ${remote}: ${errorText(error)}`] };
+  }
+}
+
+/**
+ * Bring a remote's ledger envelope across and materialize from it.
+ *
+ * `syncPull` fetches exactly one refspec, an explicit `refs/notes/reveries` one,
+ * so a configured `remote.<r>.fetch` refspec never brings the envelope along.
+ * That is why this runs its own fetch rather than relying on the refspec that
+ * setup manages.
+ */
+async function syncLedger(reveries: Reveries, remote: string): Promise<LedgerReport> {
+  if (!await remoteHasLedger(reveries, remote)) return LEDGER_ABSENT_REPORT;
+  const fetched = await fetchLedger(reveries, remote);
+  if (!fetched.ok) {
+    return { ...LEDGER_ABSENT_REPORT, ok: false, state: "refused", diagnostics: fetched.diagnostics };
+  }
+  const report = await materializeLedger(reveries, `refs/remotes/${remote}/reveries-ledger`);
+  if (report.state === "local-ahead") {
+    // Approved severity split: the notes already arrived through the notes ref,
+    // so nothing is lost and nothing is wrong. The repository is merely ahead of
+    // its last checkpoint, which `ledgerStatus` already calls `stale`.
+    return { ...report, ok: true, diagnostics: [] };
+  }
+  return report;
 }
 
 function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
@@ -1341,8 +1642,15 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       const remote = await remoteArgument(parsed, reveries);
       if (parsed.flags.has("--pull")) {
         const result = await reveries.syncPull(remote);
-        emit(io, json, command, result, result.diagnostics, { remote });
-        return result.ok ? 0 : 1;
+        // The envelope is a second, independent route for the same evidence: a
+        // remote that will not serve `refs/notes/reveries` can still deliver it
+        // through an ordinary branch. Absent envelope and a refusal are both
+        // normal here, so only a broken envelope or a lost compare-and-swap is a
+        // failure of the sync itself.
+        const ledger = await syncLedger(reveries, remote);
+        const diagnostics = [...result.diagnostics, ...ledger.diagnostics];
+        emit(io, json, command, { ...result, ledger }, diagnostics, { remote });
+        return result.ok && ledger.ok ? 0 : 1;
       }
       if (parsed.flags.has("--status")) {
         const local = await reveries.repository.notesTip();
@@ -1355,6 +1663,51 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
         emit(io, json, command, result, [], { remote });
         return 0;
       }
+    }
+    if (command === "ledger") {
+      const action = argv[1];
+      if (action !== "status" && action !== "build" && action !== "materialize") {
+        throw new UsageError("ledger action must be status, build, or materialize");
+      }
+      const parsed = parseArguments(argv.slice(2), [], ["--json"]);
+      const label = `ledger ${action}`;
+      if (action === "status") {
+        // Only an `invalid` envelope is damage. `absent` means this repository
+        // never adopted the ledger and `stale` means it has not been rebuilt
+        // over its newest notes; neither is a failure to report.
+        const status = await reveries.ledgerStatus();
+        const report: LedgerReport = {
+          ok: status.state !== "invalid",
+          state: status.state,
+          checkpoint: status.tip,
+          notesTip: status.notesTip,
+          notesCommit: status.notesCommit,
+          diagnostics: status.diagnostics,
+        };
+        emit(io, json, label, report, report.diagnostics);
+        return report.ok ? 0 : 1;
+      }
+      if (action === "build") {
+        // The manifest's `authority` field stays null: RVR-017 owns the primary
+        // remote's role semantics and has not defined them yet.
+        const built = await reveries.buildLedgerCheckpoint({ authority: null });
+        const report: LedgerReport = {
+          ok: built.ok,
+          state: built.state,
+          checkpoint: built.checkpoint,
+          notesTip: built.notesTip,
+          notesCommit: null,
+          diagnostics: built.diagnostics,
+        };
+        emit(io, json, label, report, report.diagnostics);
+        return report.ok ? 0 : 1;
+      }
+      const revision = parsed.positionals[0];
+      const report = await materializeLedger(reveries, revision);
+      // An explicit request that does not happen is a failure, so the exit code
+      // and stderr both say so. The notes ref is still never overwritten.
+      emit(io, json, label, report, report.diagnostics);
+      return report.ok ? 0 : 1;
     }
     if (command === "push") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);

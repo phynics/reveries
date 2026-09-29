@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
+import { runCli, type CliIo } from "../src/cli.ts";
 import { GitRepository, hashBlobContent, LEDGER_MANIFEST_PATH, LEDGER_NOTES_PATH, NOTES_REF } from "../src/git.ts";
 import { Reveries } from "../src/operations.ts";
 import {
@@ -550,4 +551,190 @@ test("checkOutgoingUpdates does not demand summary coverage for the ledger branc
     },
   ]);
   assert.equal(withCode.ok, false);
+});
+
+// --- Publication surfaces: the CLI commands and the sync --pull path --------
+
+function captureIo(cwd: string): { readonly io: CliIo; readonly stdout: () => string; readonly stderr: () => string } {
+  let out = "";
+  let error = "";
+  return {
+    io: {
+      cwd,
+      stdin: async () => "",
+      stdout: (text) => { out += text; },
+      stderr: (text) => { error += text; },
+    },
+    stdout: () => out,
+    stderr: () => error,
+  };
+}
+
+interface Published {
+  readonly origin: string;
+  /** The publisher's work tree, kept so a test can forge a replacement envelope. */
+  readonly work: string;
+  readonly notesCommit: ObjectId;
+}
+
+/**
+ * A publisher that ships the envelope as an ordinary branch and never publishes
+ * `refs/notes/reveries`. That is the case the envelope exists for: a remote
+ * where the notes ref is unavailable, refused, or simply not mirrored.
+ *
+ * The remote must be bare. A non-bare origin exposes its own
+ * `refs/notes/reveries`, so `syncPull` would deliver the evidence by the
+ * ordinary route and the envelope would never be exercised.
+ */
+async function publishWithoutNotes(decision = "Carry the notes in the envelope."): Promise<Published> {
+  const work = await createRepository();
+  const repository = await GitRepository.open(work);
+  await appendNote(repository, reverieLine(decision));
+  const checkpoint = await (await Reveries.open(work)).buildLedgerCheckpoint({ authority: null });
+  assert.notEqual(checkpoint.checkpoint, null);
+  assert.notEqual(checkpoint.notesTip, null);
+
+  const origin = await mkdtemp(join(tmpdir(), "reveries-ledger-remote-"));
+  temporaryRepositories.push(origin);
+  await git(origin, "init", "--bare");
+  await git(work, "remote", "add", "publish", origin);
+  await git(work, "push", "publish", "main");
+  // Only the envelope crosses. The notes ref deliberately stays behind.
+  await git(work, "push", "publish", "refs/heads/reveries-ledger:refs/heads/reveries-ledger");
+  assert.equal(await git(origin, "rev-parse", "--verify", "refs/notes/reveries").then(
+    () => true,
+    () => false,
+  ), false, "the bare remote unexpectedly publishes a notes ref");
+  return { origin, work, notesCommit: checkpoint.notesTip as ObjectId };
+}
+
+/** A clone of `origin` that already has the envelope but no notes ref. */
+async function cloneOf(origin: string): Promise<string> {
+  const clone = await mkdtemp(join(tmpdir(), "reveries-ledger-cli-"));
+  temporaryRepositories.push(clone);
+  // The bare remote's HEAD may name a branch that was never pushed, so pin the
+  // branch the publisher actually created or the clone has no worktree.
+  await execFileAsync("git", ["clone", "--quiet", "-b", "main", origin, clone], { encoding: "utf8" });
+  // A notes mutation needs a committer identity, which `git clone` does not copy.
+  await git(clone, "config", "user.name", "Ledger Test");
+  await git(clone, "config", "user.email", "reveries@example.com");
+  return clone;
+}
+
+test("sync --pull materializes a clone's notes ref from the envelope", async () => {
+  const { origin } = await publishWithoutNotes();
+  const clone = await cloneOf(origin);
+  const cloned = await GitRepository.open(clone);
+  assert.equal(await cloned.notesTip(), null, "the clone already has a notes ref");
+
+  const sync = captureIo(clone);
+  assert.equal(await runCli(["sync", "--pull", "origin"], sync.io), 0, sync.stderr());
+  assert.match(sync.stdout(), /Ledger: materialized/);
+
+  const shown = captureIo(clone);
+  assert.equal(await runCli(["show", "state.txt", "--json"], shown.io), 0);
+  const payload = JSON.parse(shown.stdout()) as { result: { records: readonly unknown[] } };
+  assert.equal(payload.result.records.length, 1, "the envelope did not deliver its evidence");
+});
+
+test("sync --pull leaves a local notes ref that leads the envelope alone", async () => {
+  const { origin } = await publishWithoutNotes();
+  const clone = await cloneOf(origin);
+  const cloned = await GitRepository.open(clone);
+
+  // Local-only evidence the envelope does not carry. Materializing would replace
+  // the ref and destroy it, so the gate must refuse.
+  const blob = await cloned.resolvePath({ path: "state.txt", revision: "HEAD" });
+  await cloned.withNotesWrite(async (transaction) => {
+    await transaction.append(blob, canonicalRecord(createReverie(
+      {
+        v: 1,
+        driving_event: "This clone has evidence the publisher has not checkpointed.",
+        decision: "Keep the local notes ref.",
+        impact: "The envelope must not replace unpublished evidence.",
+        recurrence_control: null,
+        alternatives: [],
+        sources: [],
+        supersedes: [],
+      },
+      { author_email: "reveries@example.com", session: null, created_at: "2026-08-25T03:10:00Z" },
+      (bytes) => hashBlobContent(bytes, "sha1"),
+    )));
+  });
+  const before = await cloned.notesTip();
+
+  const sync = captureIo(clone);
+  // Approved severity split: on a sync this refusal is a notice, not a failure.
+  assert.equal(await runCli(["sync", "--pull", "origin"], sync.io), 0, sync.stderr());
+  assert.equal(await cloned.notesTip(), before, "the local notes ref was overwritten");
+
+  const shown = captureIo(clone);
+  assert.equal(await runCli(["show", "state.txt", "--json"], shown.io), 0, "the local evidence was lost");
+  assert.equal(
+    (JSON.parse(shown.stdout()) as { result: { records: readonly unknown[] } }).result.records.length,
+    1,
+  );
+});
+
+test("an explicit ledger materialize refuses loudly and changes nothing", async () => {
+  const { origin } = await publishWithoutNotes();
+  const clone = await cloneOf(origin);
+  const cloned = await GitRepository.open(clone);
+  const blob = await cloned.resolvePath({ path: "state.txt", revision: "HEAD" });
+  await cloned.withNotesWrite(async (transaction) => {
+    await transaction.append(blob, '{"v":1,"type":"reverie","id":"rv:local-only"}\n');
+  });
+  const before = await cloned.notesTip();
+
+  const materialize = captureIo(clone);
+  // Approved severity split: an explicit request that does not happen fails.
+  assert.equal(await runCli([
+    "ledger", "materialize", "refs/remotes/origin/reveries-ledger",
+  ], materialize.io), 1);
+  assert.match(materialize.stderr(), /carries notes the ledger envelope does not contain/);
+  assert.equal(await cloned.notesTip(), before, "the local notes ref was overwritten");
+});
+
+test("sync --pull on a remote with no envelope is not an error", async () => {
+  const origin = await createRepository();
+  const clone = await cloneOf(origin);
+  assert.equal(await GitRepository.open(clone).then((r) => r.ledgerTip()), null);
+
+  const sync = captureIo(clone);
+  assert.equal(await runCli(["sync", "--pull", "origin"], sync.io), 0, sync.stderr());
+});
+
+test("a forged envelope fails the sync and leaves the notes ref alone", async () => {
+  // A bare remote that publishes only the envelope, so the envelope is the sole
+  // route for the evidence and a refusal is observable as an unmoved ref.
+  const { origin, work, notesCommit } = await publishWithoutNotes("Publish an envelope that lies.");
+  const repository = await GitRepository.open(work);
+  const empty = await repository.emptyTreeObjectId();
+
+  // A manifest that claims an empty notes tree while naming a real notes commit.
+  const manifest = createLedgerManifest({
+    notes_commit: notesCommit,
+    notes_tree: empty,
+    previous_ledger: null,
+    retention_commit: null,
+    authority: null,
+    annotated_subjects: 0,
+    records: 0,
+    note_bytes: 0,
+  });
+  const manifestBlob = await repository.writeBlob(canonicalLedgerManifest(manifest));
+  const tree = (await repository.run(["mktree"], {
+    input: `100644 blob ${manifestBlob}\t${LEDGER_MANIFEST_PATH}\n040000 tree ${empty}\t${LEDGER_NOTES_PATH}\n`,
+  })).stdout.trim();
+  const forged = (await repository.run([
+    "commit-tree", tree, "-p", notesCommit, "-m", "Reveries ledger checkpoint",
+  ])).stdout.trim();
+  await git(work, "push", "--force", "publish", `${forged}:refs/heads/reveries-ledger`);
+
+  const clone = await cloneOf(origin);
+  const cloned = await GitRepository.open(clone);
+  const sync = captureIo(clone);
+  assert.equal(await runCli(["sync", "--pull", "origin"], sync.io), 1, "a forged envelope passed the sync");
+  assert.match(sync.stderr(), /notes_tree|notes tree|subtree/i);
+  assert.equal(await cloned.notesTip(), null, "a failed sync still moved the notes ref");
 });

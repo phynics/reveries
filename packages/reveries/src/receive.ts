@@ -1,6 +1,14 @@
-import { GitRepository, NOTES_REF } from "./git.ts";
+import { GitRepository, LEDGER_REF, NOTES_REF } from "./git.ts";
 import { Reveries, type CheckResult } from "./operations.ts";
-import { commitId, objectId, transitionId, type CommitId, type ObjectId, type TransitionId } from "./protocol.ts";
+import {
+  commitId,
+  objectId,
+  parseLedgerManifest,
+  transitionId,
+  type CommitId,
+  type ObjectId,
+  type TransitionId,
+} from "./protocol.ts";
 
 export type ReceiveRefUpdate = {
   readonly ref: string;
@@ -229,8 +237,26 @@ function result(
   };
 }
 
+/**
+ * The ledger envelope is evidence transport, not code. RVR-005 synthesizes each
+ * checkpoint with a fixed identity and a fixed epoch date, so a checkpoint can
+ * never carry a session summary and can never disposition a predecessor blob.
+ * Holding it to authored-commit coverage is a category error, not a stricter
+ * policy, so it is excluded here exactly as `checkOutgoingUpdates` already
+ * excludes it on the push side.
+ *
+ * The set is the exact envelope ref plus its remote-tracking mirrors. A
+ * `refs/heads/reveries-*` prefix rule would silently exempt any future review or
+ * experiment branch that no contract has claimed.
+ */
+const LEDGER_MIRROR_REF = /^refs\/remotes\/[^/]+\/reveries-ledger$/;
+
+function isLedgerRef(ref: string): boolean {
+  return ref === LEDGER_REF || LEDGER_MIRROR_REF.test(ref);
+}
+
 function isCodeRef(ref: string): boolean {
-  return ref.startsWith("refs/heads/") || ref.startsWith("refs/pull/");
+  return !isLedgerRef(ref) && (ref.startsWith("refs/heads/") || ref.startsWith("refs/pull/"));
 }
 
 function isValidRef(ref: string): boolean {
@@ -259,6 +285,28 @@ async function appendCheck(
 ): Promise<void> {
   const result = await check;
   diagnostics.push(...result.diagnostics.map((diagnostic) => `${prefix}: ${diagnostic}`));
+}
+
+/**
+ * The notes commit a proposed envelope claims to transport.
+ *
+ * A ledger-only proposal publishes its notes inside the envelope, so there is no
+ * `refs/notes/reveries` update to take the boundary from. The manifest names that
+ * commit, and reading it here is not an act of trust: `verifyLedgerEnvelope` is
+ * what decides whether the claim is true, and a manifest that lies is rejected.
+ * Anything unreadable, malformed, or not a commit yields null so the
+ * verification reports the problem instead of this helper throwing.
+ */
+async function envelopeNotesCommit(
+  repository: GitRepository,
+  checkpoint: ObjectId,
+): Promise<ObjectId | null> {
+  const stored = await repository.readLedgerManifestAt(checkpoint);
+  if (stored === null) return null;
+  const manifest = parseLedgerManifest(stored, "tolerant").manifest;
+  const notesCommit = manifest?.notes_commit ?? null;
+  if (notesCommit === null) return null;
+  return await repository.objectType(notesCommit) === "commit" ? notesCommit : null;
 }
 
 /**
@@ -429,6 +477,23 @@ export async function checkReceive(cwd: string, input: ReceiveCheckInput): Promi
           ),
           update.ref,
         );
+      }
+    }
+
+    // Withdrawing authored-commit coverage from the ledger must not withdraw the
+    // check itself. The envelope is verified instead, on the same fail-closed
+    // terms `checkOutgoingUpdates` applies before publishing it and
+    // `materializeNotesFromLedger` applies before trusting it. A proposal that
+    // carries a ledger ref and no usable notes boundary is refused rather than
+    // passed through unchecked.
+    const ledgerUpdate = updates.find((update) => isLedgerRef(update.ref) && update.newObject !== null);
+    if (ledgerUpdate?.newObject != null) {
+      const boundary = notesTip ?? await envelopeNotesCommit(repository, ledgerUpdate.newObject);
+      if (boundary === null) {
+        diagnostics.push(`${ledgerUpdate.ref}: the proposed envelope transports no usable notes commit`);
+      } else {
+        const reveries = await Reveries.openBareForReceive(cwd, boundary);
+        await appendCheck(diagnostics, reveries.verifyLedgerEnvelope(ledgerUpdate.newObject), ledgerUpdate.ref);
       }
     }
 
