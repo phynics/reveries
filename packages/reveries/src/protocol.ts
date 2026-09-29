@@ -5,6 +5,7 @@ export type ObjectId = Brand<string, "git-object-id">;
 export type BlobId = ObjectId & { readonly __blobBrand: "blob-id" };
 export type CommitId = ObjectId & { readonly __commitBrand: "commit-id" };
 export type ReverieId = Brand<`rv:${string}`, "reverie-id">;
+export type TransitionId = Brand<`tr:${string}`, "transition-id">;
 
 export type SourceRelation =
   | "caused-by"
@@ -53,6 +54,61 @@ export type Retirement = {
   reason: string;
 };
 
+/**
+ * Causal content of a tree transition. The full set participates in the
+ * transition identity, normalized exactly like reverie semantic content.
+ * RVR-007 builds its fact graph on this shape: keep it small and stable.
+ */
+export type TransitionCausal = {
+  driving_event: string;
+  decision: string;
+  impact: string;
+  recurrence_control: string | null;
+  alternatives: string[];
+  sources: Source[];
+  reveries: ReverieId[];
+  retirements: Retirement[];
+};
+
+export type TransitionMetadata = {
+  author_email: string;
+  session: string | null;
+  created_at: string;
+};
+
+/**
+ * A causal explanation for why ordered parent trees became a result tree.
+ * Stored as a note on the result tree object (RVR-005 may index it by id).
+ * `parents` is ordered merge-parent order (`[]` for a root commit) and that
+ * order participates in the identity.
+ */
+export type TransitionSummary = TransitionCausal & TransitionMetadata & {
+  v: 1;
+  type: "transition-summary";
+  id: TransitionId;
+  parents: ObjectId[];
+  result: ObjectId;
+};
+
+export type TransitionInput = TransitionCausal & {
+  parents: readonly ObjectId[];
+  result: ObjectId;
+};
+
+/**
+ * Minimal publication claim: who published `commit` and which reviewed
+ * transition it used. The annotated commit is its identity (like a session
+ * summary); it carries no independent `tr:`-style ID. RVR-005/RVR-009 may
+ * extend it; the transition identity itself never depends on it.
+ */
+export type PublicationAttestation = TransitionMetadata & {
+  v: 1;
+  type: "publication-attestation";
+  commit: CommitId;
+  transition: TransitionId;
+  publisher: string;
+};
+
 export type SummaryEntry = {
   driving_event: string;
   decision: string;
@@ -85,7 +141,7 @@ export type ReveriesInit = {
   created_at: string;
 };
 
-export type NoteRecord = ReverieRecord | SessionSummary | ReveriesInit;
+export type NoteRecord = ReverieRecord | SessionSummary | ReveriesInit | TransitionSummary | PublicationAttestation;
 
 export type Diagnostic = {
   line?: number;
@@ -110,6 +166,7 @@ export type ResourceLimits = {
   maxReveries: number;
   maxRetirements: number;
   maxEntries: number;
+  maxParents: number;
   maxGraphVisits: number;
   maxDiagnostics: number;
 };
@@ -126,6 +183,7 @@ export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxReveries: 64,
   maxRetirements: 64,
   maxEntries: 64,
+  maxParents: 64,
   maxGraphVisits: 131_072,
   maxDiagnostics: 32,
 });
@@ -216,6 +274,7 @@ export type HashObject = (bytes: Uint8Array) => ObjectId;
 
 const HEX_OBJECT_ID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 const REVERIE_ID = /^rv:[0-9a-f]{40}$|^rv:[0-9a-f]{64}$/;
+const TRANSITION_ID = /^tr:[0-9a-f]{40}$|^tr:[0-9a-f]{64}$/;
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
@@ -241,6 +300,11 @@ export function commitId(value: string): CommitId {
 export function reverieId(value: string): ReverieId {
   if (!REVERIE_ID.test(value)) throw new Error(`Invalid reverie ID: ${value}`);
   return value as ReverieId;
+}
+
+export function transitionId(value: string): TransitionId {
+  if (!TRANSITION_ID.test(value)) throw new Error(`Invalid transition ID: ${value}`);
+  return value as TransitionId;
 }
 
 function trimText(value: string, field: string): string {
@@ -357,6 +421,93 @@ export function createReverie(
   return record;
 }
 
+function normalizeTransitionCausal(input: TransitionCausal): TransitionCausal {
+  const recurrence = input.recurrence_control === null
+    ? null
+    : recurrenceText(input.recurrence_control, "recurrence_control");
+  return {
+    driving_event: trimText(input.driving_event, "driving_event"),
+    decision: trimText(input.decision, "decision"),
+    impact: trimText(input.impact, "impact"),
+    recurrence_control: recurrence,
+    alternatives: sortedUnique(input.alternatives),
+    sources: sortedUniqueSources(input.sources),
+    reveries: [...new Set(input.reveries)].sort(compareUtf8),
+    retirements: canonicalRetirements(input.retirements),
+  };
+}
+
+function canonicalRetirements(retirements: readonly Retirement[]): Retirement[] {
+  return [...retirements].map(canonicalRetirement)
+    .sort((a, b) => compareUtf8(`${a.reverie}\u0000${a.from_blob}`, `${b.reverie}\u0000${b.from_blob}`));
+}
+
+/**
+ * Exact bytes hashed for the transition identity: version, ordered parent
+ * trees, result tree, and normalized causal fields. Parent order is
+ * preserved (never sorted); set-like causal arrays are deduplicated and
+ * sorted. Author metadata is excluded, so the identity survives amends and
+ * publication rewrites. RVR-007 depends on this exact shape.
+ */
+export function transitionPayload(
+  record: TransitionCausal & { parents: readonly ObjectId[]; result: ObjectId },
+): string {
+  const causal = normalizeTransitionCausal(record);
+  return JSON.stringify({
+    v: 1,
+    parents: [...record.parents],
+    result: record.result,
+    ...causal,
+  });
+}
+
+export function createTransition(
+  input: TransitionInput,
+  metadata: TransitionMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): TransitionSummary {
+  const resolved = resolveLimits(limits);
+  const payload = transitionPayload(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `tr:${hashObject(Buffer.from(`${payload}\n`, "utf8"))}` as TransitionId;
+  const causal = normalizeTransitionCausal(input);
+  const record: TransitionSummary = {
+    ...causal,
+    v: 1,
+    type: "transition-summary",
+    id,
+    parents: [...input.parents],
+    result: input.result,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+export function createAttestation(
+  input: { commit: CommitId; transition: TransitionId; publisher: string },
+  metadata: TransitionMetadata,
+  limits: Partial<ResourceLimits> = {},
+): PublicationAttestation {
+  const resolved = resolveLimits(limits);
+  validateTimestamp(metadata.created_at, "created_at");
+  const record: PublicationAttestation = {
+    v: 1,
+    type: "publication-attestation",
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+    commit: commitId(input.commit),
+    transition: transitionId(input.transition),
+    publisher: trimRef(input.publisher, "publisher", resolved),
+  };
+  validateRecord(record, undefined, resolved);
+  return record;
+}
+
 function canonicalRetirement(retirement: Retirement): Retirement {
   return {
     reverie: retirement.reverie,
@@ -404,6 +555,39 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
       ...(record.correction_reason === undefined ? {} : { correction_reason: trimText(record.correction_reason, "correction_reason") }),
     };
   }
+  if (record.type === "transition-summary") {
+    const causal = normalizeTransitionCausal(record);
+    return {
+      v: 1,
+      type: "transition-summary",
+      id: record.id,
+      parents: [...record.parents],
+      result: record.result,
+      driving_event: causal.driving_event,
+      decision: causal.decision,
+      impact: causal.impact,
+      recurrence_control: causal.recurrence_control,
+      alternatives: causal.alternatives,
+      sources: causal.sources,
+      reveries: causal.reveries,
+      retirements: causal.retirements,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
+  if (record.type === "publication-attestation") {
+    return {
+      v: 1,
+      type: "publication-attestation",
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+      commit: record.commit,
+      transition: record.transition,
+      publisher: trimText(record.publisher, "publisher"),
+    };
+  }
   return {
     v: 1,
     type: "reveries-init",
@@ -426,6 +610,8 @@ function asRecord(value: unknown): NoteRecord {
   if (record.type === "reverie") return record as unknown as ReverieRecord;
   if (record.type === "session-summary") return record as unknown as SessionSummary;
   if (record.type === "reveries-init") return record as unknown as ReveriesInit;
+  if (record.type === "transition-summary") return record as unknown as TransitionSummary;
+  if (record.type === "publication-attestation") return record as unknown as PublicationAttestation;
   throw new Error(`unknown record type: ${String(record.type)}`);
 }
 
@@ -450,6 +636,57 @@ function validateSource(source: unknown, limits: Readonly<ResourceLimits> = DEFA
   else if (value.kind === "note") reverieId(value.ref);
   else if (value.kind === "git-email") validateEmail(value.ref, "source.ref", limits);
   else if (value.kind === "issue" && !ISSUE.test(value.ref)) throw new Error("invalid issue source reference");
+}
+
+function validateTransitionSummary(
+  record: TransitionSummary,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!TRANSITION_ID.test(record.id)) throw new Error("invalid transition ID");
+  if (!Array.isArray(record.parents)) throw new Error("transition parents are required");
+  checkArrayLength(record.parents, limits.maxParents, "maxParents", "parents");
+  for (const parent of record.parents) objectId(parent);
+  objectId(record.result);
+  if (!Array.isArray(record.alternatives) || !Array.isArray(record.sources)
+    || !Array.isArray(record.reveries) || !Array.isArray(record.retirements)) {
+    throw new Error("transition arrays are required");
+  }
+  checkArrayLength(record.alternatives, limits.maxAlternatives, "maxAlternatives", "alternatives");
+  checkArrayLength(record.sources, limits.maxSources, "maxSources", "sources");
+  checkArrayLength(record.reveries, limits.maxReveries, "maxReveries", "reveries");
+  checkArrayLength(record.retirements, limits.maxRetirements, "maxRetirements", "retirements");
+  for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
+  for (const source of record.sources) validateSource(source, limits);
+  for (const id of record.reveries) reverieId(id);
+  for (const retirement of record.retirements) {
+    reverieId(retirement.reverie);
+    blobId(retirement.from_blob);
+    trimNarrative(retirement.reason, "retirement.reason", limits);
+  }
+  trimNarrative(record.driving_event, "driving_event", limits);
+  trimNarrative(record.decision, "decision", limits);
+  trimNarrative(record.impact, "impact", limits);
+  if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control", limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `tr:${hashObject(Buffer.from(`${transitionPayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`transition ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
+function validateAttestation(
+  record: PublicationAttestation,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  commitId(record.commit);
+  transitionId(record.transition);
+  trimRef(record.publisher, "publisher", limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
 }
 
 function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): void {
@@ -504,6 +741,14 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
     if (record.correction_reason !== undefined) trimNarrative(record.correction_reason, "correction_reason", limits);
     return;
   }
+  if (record.type === "transition-summary") {
+    validateTransitionSummary(record, hashObject, limits);
+    return;
+  }
+  if (record.type === "publication-attestation") {
+    validateAttestation(record, limits);
+    return;
+  }
   if (record.protocol !== 1 || record.notes_ref !== NOTES_REF) throw new Error("invalid Reveries initialization record");
   if (!Array.isArray(record.publishing_remotes) || !Array.isArray(record.hosts)) throw new Error("initialization arrays are required");
   for (const remote of record.publishing_remotes) trimRef(remote, "publishing remote", limits);
@@ -542,10 +787,30 @@ export function validateNote(
   if (summaries.length > 1) throw new Error("note contains more than one session summary");
   if (inits.length > 1) throw new Error("note contains more than one initialization record");
   if (inits.length > 0 && (summaries.length !== 1 || records.length !== 2)) throw new Error("initialization note must contain exactly one summary and one init record");
-  if (summaries.length === 0 && inits.length === 0 && records.some((record) => record.type !== "reverie")) throw new Error("blob note contains a non-reverie record");
+  // Tree notes carry transition summaries and commit notes may carry
+  // publication attestations; object-type placement beyond this is enforced
+  // by the snapshot validator, which knows each annotated object's type.
+  if (summaries.length === 0 && inits.length === 0
+    && records.some((record) => record.type !== "reverie"
+      && record.type !== "transition-summary"
+      && record.type !== "publication-attestation")) {
+    throw new Error("blob note contains a non-reverie record");
+  }
   const byId = new Map<ReverieId, string>();
+  const transitionsById = new Map<TransitionId, string>();
   let graphVisits = 0;
   for (const record of records) {
+    if (record.type === "transition-summary") {
+      graphVisits += 1;
+      if (graphVisits > limits.maxGraphVisits) {
+        throw new LimitExceededError("maxGraphVisits", graphVisits, limits.maxGraphVisits, "transition graph");
+      }
+      const payload = transitionPayload(record);
+      const previous = transitionsById.get(record.id);
+      if (previous !== undefined && previous !== payload) throw new Error(`conflicting duplicate transition ID: ${record.id}`);
+      transitionsById.set(record.id, payload);
+      continue;
+    }
     if (record.type !== "reverie") continue;
     graphVisits += 1 + record.supersedes.length;
     if (graphVisits > limits.maxGraphVisits) {
@@ -615,5 +880,7 @@ export function parseNote(
 
 export type ActiveProjection = import("./projection.ts").ActiveProjection;
 export { projectActiveReveries } from "./projection.ts";
+export type TransitionAttestationProjection = import("./projection.ts").TransitionAttestationProjection;
+export { projectTransitionAttestation } from "./projection.ts";
 export type { ContinuityInput, ContinuityReport, ContinuityDisposition, ContinuityObligation } from "./continuity.ts";
 export { analyzeContinuity } from "./continuity.ts";

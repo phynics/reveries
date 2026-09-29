@@ -1,4 +1,11 @@
-import type { ReverieId, ReverieRecord } from "./protocol.ts";
+import type {
+  CommitId,
+  ObjectId,
+  PublicationAttestation,
+  ReverieId,
+  ReverieRecord,
+  TransitionSummary,
+} from "./protocol.ts";
 
 export type ActiveProjection = {
   active: ReverieRecord[];
@@ -101,4 +108,56 @@ export function projectActiveReveries(records: readonly ReverieRecord[]): Active
     cycles,
     ...(conflictIds.size === 0 ? {} : { conflicts: [...conflictIds].sort() }),
   };
+}
+
+export type TransitionAttestationProjection = {
+  transition: TransitionSummary | null;
+  diagnostics: string[];
+};
+
+/**
+ * Link a published commit to its reviewed tree transition through its
+ * publication attestation. Pure: callers resolve the commit's parent trees,
+ * result tree, attestations, and candidate transition records first.
+ * Exactly one attested transition whose stored trees match the resolved
+ * trees resolves; anything else fails closed with a diagnostic.
+ */
+export function projectTransitionAttestation(input: {
+  commit: CommitId;
+  parents: readonly ObjectId[];
+  result: ObjectId;
+  attestations: readonly PublicationAttestation[];
+  transitions: readonly TransitionSummary[];
+}): TransitionAttestationProjection {
+  const mine = input.attestations.filter((attestation) => attestation.commit === input.commit);
+  if (mine.length === 0) {
+    return {
+      transition: null,
+      diagnostics: [`Commit ${input.commit} has no publication attestation`],
+    };
+  }
+  const attested = [...new Set(mine.map((attestation) => attestation.transition))].sort();
+  if (attested.length > 1) {
+    return {
+      transition: null,
+      diagnostics: [`Commit ${input.commit} attests more than one transition: ${attested.join(", ")}`],
+    };
+  }
+  const wanted = attested[0] as string;
+  const candidate = input.transitions.find((transition) => transition.id === wanted);
+  if (candidate === undefined) {
+    return {
+      transition: null,
+      diagnostics: [`Attested transition ${wanted} for commit ${input.commit} has no transition record`],
+    };
+  }
+  const parentsMatch = candidate.parents.length === input.parents.length
+    && candidate.parents.every((parent, index) => parent === input.parents[index]);
+  if (!parentsMatch || candidate.result !== input.result) {
+    return {
+      transition: null,
+      diagnostics: [`Attested transition ${wanted} for commit ${input.commit} does not match the resolved trees`],
+    };
+  }
+  return { transition: candidate, diagnostics: [] };
 }

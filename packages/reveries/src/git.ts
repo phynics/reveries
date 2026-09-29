@@ -366,6 +366,59 @@ export class GitRepository {
     return parseObjectId(result.stdout, `git rev-parse ${commit}^{tree}`);
   }
 
+  /**
+   * Ordered parent trees for a commit, preserving merge-parent order. A
+   * root commit yields an empty list. The order is never sorted: it
+   * participates in the RVR-004 transition identity.
+   */
+  async parentTreesForCommit(commit: CommitId): Promise<readonly ObjectId[]> {
+    const parents = (await this.run(["show", "-s", "--format=%P", commit]))
+      .stdout.trim().split(" ").filter((parent) => parent.length > 0);
+    const trees: ObjectId[] = [];
+    for (const parent of parents) {
+      const result = await this.run(["rev-parse", "--verify", `${parent}^{tree}`]);
+      trees.push(parseObjectId(result.stdout, `git rev-parse ${parent}^{tree}`));
+    }
+    return trees;
+  }
+
+  /** Result tree for an already-resolved commit. */
+  async resultTreeForCommit(commit: CommitId): Promise<ObjectId> {
+    const result = await this.run(["rev-parse", "--verify", `${commit}^{tree}`]);
+    return parseObjectId(result.stdout, `git rev-parse ${commit}^{tree}`);
+  }
+
+  /**
+   * Compute a candidate merge result tree without creating a commit, for
+   * pre-final-commit (squash / merge-queue) transition validation. The
+   * given parent order is the merge order callers must record.
+   */
+  async mergeCandidateTree(parents: readonly string[], mergeBase?: string): Promise<ObjectId> {
+    if (parents.length < 2) {
+      throw new Error("A merge candidate needs at least two parents");
+    }
+    for (const parent of parents) {
+      if (parent.length === 0 || parent.includes("\0")) {
+        throw new Error("A merge parent must be nonempty and cannot contain NUL");
+      }
+    }
+    const args = ["merge-tree", "--write-tree"];
+    if (mergeBase !== undefined) {
+      if (mergeBase.length === 0 || mergeBase.includes("\0")) {
+        throw new Error("A merge base must be nonempty and cannot contain NUL");
+      }
+      args.push("--merge-base", mergeBase);
+    }
+    args.push("--", ...parents);
+    return parseObjectId((await this.run(args)).stdout, "git merge-tree");
+  }
+
+  /** True when the object exists locally and is itself a tree. */
+  async treeExists(object: ObjectId): Promise<boolean> {
+    const result = await this.run(["cat-file", "-t", object], { allowExitCodes: [0, 1, 128] });
+    return result.exitCode === 0 && result.stdout.trim() === "tree";
+  }
+
   async objectType(object: ObjectId): Promise<"blob" | "tree" | "commit" | "tag" | null> {
     const result = await this.run(["cat-file", "-t", object], { allowExitCodes: [0, 1, 128] });
     if (result.exitCode !== 0) return null;

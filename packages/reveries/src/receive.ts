@@ -1,6 +1,6 @@
 import { GitRepository, NOTES_REF } from "./git.ts";
 import { Reveries, type CheckResult } from "./operations.ts";
-import { commitId, objectId, type CommitId, type ObjectId } from "./protocol.ts";
+import { commitId, objectId, transitionId, type CommitId, type ObjectId, type TransitionId } from "./protocol.ts";
 
 export type ReceiveRefUpdate = {
   readonly ref: string;
@@ -13,9 +13,22 @@ export type ReceiveEvidence = {
   readonly baseTree?: ObjectId;
 };
 
+/**
+ * Claimed transition evidence: ordered parent trees, candidate result tree,
+ * and the `tr:` identity reviewers approved. Validated against the proposed
+ * notes tip without requiring a final commit ID, so merge-queue candidates
+ * check before publication creates the commit.
+ */
+export type ReceiveTransitionEvidence = {
+  readonly parents: readonly string[];
+  readonly result: string;
+  readonly transition: string;
+};
+
 export type ReceiveCheckInput = {
   readonly updates: readonly ReceiveRefUpdate[];
   readonly evidence?: readonly ReceiveEvidence[];
+  readonly transitions?: readonly ReceiveTransitionEvidence[];
   readonly baseTree?: ObjectId;
   /**
    * Pull-request description text used only by the explicitly opt-in
@@ -35,6 +48,7 @@ export type ReceiveFindingCode =
   | "missing-session-summary"
   | "missing-continuity-disposition"
   | "missing-notes-publication"
+  | "missing-transition-evidence"
   | "summary-from-pr-description"
   | "other";
 
@@ -106,6 +120,19 @@ summary to the commit (see the missing-session-summary remediation) before
 merge so the published history carries durable evidence. PR-description
 coverage is explicitly weaker and must never be treated as equivalent.`;
 
+const TRANSITION_REMEDIATION = `Record a transition summary for the exact ordered parent trees and result
+tree, then push the notes ref first:
+
+    result="<result-tree-oid>"
+    printf '%s\\n' '<transition-summary-jsonl>' > /tmp/transition.jsonl
+    git notes --ref=refs/notes/reveries add -F /tmp/transition.jsonl "$result"
+    git push origin refs/notes/reveries:refs/notes/reveries
+
+The transition identity covers ordered parent trees, the result tree, and the
+causal fields; a metadata-only amend reuses it, while a rebase onto a changed
+tree needs a new or adapted record. A transition added this way must exist
+before the receive check runs.`;
+
 /**
  * Split an optional `<ref> <commit>: ` prefix from a receive diagnostic.
  * Diagnostics surfaced through `checkProposedRef` carry the ref twice
@@ -163,6 +190,16 @@ export function classifyReceiveDiagnostic(diagnostic: string): ReceiveFinding {
       ...(commit === undefined ? {} : { commit }),
       detail: diagnostic,
       remediation: CONTINUITY_REMEDIATION,
+    };
+  }
+  if (/\btransition\b/i.test(rest)) {
+    return {
+      code: "missing-transition-evidence",
+      grade: "strict",
+      ...(ref === undefined ? {} : { ref }),
+      ...(commit === undefined ? {} : { commit }),
+      detail: diagnostic,
+      remediation: TRANSITION_REMEDIATION,
     };
   }
   return {
@@ -294,6 +331,45 @@ export async function checkReceive(cwd: string, input: ReceiveCheckInput): Promi
       diagnostics.push(MISSING_NOTES_NON_DELETING);
     }
 
+    const claimedTransitions: { parents: ObjectId[]; result: ObjectId; transition: TransitionId }[] = [];
+    for (const item of input.transitions ?? []) {
+      let valid = true;
+      const parents: ObjectId[] = [];
+      if (!Array.isArray(item.parents)) {
+        diagnostics.push("Transition evidence parents must be an array of tree IDs");
+        continue;
+      }
+      for (const parent of item.parents) {
+        const tree = objectOrNull(parent as unknown as ObjectId, "transition evidence parent tree", diagnostics);
+        if (tree === null) {
+          valid = false;
+          continue;
+        }
+        if (await repository.objectType(tree) !== "tree") {
+          diagnostics.push(`Transition evidence parent tree ${tree} is not a tree`);
+          valid = false;
+          continue;
+        }
+        parents.push(tree);
+      }
+      const result = objectOrNull(item.result as unknown as ObjectId, "transition evidence result tree", diagnostics);
+      if (result !== null && await repository.objectType(result) !== "tree") {
+        diagnostics.push(`Transition evidence result tree ${result} is not a tree`);
+      }
+      let transition: TransitionId | null = null;
+      try {
+        transition = transitionId(item.transition);
+      } catch (error: unknown) {
+        diagnostics.push(`Transition evidence identity: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (valid && result !== null && await repository.objectType(result) === "tree" && transition !== null) {
+        claimedTransitions.push({ parents, result, transition });
+      }
+    }
+    if ((input.transitions ?? []).length > 0 && notesTip === null) {
+      diagnostics.push(`Transition evidence requires a proposed ${NOTES_REF} update`);
+    }
+
     const evidence = input.evidence ?? [];
     for (const item of evidence) {
       const object = objectOrNull(item.object, "evidence object", diagnostics);
@@ -337,6 +413,10 @@ export async function checkReceive(cwd: string, input: ReceiveCheckInput): Promi
       const reveries = await Reveries.openBareForReceive(cwd, notesTip);
       const evidenceCheck = await reveries.checkProposedEvidence();
       diagnostics.push(...evidenceCheck.diagnostics.map((diagnostic) => `evidence: ${diagnostic}`));
+      if (claimedTransitions.length > 0) {
+        const transitionCheck = await reveries.checkProposedTransitions(claimedTransitions);
+        diagnostics.push(...transitionCheck.diagnostics.map((diagnostic) => `transition: ${diagnostic}`));
+      }
       for (const update of codeUpdates) {
         if (update.newObject === null) continue;
         checkedRefs.push(update.ref);

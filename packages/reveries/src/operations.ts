@@ -3,7 +3,9 @@ import {
   blobId,
   canonicalRecord,
   commitId,
+  createAttestation,
   createReverie,
+  createTransition,
   createEvidenceSnapshot,
   NOTES_REF,
   objectId,
@@ -11,6 +13,8 @@ import {
   projectActiveReveries,
   resolveLimits,
   semanticPayload,
+  transitionId,
+  transitionPayload,
   validateNote,
   type ActiveProjection,
   type BlobId,
@@ -19,6 +23,7 @@ import {
   type EvidenceSnapshot,
   type NoteRecord,
   type ObjectId,
+  type PublicationAttestation,
   type ResourceLimits,
   type ReverieId,
   type ReverieInput,
@@ -28,7 +33,13 @@ import {
   type SessionSummary,
   type Source,
   type SummaryEntry,
+  type TransitionCausal,
+  type TransitionId,
+  type TransitionInput,
+  type TransitionMetadata,
+  type TransitionSummary,
 } from "./protocol.ts";
+import { projectTransitionAttestation } from "./projection.ts";
 import {
   GitRepository,
   cloneEvidenceGrade,
@@ -259,6 +270,20 @@ export interface AttachHostedSummaryResult {
   readonly diagnostics: readonly string[];
 }
 
+/** Resolved tree pair behind a transition identity. */
+export interface TransitionTrees {
+  /** Ordered parent trees (`[]` for a root commit); order is significant. */
+  readonly parents: readonly ObjectId[];
+  readonly result: ObjectId;
+}
+
+export type TransitionCoverage = "transition" | "v1-summary" | "none";
+
+export interface TransitionCheckResult extends CheckResult {
+  readonly coverage: TransitionCoverage;
+  readonly transition: TransitionId | null;
+}
+
 export interface PublishNotesInput {
   readonly remote: string;
   readonly attempts?: number;
@@ -339,6 +364,9 @@ function allSources(record: NoteRecord): readonly Source[] {
   if (record.type === "reverie") {
     return record.sources;
   }
+  if (record.type === "transition-summary") {
+    return record.sources;
+  }
   if (record.type === "session-summary") {
     return record.entries.flatMap((entry) => entry.sources);
   }
@@ -395,6 +423,8 @@ export interface EvidenceSnapshotView {
   readonly tip: ObjectId | null;
   readonly entries: readonly SnapshotNoteEntry[];
   readonly byId: ReadonlyMap<ReverieId, { readonly record: NoteRecord; readonly object: ObjectId }>;
+  readonly transitions: ReadonlyMap<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>;
+  readonly attestations: ReadonlyMap<CommitId, readonly PublicationAttestation[]>;
   readonly backlinks: ReadonlyMap<ReverieId, readonly ObjectId[]>;
   readonly init: { readonly commit: CommitId; readonly record: ReveriesInit } | null;
   readonly initError: string | null;
@@ -420,6 +450,8 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     tip: null,
     entries: [],
     byId: new Map(),
+    transitions: new Map(),
+    attestations: new Map(),
     backlinks: new Map(),
     init: null,
     initError: null,
@@ -755,6 +787,226 @@ export class Reveries {
       note: canonicalRecord(input.summary),
       validateNotesRef: (ref) => this.validateNotesRef(ref),
     });
+  }
+
+  /**
+   * Resolved tree pair for a commit: ordered parent trees (`[]` for a root)
+   * plus the result tree. The pair plus causal fields is the RVR-004
+   * transition identity; it survives metadata-only amends and publication
+   * rewrites, while a rebase onto a changed tree yields a new pair.
+   */
+  async transitionTreesForCommit(commit: CommitId): Promise<TransitionTrees> {
+    const [parents, result] = await Promise.all([
+      this.repository.parentTreesForCommit(commit),
+      this.repository.resultTreeForCommit(commit),
+    ]);
+    return { parents, result };
+  }
+
+  /** Canonical `tr:` identity for a tree pair plus causal content. */
+  async transitionIdentityFor(input: TransitionInput): Promise<TransitionId> {
+    const format = await this.repository.objectFormat();
+    return transitionId(`tr:${hashBlobContent(`${transitionPayload(input)}\n`, format)}`);
+  }
+
+  /** Tree pair plus identity for an existing commit and causal content. */
+  async transitionIdentityForCommit(commit: CommitId, causal: TransitionCausal): Promise<
+    TransitionTrees & { readonly transition: TransitionId }
+  > {
+    const trees = await this.transitionTreesForCommit(commit);
+    const transition = await this.transitionIdentityFor({ ...causal, ...trees });
+    return { ...trees, transition };
+  }
+
+  /**
+   * Record a transition summary on its result tree object. Adapted evidence
+   * for a rebased transition cites the previous commit with a
+   * `derived-from` commit-kind source in its causal fields.
+   */
+  async recordTransition(input: {
+    readonly parents: readonly ObjectId[];
+    readonly result: ObjectId;
+    readonly causal: TransitionCausal;
+    readonly metadata: TransitionMetadata;
+  }): Promise<{ readonly record: TransitionSummary }> {
+    for (const parent of input.parents) {
+      if (!(await this.repository.treeExists(parent))) {
+        throw new Error(`Parent tree ${parent} is not a tree`);
+      }
+    }
+    if (!(await this.repository.treeExists(input.result))) {
+      throw new Error(`Result tree ${input.result} is not a tree`);
+    }
+    const format = await this.repository.objectFormat();
+    const record = createTransition(
+      { ...input.causal, parents: input.parents, result: input.result },
+      input.metadata,
+      (bytes) => hashBlobContent(bytes, format),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(input.result, canonicalRecord(record));
+    });
+    return { record };
+  }
+
+  /** Record a minimal publication attestation on its commit. */
+  async recordAttestation(input: {
+    readonly commit: string;
+    readonly transition: TransitionId;
+    readonly publisher: string;
+    readonly metadata: TransitionMetadata;
+  }): Promise<{ readonly record: PublicationAttestation }> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    const record = createAttestation(
+      { commit, transition: input.transition, publisher: input.publisher },
+      input.metadata,
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(commit, canonicalRecord(record));
+    });
+    return { record };
+  }
+
+  /**
+   * Validate transition evidence for a tree pair without requiring a final
+   * commit ID, so squash and merge-group candidates validate before
+   * publication creates the commit. Fails closed when no transition record
+   * covers the exact pair, when several competing records cover it, or when
+   * an expected identity names no matching record.
+   */
+  async checkCandidateTransition(input: {
+    readonly parents: readonly ObjectId[];
+    readonly result: ObjectId;
+    readonly transition?: TransitionId;
+  }): Promise<TransitionCheckResult> {
+    for (const parent of input.parents) {
+      if (!(await this.repository.treeExists(parent))) {
+        return { ok: false, diagnostics: [`Parent tree ${parent} is not a tree`], coverage: "none", transition: null };
+      }
+    }
+    if (!(await this.repository.treeExists(input.result))) {
+      return { ok: false, diagnostics: [`Result tree ${input.result} is not a tree`], coverage: "none", transition: null };
+    }
+    const view = await this.loadCachedEvidenceSnapshot({});
+    const onResult = [...view.transitions.values()].filter(({ record }) =>
+      record.result === input.result
+      && record.parents.length === input.parents.length
+      && record.parents.every((parent, index) => parent === input.parents[index]));
+    const pair = `parents [${input.parents.join(", ")}] → ${input.result}`;
+    if (input.transition !== undefined) {
+      const match = onResult.find(({ record }) => record.id === input.transition);
+      if (match === undefined) {
+        return {
+          ok: false,
+          diagnostics: [`Transition ${input.transition} has no record for ${pair}`],
+          coverage: "none",
+          transition: null,
+        };
+      }
+      return { ok: true, diagnostics: [], coverage: "transition", transition: match.record.id };
+    }
+    if (onResult.length === 0) {
+      return {
+        ok: false,
+        diagnostics: [`No transition evidence for ${pair}; record a transition summary or adapted evidence`],
+        coverage: "none",
+        transition: null,
+      };
+    }
+    const ids = onResult.map(({ record }) => record.id).sort();
+    if (ids.length > 1) {
+      return {
+        ok: false,
+        diagnostics: [`${pair} has more than one transition explanation: ${ids.join(", ")}`],
+        coverage: "none",
+        transition: null,
+      };
+    }
+    return { ok: true, diagnostics: [], coverage: "transition", transition: ids[0] as TransitionId };
+  }
+
+  /**
+   * Validate a published commit's transition coverage: an exact attested
+   * transition wins; otherwise a readable V1 session summary covers the
+   * commit through the bridge projection. Commits with neither fail.
+   */
+  async checkCommitTransition(revision: string): Promise<TransitionCheckResult> {
+    const commit = await this.repository.resolveCommit(revision);
+    const trees = await this.transitionTreesForCommit(commit);
+    const view = await this.loadCachedEvidenceSnapshot({});
+    const projection = projectTransitionAttestation({
+      commit,
+      parents: trees.parents,
+      result: trees.result,
+      attestations: view.attestations.get(commit) ?? [],
+      transitions: [...view.transitions.values()].map((entry) => entry.record),
+    });
+    if (projection.transition !== null) {
+      return { ok: true, diagnostics: [], coverage: "transition", transition: projection.transition.id };
+    }
+    if (await this.projectV1SummaryForTransition(commit) !== null) {
+      return { ok: true, diagnostics: [], coverage: "v1-summary", transition: null };
+    }
+    return { ok: false, diagnostics: projection.diagnostics, coverage: "none", transition: null };
+  }
+
+  /**
+   * V1 bridge: project a commit's session summary onto its resolved tree
+   * pair when both sides are known. V1 summaries stay readable as
+   * transition coverage without inventing a `tr:` identity for them.
+   */
+  async projectV1SummaryForTransition(commit: CommitId): Promise<{
+    readonly parents: readonly ObjectId[];
+    readonly result: ObjectId;
+    readonly summary: SessionSummary;
+  } | null> {
+    const summary = await this.commitSessionSummary(commit);
+    if (summary === null) return null;
+    const trees = await this.transitionTreesForCommit(commit);
+    return { ...trees, summary };
+  }
+
+  /**
+   * Validate claimed transition evidence against the proposed notes tip.
+   * Used by the receive checker: every item needs a self-consistent
+   * transition record on its result tree. Never requires a final commit.
+   */
+  async checkProposedTransitions(
+    items: readonly { parents: readonly ObjectId[]; result: ObjectId; transition: TransitionId }[],
+  ): Promise<CheckResult> {
+    const diagnostics: string[] = [];
+    const format = await this.repository.objectFormat();
+    for (const item of items) {
+      const note = await this.readEvidenceNote(item.result);
+      if (note === null) {
+        diagnostics.push(`Transition ${item.transition} has no evidence on result tree ${item.result}`);
+        continue;
+      }
+      let records: readonly NoteRecord[];
+      try {
+        records = parseNote(note, "strict", { verifyIds: false }).records;
+      } catch (error: unknown) {
+        diagnostics.push(`Result tree ${item.result}: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
+      const found = records.find((record): record is TransitionSummary =>
+        record.type === "transition-summary" && record.id === item.transition);
+      if (found === undefined) {
+        diagnostics.push(`Result tree ${item.result} carries no ${item.transition} transition record`);
+        continue;
+      }
+      const expected = `tr:${hashBlobContent(`${transitionPayload(found)}\n`, format)}`;
+      if (expected !== found.id) {
+        diagnostics.push(`Transition record ${found.id} fails identity verification`);
+        continue;
+      }
+      const parentsMatch = found.parents.length === item.parents.length
+        && found.parents.every((parent, index) => parent === item.parents[index]);
+      if (!parentsMatch || found.result !== item.result) {
+        diagnostics.push(`Transition ${found.id} does not match the claimed trees`);
+      }
+    }
+    return { ok: diagnostics.length === 0, diagnostics };
   }
 
   async synthesizeHostedSummary(input: HostedSummaryInput): Promise<HostedSummaryPlan> {
@@ -1226,6 +1478,13 @@ export class Reveries {
         const parsed = parseNote(body, "strict", { limits });
         records = validateNote(parsed, { limits });
         for (const record of records) {
+          if (record.type === "transition-summary") {
+            const expected = `tr:${hashBlobContent(`${transitionPayload(record)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Transition ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
           if (record.type !== "reverie") continue;
           const expected = `rv:${hashBlobContent(`${semanticPayload(record)}\n`, format)}`;
           if (expected !== record.id) {
@@ -1283,6 +1542,20 @@ export class Reveries {
     const backlinks = new Map<ReverieId, readonly ObjectId[]>(
       [...backlinkSets].map(([id, objects]) => [id, [...objects].sort()]),
     );
+    const transitions = new Map<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>();
+    const attestationLists = new Map<CommitId, PublicationAttestation[]>();
+    for (const entry of entries) {
+      for (const record of entry.records) {
+        if (record.type === "transition-summary") {
+          if (!transitions.has(record.id)) transitions.set(record.id, { record, object: entry.object });
+        } else if (record.type === "publication-attestation") {
+          const list = attestationLists.get(record.commit) ?? [];
+          list.push(record);
+          attestationLists.set(record.commit, list);
+        }
+      }
+    }
+    const attestations = new Map<CommitId, readonly PublicationAttestation[]>(attestationLists);
     let init: EvidenceSnapshotView["init"] = null;
     let initError: string | null = null;
     for (const entry of entries) {
@@ -1304,6 +1577,8 @@ export class Reveries {
       tip,
       entries,
       byId,
+      transitions,
+      attestations,
       backlinks,
       init,
       initError,
@@ -1368,7 +1643,21 @@ export class Reveries {
         if (entry.objectType === "commit" && entry.records.some((record) => record.type === "reverie")) {
           throw new Error(`Commit ${entry.object} has a file reverie record`);
         }
-        if (entry.objectType !== "blob" && entry.objectType !== "commit" && entry.records.length > 0) {
+        if (entry.objectType === "commit"
+          && entry.records.some((record) => record.type === "transition-summary")) {
+          throw new Error(`Commit ${entry.object} has a tree transition record`);
+        }
+        if (entry.objectType === "tree"
+          && entry.records.some((record) => record.type !== "transition-summary")) {
+          throw new Error(`Tree ${entry.object} has a non-transition protocol record`);
+        }
+        for (const record of entry.records) {
+          if (record.type === "publication-attestation" && record.commit !== entry.object) {
+            throw new Error(`Attestation for ${record.commit} is attached to ${entry.object}`);
+          }
+        }
+        if (entry.objectType !== "blob" && entry.objectType !== "commit" && entry.objectType !== "tree"
+          && entry.records.length > 0) {
           throw new Error(`Protocol records cannot be attached to ${entry.objectType} object ${entry.object}`);
         }
         await this.validateSourcesWithLookup(entry.records, (id) => view.byId.has(id as ReverieId));
