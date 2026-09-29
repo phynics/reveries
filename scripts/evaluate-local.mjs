@@ -76,6 +76,12 @@ const criteria = [
   { category: "installer", criterion: "Skills update and removal paths", status: "covered", evidence: [evidence("scripts/installer-acceptance.mjs", "Reveries Skills installer acceptance passed.")] },
 ];
 
+// RVR-020: every criterion in this runner belongs to the LOCAL grade. The
+// TEAM, HOSTED, and AUTOMATIC DELIVERY grades have their own runners and
+// reports; no higher grade is inferred from this one.
+const GRADE = "LOCAL";
+for (const item of criteria) item.grade ??= GRADE;
+
 async function run(command, args) {
   const started = performance.now();
   return new Promise((resolvePromise) => {
@@ -213,8 +219,22 @@ try {
   const releaseReady = gatesOk
     && evidenceFailures.length === 0
     && criteria.every((item) => item.status === "covered" || item.status === "not-claimed");
+  const hostVersion = await run("git", ["--version"]);
   const result = {
+    grade: GRADE,
     generated_at: new Date().toISOString(),
+    host: {
+      name: "local-workstation",
+      version: `${process.version}, ${hostVersion.stdout.trim()}`,
+    },
+    merge_mode: "not-applicable (local grade; hosted merge modes belong to HOSTED)",
+    repository: "local worktree (no network access, no writes outside disposable directories)",
+    evidence_scale: {
+      criteria: criteria.length,
+      gates: gates.length,
+      unit: "acceptance criteria and executable gates",
+    },
+    verdict: releaseReady ? "verified" : "failed",
     environment: {
       network_used: false,
       external_writes: false,
@@ -239,7 +259,7 @@ try {
   if (json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } else {
-    process.stdout.write("Reveries local evaluation\n\n");
+    process.stdout.write("Reveries LOCAL evaluation (grade: LOCAL; TEAM, HOSTED, and AUTOMATIC DELIVERY have their own runners)\n\n");
     for (const gate of result.gates) {
       process.stdout.write(`${gate.ok ? "PASS" : "FAIL"} ${gate.command.join(" ")} (${gate.duration_ms} ms)\n`);
       if (!gate.ok && gate.diagnostic !== null) process.stdout.write(`  ${gate.diagnostic.replaceAll("\n", "\n  ")}\n`);

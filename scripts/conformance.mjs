@@ -8,6 +8,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cli = join(workspace, "packages", "reveries", "dist", "src", "main.js");
 const cliLibrary = join(workspace, "packages", "reveries", "dist", "src", "cli.js");
+// RVR-020: this compiled-artifact workflow is LOCAL-grade evidence. It emits
+// the shared grade report envelope with --json; TEAM, HOSTED, and AUTOMATIC
+// DELIVERY have their own runners and are never inferred from this report.
+const asJson = process.argv.includes("--json");
 
 async function run(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
@@ -164,7 +168,27 @@ try {
   assert.match(await git(remote, "rev-parse", "refs/notes/reveries"), /^[0-9a-f]{40}$/);
   assert.match(await readFile(join(repository, "AGENTS.md"), "utf8"), /reveries:begin/);
 
-  process.stdout.write("Reveries compiled-artifact conformance passed.\n");
+  if (asJson) {
+    const gitVersion = await git(repository, "--version");
+    process.stdout.write(`${JSON.stringify({
+      grade: "LOCAL",
+      generated_at: new Date().toISOString(),
+      host: { name: "local-git-fixture", version: `${process.version}, ${gitVersion}` },
+      merge_mode: "not-applicable (local grade; hosted merge modes belong to HOSTED)",
+      repository: "disposable repository with a bare remote (removed after the run)",
+      evidence_scale: { reveries: 1, summaries: 1, searched_records: 1, unit: "records in one disposable repository" },
+      criteria: [
+        { id: "compiled-init-adopt", name: "Compiled CLI initializes and adopts", status: "passed" },
+        { id: "compiled-record-continue-summarize-check", name: "Compiled CLI records, continues, summarizes, and checks", status: "passed" },
+        { id: "compiled-search-hook", name: "Compiled CLI searches and injects hook context", status: "passed" },
+        { id: "compiled-push", name: "Compiled CLI publishes branch and notes refs", status: "passed" },
+      ],
+      blockers: [],
+      verdict: "verified",
+    }, null, 2)}\n`);
+  } else {
+    process.stdout.write("Reveries compiled-artifact conformance passed.\n");
+  }
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
