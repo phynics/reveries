@@ -169,3 +169,28 @@ git push --no-verify origin "$branch:refs/heads/$branch"
 
 If the notes push fails, stop before pushing code. If the code push fails, leave the published notes
 in place and reconcile the remote state before retrying.
+
+## Repair local state in a fresh clone
+
+A clone carries no local integration. The notes merge strategy, the managed notes refspec, the
+helper runner record, and the `pre-push` and `post-commit` hook blocks all live in `.git/`, so
+`reveries doctor` reports the clone as `damaged` until they are restored. The initialization record
+travels with the notes ref, so synchronize notes first, then repair.
+
+```bash
+git fetch origin '+refs/notes/reveries*:refs/notes/reveries*'
+git notes --ref=refs/notes/reveries merge -s cat_sort_uniq \
+  refs/notes/remotes/origin/reveries
+reveries doctor --fix
+```
+
+`reveries doctor --fix` reads the committed `reveries-init` record for the approved publishing
+remotes. It converges only local Git configuration, the managed notes refspec, the helper runner,
+and Reveries-owned hook blocks. It does not write tracked files, does not append or rewrite notes,
+and does not create or change an adoption plan, so it is safe on a repository that was already
+adopted. It is idempotent, and `reveries doctor` without `--fix` only reports.
+
+Repair never overwrites a hook it cannot prove it owns. An unknown hook, an edited owned block, or
+a repository whose hooks are redirected by `core.hooksPath` is reported as partial enforcement or as
+an unsupported hook manager, and the command prints the exact invocation to add by hand. Follow that
+printed snippet instead of forcing the repair.

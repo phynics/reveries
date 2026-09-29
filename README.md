@@ -52,6 +52,30 @@ It creates the same tracked instruction blocks and adoption records. After the h
 run `reveries init` with the same answers to install local hooks without rewriting tracked setup.
 Git-only setup does not provide strict checking or atomic publication.
 
+### Repair a fresh clone
+
+A clone never receives local integration: the notes refspec, merge strategy, helper runner, and
+the `pre-push` and `post-commit` hooks all live in `.git/`. Fetch the committed evidence, then
+repair the local state:
+
+```bash
+git fetch origin '+refs/notes/reveries*:refs/notes/reveries*'
+reveries sync origin --pull
+reveries doctor --fix
+```
+
+`reveries doctor --fix` reads the committed `reveries-init` record for the approved publishing
+remotes and converges only local Git configuration, the managed notes refspec, the helper runner,
+and Reveries-owned hook blocks. It never writes tracked files, never appends or rewrites notes,
+and never creates or changes an adoption plan, so it is safe to run on a clone of a repository
+that was already adopted. Running it twice is a no-op.
+
+Repair preserves hooks it does not own. An unknown hook or an edited owned block is left intact
+and reported as partial enforcement, and a repository whose hooks are redirected by
+`core.hooksPath` is reported as an unsupported hook manager instead of being written to
+elsewhere. Both cases print the exact command to add by hand. `reveries doctor` without `--fix`
+only reports.
+
 Build and run the helper from this repository:
 
 ```bash

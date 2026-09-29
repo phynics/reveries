@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { promisify } from "node:util";
 
 import { GitRepository } from "./git.ts";
+import { parseNote, type ReveriesInit } from "./protocol.ts";
 
 const BEGIN = "<!-- reveries:begin -->";
 const END = "<!-- reveries:end -->";
@@ -1075,6 +1076,173 @@ async function removeManagedPushConfig(repository: GitRepository, remote: string
   }
 }
 
+/**
+ * Converge only the local Git state that a clone never receives: notes merge
+ * strategy, managed notes refspecs, the helper runner record, and the owned hook
+ * blocks. Tracked files, notes and adoption plans are never part of this step.
+ */
+interface LocalIntegrationTarget {
+  readonly publishingRemotes: readonly string[];
+  /** `undefined` leaves an existing directive email untouched. */
+  readonly directiveEmail: string | null | undefined;
+  readonly helper: HelperInvocation | undefined;
+  readonly mode: "initialize" | "repair";
+  /** Remotes this run cannot configure, reported instead of guessed. */
+  readonly unusableRemotes: readonly string[];
+}
+
+interface LocalIntegrationResult {
+  readonly hookSnippets: readonly string[];
+  readonly unsupportedManagers: readonly string[];
+  readonly changedConfig: readonly string[];
+  readonly diagnostics: readonly string[];
+}
+
+const LOCAL_CONFIG_KEY_PREFIXES = ["reveries.", "notes.reveries."];
+
+async function localConfigSnapshot(
+  repository: GitRepository,
+  remotes: readonly string[],
+): Promise<readonly string[]> {
+  const result = await repository.run(["config", "--local", "--list"], { allowExitCodes: [0, 1] });
+  const ownedKeys = new Set(remotes.flatMap((remote) => [`remote.${remote}.fetch`, `remote.${remote}.push`]));
+  return result.stdout
+    .trimEnd()
+    .split("\n")
+    .filter(Boolean)
+    .filter((line) => {
+      const separator = line.indexOf("=");
+      if (separator < 0) return false;
+      const key = line.slice(0, separator);
+      return LOCAL_CONFIG_KEY_PREFIXES.some((prefix) => key.startsWith(prefix)) || ownedKeys.has(key);
+    })
+    .sort();
+}
+
+async function configuredHooksPath(repository: GitRepository): Promise<string | null> {
+  const result = await repository.run(["config", "--get", "core.hooksPath"], { allowExitCodes: [0, 1] });
+  if (result.exitCode !== 0) return null;
+  const value = result.stdout.trim();
+  return value.length === 0 ? null : value;
+}
+
+async function convergeLocalIntegration(
+  repository: GitRepository,
+  target: LocalIntegrationTarget,
+): Promise<LocalIntegrationResult> {
+  const diagnostics: string[] = [];
+  const remotes = target.publishingRemotes.filter((remote) => !target.unusableRemotes.includes(remote));
+  const before = await localConfigSnapshot(repository, target.publishingRemotes);
+
+  if (target.mode === "initialize") {
+    const previousRemotes = await configValues(repository, "reveries.publishingRemote");
+    for (const remote of new Set([...previousRemotes, ...(await configuredRemoteNames(repository))])) {
+      if (!target.publishingRemotes.includes(remote)) await removeManagedRemoteConfig(repository, remote);
+    }
+    await repository.run(["config", "--unset-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1, 5] });
+  }
+  const configured = await configValues(repository, "reveries.publishingRemote");
+  for (const remote of remotes) {
+    if (configured.includes(remote)) continue;
+    await repository.run(["config", "--add", "reveries.publishingRemote", remote]);
+  }
+  await repository.run(["config", "reveries.localOnly", remotes.length === 0 ? "true" : "false"]);
+
+  const previousMerge = await repository.run(
+    ["config", "--get", "notes.reveries.mergeStrategy"],
+    { allowExitCodes: [0, 1] },
+  );
+  if (previousMerge.stdout.trim() !== "cat_sort_uniq") {
+    await repository.run(["config", "reveries.managedMergeStrategy", "true"]);
+    if (previousMerge.exitCode === 0) {
+      await repository.run(["config", "reveries.previousMergeStrategy", previousMerge.stdout.trim()]);
+    }
+    await repository.run(["config", "notes.reveries.mergeStrategy", "cat_sort_uniq"]);
+  } else if ((await repository.run(
+    ["config", "--get", "reveries.managedMergeStrategy"],
+    { allowExitCodes: [0, 1] },
+  )).exitCode !== 0) {
+    await repository.run(["config", "reveries.managedMergeStrategy", "false"]);
+  }
+  if (target.directiveEmail !== undefined) {
+    if (target.directiveEmail === null) {
+      await repository.run(["config", "--unset-all", "reveries.directiveEmail"], { allowExitCodes: [0, 1, 5] });
+    } else {
+      await repository.run(["config", "reveries.directiveEmail", target.directiveEmail]);
+    }
+  }
+  for (const remote of remotes) {
+    if (await managedFlag(repository, `reveries.managed-${remote}.fetch`)) {
+      await unsetConfigValue(
+        repository,
+        `remote.${remote}.fetch`,
+        `+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`,
+      );
+    }
+    await removeManagedPushConfig(repository, remote);
+    const fetchAdded = await ensureConfigValue(
+      repository,
+      `remote.${remote}.fetch`,
+      `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
+    );
+    await rememberManagedValue(repository, `reveries.managed-${remote}.fetch`, fetchAdded);
+  }
+
+  const hookSnippets: string[] = [];
+  const available = await helperInvocationAvailable(target.helper);
+  await repository.run(["config", "--unset-all", "reveries.helperCommand"], { allowExitCodes: [0, 1, 5] });
+  await repository.run(["config", "--unset-all", "reveries.helperArg"], { allowExitCodes: [0, 1, 5] });
+  await repository.run(["config", "--unset-all", "reveries.helperVerification"], { allowExitCodes: [0, 1, 5] });
+  await repository.run(["config", "--unset-all", "reveries.helperFingerprint"], { allowExitCodes: [0, 1, 5] });
+  if (available && target.helper !== undefined) {
+    await repository.run(["config", "reveries.helperCommand", target.helper.command]);
+    for (const argument of target.helper.args) await repository.run(["config", "--add", "reveries.helperArg", argument]);
+    await repository.run(["config", "reveries.helperVerification", target.helper.verification ?? "probe"]);
+    const fingerprint = await helperInvocationFingerprint(target.helper);
+    if (fingerprint !== null) await repository.run(["config", "reveries.helperFingerprint", fingerprint]);
+  }
+  const hooks = remotes.length === 0
+    ? ["post-commit"] as const
+    : ["pre-push", "post-commit"] as const;
+  const hooksPath = await configuredHooksPath(repository);
+  if (hooksPath !== null) {
+    // Hooks are redirected, so the owned block cannot be composed safely here.
+    diagnostics.push(
+      `core.hooksPath redirects hooks to ${hooksPath}; Reveries cannot install owned hook blocks there`,
+    );
+    for (const hook of hooks) {
+      const helper = target.helper ?? { command: "reveries", args: [] };
+      hookSnippets.push(hookInvocation(helper, hook));
+    }
+  } else {
+    if (remotes.length === 0) await removeOwnedHook(repository, "pre-push");
+    for (const hook of hooks) {
+      if (!available || target.helper === undefined) {
+        const helper = target.helper ?? { command: "reveries", args: [] };
+        hookSnippets.push(hookInvocation(helper, hook));
+      } else {
+        const result = await installHook(repository, hook, target.helper);
+        if (result.snippet !== null) hookSnippets.push(result.snippet);
+      }
+    }
+  }
+
+  const after = await localConfigSnapshot(repository, target.publishingRemotes);
+  const changed = after.filter((line) => !before.includes(line))
+    .map((line) => line.slice(0, Math.max(0, line.indexOf("="))));
+  return {
+    hookSnippets,
+    unsupportedManagers: hooksPath === null ? [] : [hooksPath],
+    changedConfig: [...new Set(changed)].sort(),
+    diagnostics,
+  };
+}
+
+async function configuredRemoteNames(repository: GitRepository): Promise<readonly string[]> {
+  const result = await repository.run(["remote"]);
+  return result.stdout.trimEnd().split("\n").filter((remote) => remote.length > 0);
+}
+
 async function withSetupLock<T>(repository: GitRepository, operation: () => Promise<T>): Promise<T> {
   const commonDirectory = await repository.commonDirectory();
   const parent = join(commonDirectory, "reveries");
@@ -1140,16 +1308,6 @@ async function initializeUnlocked(
   } else if (options.skillSetup.kind === "submodule") {
     await preflightSubmodule(repository, options.skillSetup);
   }
-  const previousRemotes = await configValues(repository, "reveries.publishingRemote");
-  for (const remote of new Set([...previousRemotes, ...existingRemotes])) {
-    if (!options.publishingRemotes.includes(remote)) await removeManagedRemoteConfig(repository, remote);
-  }
-  await repository.run(["config", "--unset-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1, 5] });
-  for (const remote of options.publishingRemotes) {
-    await repository.run(["config", "--add", "reveries.publishingRemote", remote]);
-  }
-  await repository.run(["config", "reveries.localOnly", options.publishingRemotes.length === 0 ? "true" : "false"]);
-
   const changedFiles: string[] = [];
   const adoptionFiles = new Set<string>(["AGENTS.md"]);
   const agentsPath = join(repository.root, "AGENTS.md");
@@ -1248,71 +1406,14 @@ async function initializeUnlocked(
     }
   }
 
-  const previousMerge = await repository.run(
-    ["config", "--get", "notes.reveries.mergeStrategy"],
-    { allowExitCodes: [0, 1] },
-  );
-  if (previousMerge.stdout.trim() !== "cat_sort_uniq") {
-    await repository.run(["config", "reveries.managedMergeStrategy", "true"]);
-    if (previousMerge.exitCode === 0) {
-      await repository.run(["config", "reveries.previousMergeStrategy", previousMerge.stdout.trim()]);
-    }
-    await repository.run(["config", "notes.reveries.mergeStrategy", "cat_sort_uniq"]);
-  } else if ((await repository.run(
-    ["config", "--get", "reveries.managedMergeStrategy"],
-    { allowExitCodes: [0, 1] },
-  )).exitCode !== 0) {
-    await repository.run(["config", "reveries.managedMergeStrategy", "false"]);
-  }
-  if (options.directiveEmail === null) {
-    await repository.run(["config", "--unset-all", "reveries.directiveEmail"], { allowExitCodes: [0, 1, 5] });
-  } else {
-    await repository.run(["config", "reveries.directiveEmail", options.directiveEmail]);
-  }
-  for (const remote of options.publishingRemotes) {
-    const exactFetch = `+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`;
-    if (await managedFlag(repository, `reveries.managed-${remote}.fetch`)) {
-      await unsetConfigValue(
-        repository,
-        `remote.${remote}.fetch`,
-        exactFetch,
-      );
-    }
-    await removeManagedPushConfig(repository, remote);
-    const fetchAdded = await ensureConfigValue(
-      repository,
-      `remote.${remote}.fetch`,
-      `+refs/notes/reveries*:refs/notes/remotes/${remote}/reveries*`,
-    );
-    await rememberManagedValue(repository, `reveries.managed-${remote}.fetch`, fetchAdded);
-  }
-
-  const hookSnippets: string[] = [];
-  const available = await helperInvocationAvailable(options.helper);
-  await repository.run(["config", "--unset-all", "reveries.helperCommand"], { allowExitCodes: [0, 1, 5] });
-  await repository.run(["config", "--unset-all", "reveries.helperArg"], { allowExitCodes: [0, 1, 5] });
-  await repository.run(["config", "--unset-all", "reveries.helperVerification"], { allowExitCodes: [0, 1, 5] });
-  await repository.run(["config", "--unset-all", "reveries.helperFingerprint"], { allowExitCodes: [0, 1, 5] });
-  if (available && options.helper !== undefined) {
-    await repository.run(["config", "reveries.helperCommand", options.helper.command]);
-    for (const argument of options.helper.args) await repository.run(["config", "--add", "reveries.helperArg", argument]);
-    await repository.run(["config", "reveries.helperVerification", options.helper.verification ?? "probe"]);
-    const fingerprint = await helperInvocationFingerprint(options.helper);
-    if (fingerprint !== null) await repository.run(["config", "reveries.helperFingerprint", fingerprint]);
-  }
-  const hooks = options.publishingRemotes.length === 0
-    ? ["post-commit"] as const
-    : ["pre-push", "post-commit"] as const;
-  if (options.publishingRemotes.length === 0) await removeOwnedHook(repository, "pre-push");
-  for (const hook of hooks) {
-    if (!available || options.helper === undefined) {
-      const helper = options.helper ?? { command: "reveries", args: [] };
-      hookSnippets.push(hookInvocation(helper, hook));
-    } else {
-      const result = await installHook(repository, hook, options.helper);
-      if (result.snippet !== null) hookSnippets.push(result.snippet);
-    }
-  }
+  const local = await convergeLocalIntegration(repository, {
+    publishingRemotes: options.publishingRemotes,
+    directiveEmail: options.directiveEmail,
+    helper: options.helper,
+    mode: "initialize",
+    unusableRemotes: [],
+  });
+  const { hookSnippets } = local;
 
   const templatePaths = await writeAdoptionTemplates(repository, options);
   const completeFiles = [...adoptionFiles];
@@ -1404,4 +1505,107 @@ async function removeUnlocked(repository: GitRepository, options: RemovalOptions
     evidencePreserved: true,
     preservedSkillPaths: skillRemoval.preserved,
   };
+}
+
+export interface RepairOptions {
+  readonly helper?: HelperInvocation;
+}
+
+export type RepairState = "repaired" | "partial" | "unavailable";
+
+export interface RepairResult {
+  readonly state: RepairState;
+  readonly publishingRemotes: readonly string[];
+  readonly changedConfig: readonly string[];
+  readonly hookSnippets: readonly string[];
+  readonly diagnostics: readonly string[];
+  readonly unsupportedManagers: readonly string[];
+}
+
+/**
+ * Read the single committed initialization record. A clone receives this record
+ * with the notes ref, so it is the authority for repair; local configuration is
+ * never used to guess it.
+ */
+async function committedInitialization(repository: GitRepository): Promise<ReveriesInit | null> {
+  let found: ReveriesInit | null = null;
+  for (const entry of await repository.listNotes()) {
+    const note = await repository.readNote(entry.object);
+    if (note === null) continue;
+    for (const record of parseNote(note, "tolerant", { verifyIds: false }).records) {
+      if (record.type !== "reveries-init") continue;
+      if (found !== null) throw new Error("More than one Reveries initialization boundary exists");
+      if (!(await repository.objectExists("commit", entry.object))) {
+        throw new Error("The Reveries initialization record is not attached to a commit");
+      }
+      found = record;
+    }
+  }
+  return found;
+}
+
+export async function repairLocalIntegration(cwd: string, options: RepairOptions = {}): Promise<RepairResult> {
+  const repository = await GitRepository.open(cwd);
+  return withSetupLock(repository, async () => {
+    const diagnostics: string[] = [];
+    let initialization: ReveriesInit | null = null;
+    try {
+      initialization = await committedInitialization(repository);
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    if (initialization === null) {
+      diagnostics.push(
+        "No committed Reveries initialization record is available locally; "
+        + "fetch the notes ref (`git fetch origin '+refs/notes/reveries*:refs/notes/reveries*'`) "
+        + "and run `reveries sync origin --pull` before repairing",
+      );
+      return {
+        state: "unavailable",
+        publishingRemotes: [],
+        changedConfig: [],
+        hookSnippets: [],
+        diagnostics,
+        unsupportedManagers: [],
+      };
+    }
+
+    const existing = await configuredRemoteNames(repository);
+    const unusableRemotes: string[] = [];
+    for (const remote of initialization.publishing_remotes) {
+      validateRemote(remote);
+      if (!existing.includes(remote)) {
+        diagnostics.push(`Publishing remote ${remote} does not exist in this clone; add it before repairing`);
+        unusableRemotes.push(remote);
+        continue;
+      }
+      const exactFetch = `+refs/notes/reveries:refs/notes/remotes/${remote}/reveries`;
+      const configured = await configValues(repository, `remote.${remote}.fetch`);
+      if (configured.includes(exactFetch) && !await managedFlag(repository, `reveries.managed-${remote}.fetch`)) {
+        diagnostics.push(
+          `Publishing remote ${remote} has an unmanaged exact Reveries fetch refspec; remove or replace it explicitly`,
+        );
+        unusableRemotes.push(remote);
+      }
+    }
+
+    const local = await convergeLocalIntegration(repository, {
+      publishingRemotes: initialization.publishing_remotes,
+      directiveEmail: undefined,
+      helper: options.helper,
+      mode: "repair",
+      unusableRemotes,
+    });
+    const allDiagnostics = [...diagnostics, ...local.diagnostics];
+    return {
+      state: allDiagnostics.length === 0 && local.hookSnippets.length === 0 ? "repaired" : "partial",
+      publishingRemotes: initialization.publishing_remotes.filter(
+        (remote) => !unusableRemotes.includes(remote),
+      ),
+      changedConfig: local.changedConfig,
+      hookSnippets: local.hookSnippets,
+      diagnostics: allDiagnostics,
+      unsupportedManagers: local.unsupportedManagers,
+    };
+  });
 }

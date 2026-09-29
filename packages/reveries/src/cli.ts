@@ -10,6 +10,7 @@ import {
   commitAdoption,
   initializeRepository,
   removeIntegration,
+  repairLocalIntegration,
   type HelperInvocation,
   type SkillSetup,
   type SupportedHost,
@@ -78,7 +79,7 @@ Commands:
   help       Show general or command-specific help
   init       Prepare project instructions, Git configuration, and hooks
   adopt      Verify the prepared files and create the adoption commit
-  doctor     Diagnose the local installation and notes state
+  doctor     Diagnose the local installation and notes state (--fix repairs local state)
   show       Show notes for a path, blob, or commit
   record     Create, continue, or supersede a blob reverie
   summarize  Attach or replace a commit summary or initialization record
@@ -121,11 +122,15 @@ Verify the prepared adoption plan and create its adoption commit.
 Examples:
   reveries adopt --plan .reveries/adoption.json --message "Adopt Reveries"
 `,
-  doctor: `Usage: reveries doctor [--json]
+  doctor: `Usage: reveries doctor [--fix] [--json]
 
-Diagnose repository setup, enforcement, and notes state.
+Diagnose repository setup, enforcement, and notes state. --fix first repairs local
+Git configuration, managed notes refspecs, the helper runner, and Reveries-owned
+hook blocks from the committed initialization record, then reports the result.
+--fix never changes tracked files, notes, or the adoption plan.
 Examples:
   reveries doctor
+  reveries doctor --fix
   reveries doctor --json
 `,
   show: `Usage: reveries show <path|blob|commit> [--staged] [--json]
@@ -864,6 +869,13 @@ function humanOutput(
         `Protection: helper ${stringField(protection, "helper")}, local ${stringField(protection, "local")}, receive-side ${stringField(protection, "receiveSide")}.`,
       );
     }
+    const repair = asRecord(value?.repair);
+    if (repair !== null) {
+      lines.push(`Repair: ${stringField(repair, "state")}.`);
+      for (const snippet of stringList(repair.hookSnippets)) {
+        lines.push(`Add this to the ${/(\S+)\s+"\$@"$/.exec(snippet)?.[1] ?? "matching"} hook: ${snippet}`);
+      }
+    }
     for (const notice of stringList(value?.notices)) lines.push(`Notice: ${notice}`);
     return `${lines.join("\n")}\n`;
   }
@@ -1338,10 +1350,14 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       return result.ok ? 0 : 1;
     }
     if (command === "doctor") {
-      const parsed = parseArguments(argv.slice(1), [], ["--json"]);
+      const parsed = parseArguments(argv.slice(1), [], ["--json", "--fix"]);
+      const repair = parsed.flags.has("--fix")
+        ? await repairLocalIntegration(io.cwd, io.helper === undefined ? {} : { helper: io.helper })
+        : null;
       const result = await reveries.doctor();
-      emit(io, json, command, result, result.diagnostics);
-      return result.ok ? 0 : 1;
+      const diagnostics = [...result.diagnostics, ...(repair?.diagnostics ?? [])];
+      emit(io, json, command, repair === null ? result : { ...result, repair }, diagnostics);
+      return result.ok && repair?.state !== "unavailable" ? 0 : 1;
     }
     if (command === "pre-push") {
       const remote = argv[1];
