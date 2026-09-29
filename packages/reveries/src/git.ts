@@ -99,11 +99,63 @@ export class GitCommandError extends Error {
   }
 }
 
+/**
+ * Never thrown since the lock-free publication change (RVR-016). The
+ * `write.lock` directory is no longer consulted by any write path, so a
+ * stale lock can neither block nor serialize writers. Kept exported for
+ * backward compatibility with external importers catching it.
+ *
+ * @deprecated Publication is guarded by expected-old-OID compare-and-swap;
+ * a stale lock directory is reported by `doctor()` as a notice, never an error.
+ */
 export class NotesLockError extends Error {
   constructor(readonly lockPath: string) {
     super(`Reveries notes are locked at ${lockPath}`);
     this.name = "NotesLockError";
   }
+}
+
+/**
+ * Thrown when a notes mutation exhausts its bounded compare-and-swap
+ * retries without publishing. Every attempt preserved the records it
+ * raced against (the winner's tip is always the replay base), so this
+ * failure is explicit contention, never silent record loss.
+ */
+export class NotesContentionError extends Error {
+  constructor(
+    readonly ref: string,
+    readonly attempts: number,
+    readonly expectedTip: ObjectId | null,
+    readonly actualTip: ObjectId | null,
+  ) {
+    super(`The Reveries notes ref ${ref} changed concurrently during ${attempts} write attempts`);
+    this.name = "NotesContentionError";
+  }
+}
+
+/** Private namespace for per-attempt notes-transaction refs. Disposable. */
+export const NOTES_TXN_REF_PREFIX = "refs/notes/reveries-txn/";
+
+export interface TemporaryNotesRef {
+  readonly ref: string;
+  /** Committer-date of the temp ref tip, or null when Git reports none. */
+  readonly createdAtUnix: number | null;
+}
+
+export interface WithNotesWriteOptions {
+  /** Total CAS attempts before bounded-contention failure. Defaults to 15. */
+  readonly attempts?: number;
+  /** Base backoff between attempts in milliseconds. Defaults to 10. */
+  readonly baseDelayMs?: number;
+  /** Backoff cap in milliseconds. Defaults to 200. */
+  readonly maxDelayMs?: number;
+}
+
+/** Exponential backoff with jitter, capped; never holds a lock (there is none). */
+async function boundedBackoff(attempt: number, baseDelayMs: number, maxDelayMs: number): Promise<void> {
+  const exponential = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, attempt - 1));
+  const delay = Math.floor(exponential * (0.5 + Math.random() * 0.5));
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
 export class AtomicPushUnavailableError extends Error {
@@ -260,6 +312,14 @@ export class GitRepository {
     return this.commonDir;
   }
 
+  /**
+   * Diagnostic path of the retired `write.lock` directory. No write path
+   * consults it; `doctor()` reports leftovers as a notice. Kept so existing
+   * tooling and tests can locate the path a killed pre-RVR-016 writer left.
+   *
+   * @deprecated The lock is not a correctness dependency. Do not `mkdir` or
+   * throw on this path in any write path.
+   */
   writeLockPath(): string {
     return join(this.commonDir, "reveries", "write.lock");
   }
@@ -737,68 +797,73 @@ export class GitRepository {
   }): Promise<CommitId> {
     if (input.message.trim().length === 0) throw new Error("Commit message must be nonempty");
 
-    const commit = await this.withNotesLock(async () => {
-      const branchRef = await this.currentBranchRef();
-      const branchTip = await this.refTip(branchRef);
-      const notesTip = await this.notesTip();
-      const mergeHead = await this.readGitStateFile("MERGE_HEAD");
-      const mergeState = mergeHead.contents === null
-        ? []
-        : [mergeHead, await this.readGitStateFile("MERGE_MSG"), await this.readGitStateFile("MERGE_MODE")];
-      const temporaryRef = `refs/notes/reveries-txn/${process.pid}-${randomUUID()}`;
-      const messagePath = join(dirname(this.writeLockPath()), `commit-message-${randomUUID()}.txt`);
+    // Lock-free: the ref-transaction below is the publication guard, so a
+    // killed process leaves only a disposable temp ref, an orphan commit
+    // object, and a message file — never a repository-wide blockage.
+    const branchRef = await this.currentBranchRef();
+    const branchTip = await this.refTip(branchRef);
+    const notesTip = await this.notesTip();
+    const mergeHead = await this.readGitStateFile("MERGE_HEAD");
+    const mergeState = mergeHead.contents === null
+      ? []
+      : [mergeHead, await this.readGitStateFile("MERGE_MSG"), await this.readGitStateFile("MERGE_MODE")];
+    const temporaryRef = `${NOTES_TXN_REF_PREFIX}${process.pid}-${randomUUID()}`;
+    // The message file lives beside the retired lock directory, never inside
+    // it, so a stale lock dir is not a dependency of this path.
+    const messageDir = join(this.commonDir, "reveries", "tmp");
+    const messagePath = join(messageDir, `commit-message-${process.pid}-${randomUUID()}.txt`);
+    let commit: CommitId;
+    try {
+      if (notesTip !== null) await this.run(["update-ref", temporaryRef, notesTip]);
+      await mkdir(messageDir, { recursive: true });
+      await writeFile(messagePath, `${input.message.replace(/\n*$/, "")}\n`, { encoding: "utf8", flag: "wx" });
+      await this.run(["hook", "run", "--ignore-missing", "pre-commit"]);
+      await this.run([
+        "hook",
+        "run",
+        "--ignore-missing",
+        "prepare-commit-msg",
+        "--",
+        messagePath,
+        "message",
+      ]);
+      await this.run(["hook", "run", "--ignore-missing", "commit-msg", "--", messagePath]);
+      const tree = parseObjectId((await this.run(["write-tree"])).stdout, "git write-tree");
+      const parents = this.commitParents(branchTip, mergeHead.contents);
+      const message = await readFile(messagePath, "utf8");
+      if (message.trim().length === 0) throw new Error("Commit message hook produced an empty message");
+      const signing = await this.run(["config", "--bool", "--get", "commit.gpgSign"], {
+        allowExitCodes: [0, 1],
+      });
+      const argumentsList = ["commit-tree", tree];
+      for (const parent of parents) argumentsList.push("-p", parent);
+      if (signing.stdout.trim() === "true") argumentsList.push("-S");
+      argumentsList.push("-F", "-");
+      const newCommit = commitId(parseObjectId(
+        (await this.run(argumentsList, { input: message })).stdout,
+        "git commit-tree",
+      ));
 
-      try {
-        if (notesTip !== null) await this.run(["update-ref", temporaryRef, notesTip]);
-        await writeFile(messagePath, `${input.message.replace(/\n*$/, "")}\n`, { encoding: "utf8", flag: "wx" });
-        await this.run(["hook", "run", "--ignore-missing", "pre-commit"]);
-        await this.run([
-          "hook",
-          "run",
-          "--ignore-missing",
-          "prepare-commit-msg",
-          "--",
-          messagePath,
-          "message",
-        ]);
-        await this.run(["hook", "run", "--ignore-missing", "commit-msg", "--", messagePath]);
-        const tree = parseObjectId((await this.run(["write-tree"])).stdout, "git write-tree");
-        const parents = this.commitParents(branchTip, mergeHead.contents);
-        const message = await readFile(messagePath, "utf8");
-        if (message.trim().length === 0) throw new Error("Commit message hook produced an empty message");
-        const signing = await this.run(["config", "--bool", "--get", "commit.gpgSign"], {
-          allowExitCodes: [0, 1],
-        });
-        const argumentsList = ["commit-tree", tree];
-        for (const parent of parents) argumentsList.push("-p", parent);
-        if (signing.stdout.trim() === "true") argumentsList.push("-S");
-        argumentsList.push("-F", "-");
-        const commit = commitId(parseObjectId(
-          (await this.run(argumentsList, { input: message })).stdout,
-          "git commit-tree",
-        ));
-
-        const notes = new TemporaryNotesTransaction(this, temporaryRef);
-        await notes.append(commit, input.note);
-        const newNotesTip = await this.notesTip(temporaryRef);
-        if (newNotesTip === null) throw new Error("Prepared Reveries notes transaction has no tip");
-        await input.validateNotesRef(temporaryRef);
-        const currentHead = await this.run(["symbolic-ref", "--quiet", "HEAD"], { allowExitCodes: [0, 1] });
-        if (currentHead.exitCode !== 0 || currentHead.stdout.trim() !== branchRef) {
-          throw new Error("The current branch changed concurrently during commit preparation");
-        }
-
-        await this.updateRefsAtomically([
-          { ref: branchRef, next: commit, expected: branchTip },
-          { ref: NOTES_REF, next: newNotesTip, expected: notesTip },
-        ]);
-        await this.clearMergeState(mergeState);
-        return commit;
-      } finally {
-        await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
-        await rm(messagePath, { force: true });
+      const notes = new TemporaryNotesTransaction(this, temporaryRef);
+      await notes.append(newCommit, input.note);
+      const newNotesTip = await this.notesTip(temporaryRef);
+      if (newNotesTip === null) throw new Error("Prepared Reveries notes transaction has no tip");
+      await input.validateNotesRef(temporaryRef);
+      const currentHead = await this.run(["symbolic-ref", "--quiet", "HEAD"], { allowExitCodes: [0, 1] });
+      if (currentHead.exitCode !== 0 || currentHead.stdout.trim() !== branchRef) {
+        throw new Error("The current branch changed concurrently during commit preparation");
       }
-    });
+
+      await this.updateRefsAtomically([
+        { ref: branchRef, next: newCommit, expected: branchTip },
+        { ref: NOTES_REF, next: newNotesTip, expected: notesTip },
+      ]);
+      await this.clearMergeState(mergeState);
+      commit = newCommit;
+    } finally {
+      await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
+      await rm(messagePath, { force: true });
+    }
     try {
       await this.run(["hook", "run", "--ignore-missing", "post-commit"]);
     } catch {
@@ -807,73 +872,92 @@ export class GitRepository {
     return commit;
   }
 
+  /**
+   * Lock-free notes mutation. Each attempt reads the canonical tip, builds
+   * and validates the mutation on a unique private ref, then publishes with
+   * an expected-old-OID compare-and-swap. On contention the pure `operation`
+   * replays against the new tip after bounded backoff; when retries exhaust,
+   * a `NotesContentionError` reports explicit bounded contention — never
+   * silent loss. A killed process leaves only a disposable temp ref and
+   * orphan objects, never a write blockage.
+   *
+   * Replay contract: `operation` must be pure — every read through
+   * `notes.read`, no consumed iterators or single-use state captured outside
+   * the closure — because it may run more than once per call.
+   */
   async withNotesWrite<T>(
     operation: (notes: NotesTransaction) => Promise<T>,
     validate: NotesRefValidator = async () => undefined,
     onValidationFailure?: NotesValidationFailure,
+    options: WithNotesWriteOptions = {},
   ): Promise<T> {
-    return this.withNotesLock(async () => {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const expectedTip = await this.notesTip();
-        const temporaryRef = `refs/notes/reveries-txn/${process.pid}-${randomUUID()}`;
-        try {
-          if (expectedTip !== null) {
-            await this.run(["update-ref", temporaryRef, expectedTip]);
-          }
-          const transaction = new TemporaryNotesTransaction(this, temporaryRef);
-          const value = await operation(transaction);
-          const newTip = await this.notesTip(temporaryRef);
-          if (newTip === null) {
-            return value;
-          }
-          try {
-            await validate(temporaryRef);
-          } catch (error: unknown) {
-            if (onValidationFailure !== undefined) {
-              await onValidationFailure(temporaryRef, newTip, error);
-            }
-            throw error;
-          }
-          const format = await this.objectFormat();
-          const absent = "0".repeat(format === "sha1" ? 40 : 64);
-          const update = await this.run(["update-ref", NOTES_REF, newTip, expectedTip ?? absent], {
-            allowExitCodes: [0, 1, 128],
-          });
-          if (update.exitCode === 0) {
-            return value;
-          }
-          if (attempt === 1) {
-            throw new Error("The Reveries notes ref changed concurrently during two write attempts");
-          }
-        } finally {
-          await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
+    const maxAttempts = Math.max(1, Math.floor(options.attempts ?? 15));
+    const baseDelayMs = Math.max(0, options.baseDelayMs ?? 10);
+    const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 200);
+    let expectedTip: ObjectId | null = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      expectedTip = await this.notesTip();
+      const temporaryRef = `${NOTES_TXN_REF_PREFIX}${process.pid}-${randomUUID()}-a${attempt}`;
+      try {
+        if (expectedTip !== null) {
+          await this.run(["update-ref", temporaryRef, expectedTip]);
         }
+        const transaction = new TemporaryNotesTransaction(this, temporaryRef);
+        const value = await operation(transaction);
+        const newTip = await this.notesTip(temporaryRef);
+        if (newTip === null) {
+          return value;
+        }
+        try {
+          await validate(temporaryRef);
+        } catch (error: unknown) {
+          if (onValidationFailure !== undefined) {
+            await onValidationFailure(temporaryRef, newTip, error);
+          }
+          throw error;
+        }
+        const format = await this.objectFormat();
+        const absent = "0".repeat(format === "sha1" ? 40 : 64);
+        const update = await this.run(["update-ref", NOTES_REF, newTip, expectedTip ?? absent], {
+          allowExitCodes: [0, 1, 128],
+        });
+        if (update.exitCode === 0) {
+          return value;
+        }
+      } finally {
+        await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
       }
-      throw new Error("Unreachable notes transaction state");
-    });
+      if (attempt < maxAttempts) {
+        await boundedBackoff(attempt, baseDelayMs, maxDelayMs);
+      }
+    }
+    throw new NotesContentionError(NOTES_REF, maxAttempts, expectedTip, await this.notesTip());
   }
 
-  private async withNotesLock<T>(operation: () => Promise<T>): Promise<T> {
-    const lockPath = this.writeLockPath();
-    await mkdir(dirname(lockPath), { recursive: true });
-    try {
-      await mkdir(lockPath);
-    } catch (error: unknown) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        throw new NotesLockError(lockPath);
-      }
-      throw error;
+  /** Every live transaction ref under the disposable `reveries-txn` namespace. */
+  async listTemporaryNotesRefs(): Promise<readonly TemporaryNotesRef[]> {
+    const result = await this.run(
+      ["for-each-ref", "--format=%(refname)%00%(creatordate:unix)", NOTES_TXN_REF_PREFIX],
+    );
+    const refs: TemporaryNotesRef[] = [];
+    for (const line of result.stdout.split("\n")) {
+      if (line.length === 0) continue;
+      const separator = line.indexOf("\0");
+      const ref = separator < 0 ? line : line.slice(0, separator);
+      const rawDate = separator < 0 ? "" : line.slice(separator + 1).trim();
+      const createdAtUnix = /^\d+$/.test(rawDate) ? Number(rawDate) : null;
+      if (!ref.startsWith(NOTES_TXN_REF_PREFIX)) continue;
+      refs.push({ ref, createdAtUnix });
     }
-    try {
-      await writeFile(
-        join(lockPath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`,
-        { encoding: "utf8", flag: "wx" },
-      );
-      return await operation();
-    } finally {
-      await rm(lockPath, { recursive: true, force: true });
+    return refs.sort((left, right) => left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0);
+  }
+
+  /** Delete one disposable transaction ref; never touches the canonical ref. */
+  async deleteTemporaryNotesRef(ref: string): Promise<void> {
+    if (!ref.startsWith(NOTES_TXN_REF_PREFIX) || ref.includes("\0") || ref.includes(" ")) {
+      throw new Error(`Not a disposable Reveries transaction ref: ${ref}`);
     }
+    await this.run(["update-ref", "-d", ref], { allowExitCodes: [0, 1, 128] });
   }
 
   private async currentBranchRef(): Promise<string> {

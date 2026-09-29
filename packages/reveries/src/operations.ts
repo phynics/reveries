@@ -40,6 +40,7 @@ import {
   type NoteListEntry,
   type NotesTransaction,
   type RetentionSubject,
+  type WithNotesWriteOptions,
 } from "./git.ts";
 import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
 
@@ -469,8 +470,8 @@ export class Reveries {
     /**
      * Explicit network operations (fetch, push, ls-remote) and only those
      * use the live handle. RVR-016 note: the notes-mutation retry/replay
-     * loop must stay on `repository` (suppressed) and keep using
-     * `withNotesWrite` as its publication primitive.
+     * loop stays on `repository` (suppressed) and publishes through the
+     * lock-free `withNotesWrite` compare-and-swap via `mutateNotes`.
      */
     private readonly liveRepository: GitRepository,
     private readonly proposedNotesTip?: ObjectId,
@@ -701,6 +702,30 @@ export class Reveries {
     };
   }
 
+  /**
+   * Notes-mutation operation wrapper: owns the retry/replay policy while
+   * `GitRepository.withNotesWrite` owns ref updates and temporary-ref
+   * handling. The canonical-tip compare-and-swap stays the final
+   * publication guard; contention replays this pure mutation against the
+   * new tip with bounded backoff, and exhaustion throws
+   * `NotesContentionError` (explicit bounded contention, never silent loss).
+   *
+   * Replay contract: `mutation` may run more than once per call. Every read
+   * must go through `notes.read` inside the closure; no consumed iterators
+   * or single-use state may be captured outside it.
+   */
+  async mutateNotes<T>(
+    mutation: (notes: NotesTransaction) => Promise<T>,
+    options: WithNotesWriteOptions = {},
+  ): Promise<T> {
+    return this.repository.withNotesWrite(
+      mutation,
+      (ref) => this.validateNotesRef(ref),
+      undefined,
+      options,
+    );
+  }
+
   async summarize(input: {
     readonly commit: string;
     readonly summary: SessionSummary;
@@ -708,7 +733,7 @@ export class Reveries {
   }): Promise<void> {
     const commit = await this.repository.resolveCommit(input.commit);
     validateNote([input.summary], { verifyIds: false });
-    await this.repository.withNotesWrite(async (notes) => {
+    await this.mutateNotes(async (notes) => {
       if (input.replace !== true) {
         await notes.append(commit, canonicalRecord(input.summary));
         return;
@@ -717,7 +742,7 @@ export class Reveries {
       const records = existing === null ? [] : parseNote(existing, "strict", { verifyIds: false }).records;
       const retained = records.filter((record) => record.type !== "session-summary");
       await notes.replace(commit, [input.summary, ...retained].map(canonicalRecord).join(""));
-    }, (ref) => this.validateNotesRef(ref));
+    });
   }
 
   async commitWithSummary(input: {
@@ -781,7 +806,7 @@ export class Reveries {
         `Session summary for ${commit} fails strict validation: ${check.diagnostics.join("; ")}`,
       );
     }
-    return this.repository.withNotesWrite(async (notes) => {
+    return this.mutateNotes(async (notes) => {
       const existing = await notes.read(commit);
       const records = existing === null
         ? []
@@ -797,7 +822,7 @@ export class Reveries {
       }
       await notes.append(commit, canonicalRecord(input.summary));
       return { commit, state: "attached" as const, summary: input.summary, diagnostics: [] };
-    }, (ref) => this.validateNotesRef(ref));
+    });
   }
 
   async publishNotes(input: PublishNotesInput): Promise<PublishNotesResult> {
@@ -851,9 +876,9 @@ export class Reveries {
 
   async attachInitialization(input: { readonly commit: string; readonly record: ReveriesInit }): Promise<void> {
     const commit = await this.repository.resolveCommit(input.commit);
-    await this.repository.withNotesWrite(async (notes) => {
+    await this.mutateNotes(async (notes) => {
       await notes.append(commit, canonicalRecord(input.record));
-    }, (ref) => this.validateNotesRef(ref));
+    });
   }
 
   async attachAdoption(input: {
@@ -863,7 +888,7 @@ export class Reveries {
   }): Promise<void> {
     const commit = await this.repository.resolveCommit(input.commit);
     validateNote([input.summary, input.initialization], { verifyIds: false });
-    await this.repository.withNotesWrite(async (notes) => {
+    await this.mutateNotes(async (notes) => {
       const existing = await notes.read(commit);
       const records = existing === null
         ? []
@@ -883,7 +908,7 @@ export class Reveries {
         commit,
         [input.summary, input.initialization, ...retained].map(canonicalRecord).join(""),
       );
-    }, (ref) => this.validateNotesRef(ref));
+    });
   }
 
   async checkStaged(explicitSuccessors: ReadonlyMap<string, string> = new Map()): Promise<CheckResult> {
@@ -1838,6 +1863,43 @@ export class Reveries {
     } catch {
       // No unresolved notes merge marker exists.
     }
+    // Retired-lock leftovers and disposable transaction refs are
+    // collectible and diagnosable, never damage: they are reported as
+    // notices and must never flip `ok` to false by themselves.
+    try {
+      const lockPath = this.repository.writeLockPath();
+      const lockStat = await stat(lockPath).catch(() => null);
+      if (lockStat !== null) {
+        let owner = "unknown owner";
+        try {
+          const raw = await readFile(join(lockPath, "owner.json"), "utf8");
+          const parsed = JSON.parse(raw) as { pid?: unknown; started_at?: unknown };
+          const ageMs = lockStat.mtimeMs;
+          const age = Number.isFinite(ageMs) ? `, directory mtime ${new Date(ageMs).toISOString()}` : "";
+          owner = `pid ${String(parsed.pid ?? "unknown")} started ${String(parsed.started_at ?? "unknown")}${age}`;
+        } catch {
+          // Owner metadata is best-effort; the leftover itself is the signal.
+        }
+        notices.push(
+          `A stale Reveries write.lock directory remains at ${lockPath} (${owner}). `
+          + "Writers ignore it; remove the directory to silence this notice.",
+        );
+      }
+    } catch {
+      // A lock-path probe failure is not a diagnosis.
+    }
+    try {
+      const orphans = await this.repository.listTemporaryNotesRefs();
+      if (orphans.length > 0) {
+        const names = orphans.map((entry) => entry.ref).sort().join(", ");
+        notices.push(
+          `Abandoned Reveries transaction ref(s) under refs/notes/reveries-txn `
+          + `(${orphans.length}): ${names}. They are disposable; collect them with pruneTemporaryNotesRefs.`,
+        );
+      }
+    } catch {
+      // A temp-ref listing failure is not a diagnosis.
+    }
     try {
       await this.validateNotesRef("refs/notes/reveries");
     } catch (error: unknown) {
@@ -1891,9 +1953,37 @@ export class Reveries {
   }
 
   private async appendRecord(object: ObjectId, record: ReverieRecord): Promise<void> {
-    await this.repository.withNotesWrite(async (notes) => {
+    await this.mutateNotes(async (notes) => {
       await notes.append(object, canonicalRecord(record));
-    }, (ref) => this.validateNotesRef(ref));
+    });
+  }
+
+  /**
+   * Collect disposable transaction refs left by killed writers
+   * (`refs/notes/reveries-txn/*`). Refs older than `olderThanMs`
+   * (default: one day) are deleted; refs without a readable creation date
+   * count as stale. With `dryRun`, report without deleting. Never touches
+   * the canonical notes ref. Returns the pruned and kept ref names.
+   */
+  async pruneTemporaryNotesRefs(input: {
+    readonly olderThanMs?: number;
+    readonly dryRun?: boolean;
+  } = {}): Promise<{ readonly pruned: readonly string[]; readonly kept: readonly string[] }> {
+    const cutoff = Date.now() - (input.olderThanMs ?? 24 * 3600 * 1000);
+    const pruned: string[] = [];
+    const kept: string[] = [];
+    for (const entry of await this.repository.listTemporaryNotesRefs()) {
+      const stale = entry.createdAtUnix === null || entry.createdAtUnix * 1000 <= cutoff;
+      if (!stale) {
+        kept.push(entry.ref);
+        continue;
+      }
+      if (input.dryRun !== true) {
+        await this.repository.deleteTemporaryNotesRef(entry.ref);
+      }
+      pruned.push(entry.ref);
+    }
+    return { pruned: pruned.sort(), kept: kept.sort() };
   }
 
   private async checkRemoteNotesIncorporated(remote: string, remoteObject: ObjectId | null): Promise<CheckResult> {
@@ -2141,5 +2231,5 @@ export class Reveries {
     return { ok: report.ok, diagnostics };
   }
 }
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";

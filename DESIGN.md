@@ -1149,27 +1149,22 @@ Agent startup never performs network access automatically.
 
 Before substantial shared work, the Skill requires an explicit pull or a clear statement that local Reveries state may be stale.
 
-### 17.3 Local write locking
+### 17.3 Local write concurrency
 
-The helper serializes notes-ref writes with a lock under the common Git directory:
+The helper publishes notes-ref writes without a lock. A write:
 
-```text
-<git-common-dir>/reveries/write.lock
-```
+1. reads the current notes-ref tip;
+2. validates existing note content;
+3. applies the mutation onto a unique temporary ref under `refs/notes/reveries-txn/`;
+4. verifies the result;
+5. updates `refs/notes/reveries` with the old tip as a compare-and-swap guard.
 
-This covers linked worktrees.
-
-A write:
-
-1. acquires the lock;
-2. reads the current notes-ref tip;
-3. validates existing note content;
-4. applies the mutation;
-5. verifies the result;
-6. updates the ref;
-7. releases the lock.
-
-If another process changes the ref outside the lock, the helper retries from the new tip or refuses with a concurrency error.
+If another process changes the ref first, the helper retries from the new tip with exponential
+backoff and jitter, then fails with a bounded contention error after its attempt budget. Linked
+worktrees share the same refs, so the compare-and-swap guard covers them. A writer that dies
+mid-write leaves only a disposable temporary ref and loose objects; `doctor` reports them and the
+helper can prune them. No process can block future writes by holding a stale lock. The guard also
+detects writers that bypass the helper.
 
 ---
 

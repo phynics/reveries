@@ -4,7 +4,9 @@ export {
   GitCommandError,
   GitRepository,
   hashBlobContent,
+  NotesContentionError,
   NotesLockError,
+  NOTES_TXN_REF_PREFIX,
   SnapshotIndexCorruptError,
 } from "./git.ts";
 export type {
@@ -14,7 +16,9 @@ export type {
   NotesRefValidator,
   NotesTransaction,
   NotesValidationFailure,
+  TemporaryNotesRef,
   TreeEntry,
+  WithNotesWriteOptions,
 } from "./git.ts";
 export * from "./hooks.ts";
 export * from "./install.ts";
