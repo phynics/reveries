@@ -24,7 +24,14 @@ import {
   type Source,
   type SummaryEntry,
 } from "./protocol.ts";
-import { GitRepository, type NoteListEntry, type NotesTransaction } from "./git.ts";
+import {
+  GitRepository,
+  RETENTION_COMMITS_REF,
+  RETENTION_OBJECTS_REF,
+  type NoteListEntry,
+  type NotesTransaction,
+  type RetentionSubject,
+} from "./git.ts";
 import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
 
 export interface RecordTarget {
@@ -118,12 +125,31 @@ export interface DoctorResult extends CheckResult {
   readonly state: "prepared" | "adopted" | "damaged";
   readonly notices: readonly string[];
   readonly protection: DoctorProtection;
+  readonly retention: RetentionStatus;
 }
 
 export interface DoctorProtection {
   readonly helper: "available" | "unavailable";
   readonly local: "complete" | "partial" | "not-configured";
   readonly receiveSide: "unknown";
+}
+
+export const RETENTION_POLICIES = ["none", "active", "all", "archive"] as const;
+export type RetentionPolicy = (typeof RETENTION_POLICIES)[number];
+
+export interface RetentionStatus {
+  readonly policy: RetentionPolicy;
+  readonly state: "absent" | "current" | "incomplete";
+  /** Annotated subjects the policy selects, sorted. */
+  readonly expected: readonly ObjectId[];
+  /** Annotated subjects the vault currently keeps, sorted. */
+  readonly retained: readonly ObjectId[];
+  /** Selected subjects the vault does not keep. */
+  readonly missing: readonly ObjectId[];
+}
+
+export interface RetentionResult extends RetentionStatus {
+  readonly changed: boolean;
 }
 
 export interface PushUpdate {
@@ -952,6 +978,133 @@ export class Reveries {
     return descendant.exitCode === 0 ? this.checkCommit("HEAD") : { ok: true, diagnostics: [] };
   }
 
+  /**
+   * Read the configured retention policy. An unset key means the default, which keeps
+   * only the annotated objects that currently carry an active reverie.
+   */
+  async retentionPolicy(): Promise<RetentionPolicy> {
+    const result = await this.repository.run(["config", "--get", "reveries.retention"], {
+      allowExitCodes: [0, 1],
+    });
+    const value = result.stdout.trim();
+    if (value === "") return "active";
+    if (!(RETENTION_POLICIES as readonly string[]).includes(value)) {
+      throw new Error(`reveries.retention must be one of ${RETENTION_POLICIES.join(", ")}; found ${value}`);
+    }
+    return value as RetentionPolicy;
+  }
+
+  private async retentionSelection(policy: RetentionPolicy): Promise<readonly RetentionSubject[]> {
+    const subjects: { readonly object: ObjectId; readonly type: RetentionSubject["type"]; readonly reveries: readonly ReverieRecord[] }[] = [];
+    for (const entry of await this.repository.listNotes()) {
+      const type = await this.repository.objectType(entry.object);
+      if (type === null) continue;
+      if (type === "tag") {
+        throw new Error(`Retention cannot anchor annotated tag ${entry.object}`);
+      }
+      subjects.push({ object: entry.object, type, reveries: await this.subjectReveries(entry.object) });
+    }
+    // A supersession recorded on any subject retires the predecessor everywhere, so the
+    // active set must be projected across the whole evidence set rather than per note.
+    const activeIds = new Set(
+      projectActiveReveries(subjects.flatMap((subject) => subject.reveries)).active.map((record) => record.id),
+    );
+    const selected = new Map<ObjectId, RetentionSubject["type"]>();
+    for (const subject of subjects) {
+      if (policy === "active" && !subject.reveries.some((record) => activeIds.has(record.id))) continue;
+      selected.set(subject.object, subject.type);
+    }
+    if (policy === "archive") {
+      const vault = await this.repository.listRetentionObjects();
+      for (const object of await this.repository.listRetentionCommits()) {
+        if (!selected.has(object)) selected.set(object, "commit");
+      }
+      for (const object of vault) {
+        if (selected.has(object)) continue;
+        const type = await this.repository.objectType(object);
+        if (type === "blob" || type === "tree") selected.set(object, type);
+      }
+    }
+    return [...selected]
+      .map(([object, type]) => ({ object, type }))
+      .sort((left, right) => (left.object < right.object ? -1 : left.object > right.object ? 1 : 0));
+  }
+
+  private async subjectReveries(object: ObjectId): Promise<readonly ReverieRecord[]> {
+    const note = await this.repository.readNoteFromRef(NOTES_REF, object);
+    if (note === null) return [];
+    const parsed = parseNote(note, "tolerant", { verifyIds: false });
+    return parsed.records.filter((record): record is ReverieRecord => record.type === "reverie");
+  }
+
+  private async retentionVault(): Promise<{
+    readonly objectsTip: ObjectId | null;
+    readonly objects: readonly ObjectId[];
+    readonly commitsTip: ObjectId | null;
+  }> {
+    const objectsTip = await this.repository.notesTip(RETENTION_OBJECTS_REF);
+    const chain = await this.repository.retentionCommits();
+    return {
+      objectsTip,
+      objects: await this.repository.listRetentionObjects(),
+      commitsTip: chain.tip,
+    };
+  }
+
+  async retentionStatus(policy?: RetentionPolicy): Promise<RetentionStatus> {
+    const resolved = policy ?? await this.retentionPolicy();
+    if (resolved === "none") {
+      return { policy: "none", state: "absent", expected: [], retained: [], missing: [] };
+    }
+    const expected = (await this.retentionSelection(resolved)).map((subject) => subject.object);
+    const vault = await this.retentionVault();
+    const retained = [...new Set([...vault.objects, ...await this.repository.listRetentionCommits()])]
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+    const missing = expected.filter((object) => !retained.includes(object));
+    return {
+      policy: resolved,
+      state: missing.length > 0 ? "incomplete" : retained.length === 0 ? "absent" : "current",
+      expected,
+      retained,
+      missing,
+    };
+  }
+
+  /**
+   * Rebuild the retention vault from evidence. Only the explicit `none` policy removes
+   * retention; an empty selection leaves the existing vault untouched.
+   */
+  async retain(): Promise<RetentionResult> {
+    const policy = await this.retentionPolicy();
+    const vault = await this.retentionVault();
+    if (policy === "none") {
+      if (vault.objectsTip === null && vault.commitsTip === null) {
+        return { ...(await this.retentionStatus("none")), changed: false };
+      }
+      await this.repository.deleteRetentionRefs({
+        objects: vault.objectsTip,
+        commits: vault.commitsTip,
+      });
+      return { ...(await this.retentionStatus("none")), changed: true };
+    }
+    const selection = await this.retentionSelection(policy);
+    if (selection.length === 0) {
+      return { ...(await this.retentionStatus(policy)), changed: false };
+    }
+    const objects = await this.repository.writeRetentionObjects(
+      selection.filter((subject) => subject.type !== "commit"),
+    );
+    const commits = await this.repository.writeRetentionCommits(
+      selection.filter((subject) => subject.type === "commit").map((subject) => subject.object),
+      vault.commitsTip,
+    );
+    await this.repository.updateRetentionRefs({
+      objects: { next: objects, expected: vault.objectsTip },
+      commits: { next: commits, expected: vault.commitsTip },
+    });
+    return { ...(await this.retentionStatus(policy)), changed: true };
+  }
+
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
     const notices: string[] = [];
@@ -1064,6 +1217,24 @@ export class Reveries {
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
+    let retention: RetentionStatus = {
+      policy: "none",
+      state: "absent",
+      expected: [],
+      retained: [],
+      missing: [],
+    };
+    try {
+      retention = await this.retentionStatus();
+      if (retention.missing.length > 0) {
+        diagnostics.push(
+          `Retention policy ${retention.policy} does not keep ${retention.missing.length} annotated subject(s): `
+          + `${retention.missing.join(", ")}`,
+        );
+      }
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
     const protection: DoctorProtection = {
       helper: helperAvailable ? "available" : "unavailable",
       local: unsafeGenericPush
@@ -1079,11 +1250,16 @@ export class Reveries {
       `Protection: helper ${protection.helper}; local ${protection.local}; receive-side ${protection.receiveSide}. `
       + "Local hooks are not a security boundary and may be bypassed with --no-verify.",
     );
+    notices.push(
+      `Retention: policy ${retention.policy}; ${retention.state}; `
+      + `${retention.retained.length} of ${retention.expected.length} annotated subject(s) kept.`,
+    );
     return {
       ok: diagnostics.length === 0,
       diagnostics,
       notices,
       protection,
+      retention,
       state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
     };
   }

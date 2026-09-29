@@ -7,7 +7,13 @@ import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
 import { Reveries } from "../src/operations.ts";
-import { blobId, type ReverieInput, type ReverieMetadata, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
+import {
+  NOTES_REF,
+  RETENTION_BUNDLE_REFS,
+  RETENTION_COMMITS_REF,
+  RETENTION_OBJECTS_REF,
+} from "../src/git.ts";
+import { blobId, objectId, type ReverieInput, type ReverieMetadata, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
@@ -623,4 +629,190 @@ test("atomic commit-and-summary creation supports an unborn branch", async () =>
   assert.equal(await git(directory, "rev-parse", "HEAD"), commit);
   assert.equal(await git(directory, "show", "-s", "--format=%P", commit), "");
   assert.equal((await reveries.show({ target: commit })).records.length, 1);
+});
+
+test("retention defaults to the active policy and rejects an unknown one", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+
+  assert.equal(await reveries.retentionPolicy(), "active");
+
+  await git(directory, "config", "reveries.retention", "all");
+  assert.equal(await reveries.retentionPolicy(), "all");
+
+  await git(directory, "config", "reveries.retention", "forever");
+  await assert.rejects(() => reveries.retentionPolicy(), /reveries\.retention|forever/);
+});
+
+test("the active policy retains only subjects with an active reverie", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const original = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+  await git(directory, "add", "state.txt");
+  const successor = await reveries.recordSupersede({
+    path: "state.txt",
+    revision: "index",
+    semantic: { ...semantic, decision: `${semantic.decision} A sharper rule.` },
+    metadata,
+    old: original.record.id,
+  });
+
+  const result = await reveries.retain();
+
+  assert.equal(result.policy, "active");
+  assert.deepEqual([...result.retained], [successor.object]);
+  assert.deepEqual(await reveries.repository.listRetentionCommits(), []);
+  assert.equal(await reveries.repository.objectType(commit), "commit");
+});
+
+test("the all policy retains every annotated subject", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+
+  const result = await reveries.retain();
+
+  assert.deepEqual([...result.retained].sort(), [recorded.object, commit].sort());
+  assert.deepEqual(
+    [...await reveries.repository.listRetentionCommits()],
+    [commit],
+  );
+});
+
+test("the archive policy keeps subjects that later evidence supersedes", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const original = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await git(directory, "config", "reveries.retention", "archive");
+  await reveries.retain();
+  await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+  await git(directory, "add", "state.txt");
+  await reveries.recordSupersede({
+    path: "state.txt",
+    revision: "index",
+    semantic: { ...semantic, decision: `${semantic.decision} A sharper rule.` },
+    metadata,
+    old: original.record.id,
+  });
+  const staged = await reveries.repository.resolvePath({ path: "state.txt", revision: "index" });
+
+  const result = await reveries.retain();
+
+  assert.equal(result.policy, "archive");
+  assert.deepEqual([...result.retained].sort(), [original.object, staged].sort());
+});
+
+test("the none policy removes retention and an empty rebuild never does", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await reveries.retain();
+  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  assert.notEqual(objectsTip, null);
+
+  await git(directory, "config", "reveries.retention", "none");
+  const removed = await reveries.retain();
+  assert.equal(removed.changed, true);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), null);
+  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), null);
+
+  await git(directory, "config", "reveries.retention", "all");
+  await reveries.retain();
+  const restored = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  await writeFile(join(directory, "state.txt"), "third\n", "utf8");
+  await git(directory, "add", "state.txt");
+  const second = await reveries.repository.resolvePath({ path: "state.txt", revision: "index" });
+  await reveries.repository.run(["notes", "--ref=refs/notes/reveries", "remove", second], { allowExitCodes: [0, 1, 5] });
+  const empty = await reveries.retain();
+
+  assert.deepEqual([...empty.retained], [recorded.object]);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), restored);
+});
+
+test("doctor reports retention coverage and the subjects a vault misses", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+
+  const uncovered = await reveries.doctor();
+  assert.equal(uncovered.retention.policy, "active");
+  assert.equal(uncovered.retention.state, "incomplete");
+  assert.deepEqual([...uncovered.retention.missing], [recorded.object]);
+  assert.match(uncovered.diagnostics.join(" "), /Retention policy active does not keep 1 annotated subject/);
+  assert.match(uncovered.notices.join(" "), /Retention: policy active; incomplete; 0 of 1 annotated subject/);
+
+  await reveries.retain();
+  const covered = await reveries.doctor();
+  assert.equal(covered.retention.state, "current");
+  assert.deepEqual([...covered.retention.missing], []);
+  assert.match(covered.notices.join(" "), /Retention: policy active; current; 1 of 1 annotated subject/);
+});
+
+test("retained annotated objects survive aggressive pruning and controls do not", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await reveries.retain();
+  const unretained = objectId((await reveries.repository.run(["hash-object", "-w", "--stdin"], { input: "control\n" })).stdout.trim());
+
+  await writeFile(join(directory, "orphan.txt"), "orphan\n", "utf8");
+  await git(directory, "add", "orphan.txt");
+  await git(directory, "commit", "-m", "orphan commit");
+  await git(directory, "reset", "--hard", "HEAD~1");
+  await git(directory, "reflog", "expire", "--expire=now", "--all");
+  await git(directory, "gc", "--prune=now", "--aggressive");
+
+  assert.equal(await reveries.repository.objectType(recorded.object), "blob");
+  assert.equal(await reveries.repository.objectType(commit), "commit");
+  assert.equal(await reveries.repository.objectType(unretained), null);
+});
+
+test("a vault rebuilt from evidence reproduces the same objects", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+  const first = await reveries.retain();
+  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  const commitsTip = await reveries.repository.notesTip(RETENTION_COMMITS_REF);
+  assert.notEqual(objectsTip, null);
+  assert.notEqual(commitsTip, null);
+
+  await reveries.repository.deleteRetentionRefs({ objects: objectsTip, commits: commitsTip });
+  const rebuilt = await reveries.retain();
+
+  assert.equal(rebuilt.changed, true);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), objectsTip);
+  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), commitsTip);
+  assert.deepEqual([...first.retained].sort(), [recorded.object, commit].sort());
+});
+
+test("a bundle carries notes, ledger, and retention refs", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+  await reveries.retain();
+  const bundlePath = join(directory, "reveries.bundle");
+  const created = join(directory, "created.bundle");
+
+  const withoutLedger = await reveries.repository.existingRetentionBundleRefs();
+  await git(directory, "bundle", "create", bundlePath, ...withoutLedger);
+  assert.equal(withoutLedger.includes("refs/heads/reveries-ledger"), false);
+
+  await git(directory, "update-ref", "refs/heads/reveries-ledger", await git(directory, "rev-parse", "HEAD"));
+  const refs = await reveries.repository.existingRetentionBundleRefs();
+  await git(directory, "bundle", "create", created, ...refs);
+  const heads = await git(directory, "bundle", "list-heads", created);
+
+  for (const ref of [NOTES_REF, "refs/heads/reveries-ledger", RETENTION_OBJECTS_REF, RETENTION_COMMITS_REF]) {
+    assert.match(heads, new RegExp(`^\\S+ ${ref}$`, "m"), `the bundle is missing ${ref}`);
+  }
 });

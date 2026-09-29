@@ -1856,7 +1856,33 @@ Checks:
 * adapter status;
 * initialization boundary;
 * notes divergence;
-* record damage.
+* record damage;
+* retention policy, vault coverage, and the annotated subjects a vault misses.
+
+A retention gap is a diagnostic, not a notice: an annotated object the vault does not
+keep can be pruned, which would leave the evidence explaining bytes Git no longer has.
+
+### 27.3.1 Retention policy and vault
+
+`git config reveries.retention <none|active|all|archive>` selects which annotated
+subjects the vault keeps. An unset key means `active`.
+
+| Policy | Annotated subjects kept |
+| --- | --- |
+| `none` | none; this is the only setting that removes retention. |
+| `active` | subjects carrying a reverie that the whole evidence set still projects as active. |
+| `all` | every subject the notes ref references. |
+| `archive` | `all`, unioned with every subject the vault already keeps, so coverage only grows. |
+
+The vault holds two refs. `refs/reveries/retention/objects` is a fanout tree at
+`<oid[0:2]>/<oid[2:]>` holding annotated blobs and trees. `refs/reveries/retention/commits`
+is a chain whose first parent is the previous checkpoint and whose other parents are the
+newly annotated commits, which keeps those commits reachable without copying content.
+Checkpoints use a fixed identity and a fixed epoch date, so a rebuild from the same
+evidence reproduces the same object IDs. Both refs move in one guarded ref transaction.
+
+Bundles carry the notes, ledger, and retention refs, filtered to the refs a repository
+actually has.
 
 ### 27.4 `reveries show`
 
