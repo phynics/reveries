@@ -323,6 +323,13 @@ export class NotesContentionError extends Error {
 /** Private namespace for per-attempt notes-transaction refs. Disposable. */
 export const NOTES_TXN_REF_PREFIX = "refs/notes/reveries-txn/";
 
+/**
+ * Where a fetched-but-unpromoted candidate is preserved (RVR-001 quarantine, and
+ * the RVR-017 role check). The shape is unchanged from RVR-001 so existing
+ * resolver tooling finds an import or mirror quarantine where it already looks.
+ */
+export const QUARANTINE_REF_PREFIX = "refs/reveries/quarantine/";
+
 export interface TemporaryNotesRef {
   readonly ref: string;
   /** Committer-date of the temp ref tip, or null when Git reports none. */
@@ -336,7 +343,25 @@ export interface WithNotesWriteOptions {
   readonly baseDelayMs?: number;
   /** Backoff cap in milliseconds. Defaults to 200. */
   readonly maxDelayMs?: number;
+  /**
+   * Whether a validated candidate may move `NOTES_REF`. Defaults to true.
+   *
+   * RVR-017 needs a candidate that went through the *identical* validation a
+   * promoted one faces but is deliberately kept out of canonical state, so
+   * "import-only evidence cannot enter canonical state silently" is a property
+   * of this code path rather than a convention callers must remember. Setting
+   * this false with no `onCandidate` does nothing useful, so it is refused.
+   */
+  readonly promote?: boolean;
+  /**
+   * Observe the validated candidate before the compare-and-swap, and again when
+   * promotion is withheld. This is how a caller parks the candidate at a
+   * quarantine ref without ever touching the canonical notes ref.
+   */
+  readonly onCandidate?: NotesCandidateObserver;
 }
+
+export type NotesCandidateObserver = (candidate: ObjectId, temporaryRef: string) => Promise<void>;
 
 /** Exponential backoff with jitter, capped; never holds a lock (there is none). */
 async function boundedBackoff(attempt: number, baseDelayMs: number, maxDelayMs: number): Promise<void> {
@@ -1204,6 +1229,11 @@ export class GitRepository {
           }
           throw error;
         }
+        // The candidate is valid at this point, so a caller may observe it before
+        // it lands. Quarantine and promotion differ only in whether the
+        // canonical ref moves, not in what the candidate was checked against.
+        if (options.onCandidate !== undefined) await options.onCandidate(newTip, temporaryRef);
+        if (options.promote === false) return value;
         const format = await this.objectFormat();
         const absent = "0".repeat(format === "sha1" ? 40 : 64);
         const update = await this.run(["update-ref", NOTES_REF, newTip, expectedTip ?? absent], {
@@ -1711,11 +1741,17 @@ export class GitRepository {
     return "fetched";
   }
 
+  /**
+   * Merge a fetched notes ref into canonical state and return the promoted
+   * candidate, or null when the merge produced no notes at all.
+   */
   async mergeFetchedNotes(
     remote: string,
     validate: NotesRefValidator = async () => undefined,
     onValidationFailure?: NotesValidationFailure,
-  ): Promise<void> {
+    options: WithNotesWriteOptions = {},
+  ): Promise<ObjectId | null> {
+    let promoted: ObjectId | null = null;
     await this.withNotesWrite(async (notes) => {
       await this.run([
         "notes",
@@ -1725,11 +1761,47 @@ export class GitRepository {
         "cat_sort_uniq",
         `refs/notes/remotes/${remote}/reveries`,
       ]);
-    }, validate, onValidationFailure);
+    }, validate, onValidationFailure, {
+      ...options,
+      onCandidate: async (candidate, temporaryRef) => {
+        promoted = candidate;
+        await options.onCandidate?.(candidate, temporaryRef);
+      },
+    });
+    return promoted;
+  }
+
+  /**
+   * Merge a fetched notes ref, validate it exactly as a promotion would, and
+   * park the result at `refs/reveries/quarantine/<remote>/<oid>` instead of
+   * moving `refs/notes/reveries` (RVR-017).
+   *
+   * This is the mechanism behind "import-only evidence cannot enter canonical
+   * state silently": the candidate is not merely refused, it is preserved and
+   * inspectable, and it passed the same validation a promoted union would have
+   * had to pass. A quarantined candidate is therefore evidence held outside the
+   * canonical ref, never evidence silently merged into it.
+   */
+  async quarantineFetchedNotes(
+    remote: string,
+    validate: NotesRefValidator = async () => undefined,
+    onValidationFailure?: NotesValidationFailure,
+  ): Promise<string> {
+    let quarantineRef: string | null = null;
+    await this.mergeFetchedNotes(remote, validate, onValidationFailure, {
+      promote: false,
+      onCandidate: async (candidate) => {
+        quarantineRef = await this.quarantineNotes(remote, candidate);
+      },
+    });
+    if (quarantineRef === null) {
+      throw new Error(`Fetched notes for ${remote} produced no candidate to quarantine`);
+    }
+    return quarantineRef;
   }
 
   async quarantineNotes(remote: string, candidate: ObjectId): Promise<string> {
-    const ref = `refs/reveries/quarantine/${remote}/${candidate}`;
+    const ref = `${QUARANTINE_REF_PREFIX}${remote}/${candidate}`;
     await this.run(["update-ref", ref, candidate]);
     return ref;
   }

@@ -180,7 +180,13 @@ export type LedgerManifest = {
   previous_ledger: CommitId | null;
   /** The retention checkpoint this ledger anchors; null when no vault exists. */
   retention_commit: CommitId | null;
-  /** Reserved for RVR-017 authority roles: the configured primary remote name, or null. */
+  /**
+   * The primary remote this checkpoint is published on behalf of, or null
+   * (RVR-017). This field was reserved by RVR-005 and signed by RVR-009, so
+   * both tickets extended a stable field rather than adding a key: the role
+   * vocabulary lives in configuration and in verification, never in the signed
+   * bytes. A repository with no determined authority writes null.
+   */
   authority: string | null;
   /** Informational totals recomputed from the grafted notes tree. */
   annotated_subjects: number;
@@ -283,6 +289,212 @@ export const SIGNATURE_DOMAIN_MANIFEST = "reveries/v1/ledger-manifest";
 export type SignatureRole = "author" | "reviewer" | "publisher";
 
 export const SIGNATURE_ROLES: readonly SignatureRole[] = ["author", "reviewer", "publisher"];
+
+/**
+ * What a publishing remote is for (RVR-017).
+ *
+ * A `SignatureRole` says who is attesting; a `RemoteRole` says where evidence
+ * travels. They are deliberately separate closed sets: a repository that has not
+ * adopted roles is ordinary, so the vocabulary is only ever consulted once an
+ * operator has declared one.
+ */
+export type RemoteRole = "primary" | "mirror" | "archive" | "import-only";
+
+export const REMOTE_ROLES: readonly RemoteRole[] = ["primary", "mirror", "archive", "import-only"];
+
+/**
+ * What a sync from a remote of this role may do to canonical state.
+ *
+ * Only the primary promotes. A mirror already holds evidence the primary has, an
+ * import is foreign history, and an archive is a destination rather than a
+ * source; all three are fetched, fully validated, and kept, but none becomes
+ * `refs/notes/reveries`. That is what makes "import-only evidence cannot enter
+ * canonical state silently" a property of the code path rather than a convention.
+ */
+export type RolePromotion = "promote" | "quarantine";
+
+export function rolePromotion(role: RemoteRole): RolePromotion {
+  return role === "primary" ? "promote" : "quarantine";
+}
+
+/**
+ * Whether this repository may push published evidence *to* a remote of this
+ * role. This is a different question from promotion: a mirror and an archive are
+ * replicas this repository writes to, so they accept publication even though
+ * neither is merged back. An `import-only` remote is a source of someone else's
+ * history, and publishing into it would forge provenance, so it never does.
+ */
+export function rolePublishable(role: RemoteRole): boolean {
+  return role !== "import-only";
+}
+
+/**
+ * Whether a remote of this role is a legitimate synchronization source. An
+ * archive keeps evidence rather than supplying it, so syncing from one has
+ * nothing legitimate to do and is refused instead of silently importing.
+ */
+export function roleSyncSource(role: RemoteRole): boolean {
+  return role !== "archive";
+}
+
+/**
+ * How much authority this repository has over its publication (RVR-017).
+ *
+ * `absent` and `unconfigured` are ordinary states, not damage: they are what a
+ * repository that never adopted roles looks like, and reporting them as damage
+ * would flip every existing V1 setup. Only `invalid` means the configuration
+ * contradicts itself.
+ */
+export type AuthorityState = "absent" | "inferred" | "configured" | "unconfigured" | "invalid";
+
+export type AuthorityResolution = {
+  readonly state: AuthorityState;
+  /** The single authoritative remote, or null when none is determined. */
+  readonly primary: string | null;
+  /** Every declared role, keyed by remote name. */
+  readonly roles: ReadonlyMap<string, RemoteRole>;
+  /** A human-readable summary of why there is no primary. */
+  readonly notice: string;
+  /** Contradictions only. Absent and inferred authority produce none. */
+  readonly diagnostics: readonly string[];
+};
+
+const REMOTE_ROLE_SET: ReadonlySet<string> = new Set(REMOTE_ROLES);
+
+export function remoteRole(value: unknown): RemoteRole {
+  if (typeof value !== "string" || !REMOTE_ROLE_SET.has(value)) {
+    throw new Error(`reveries.remoteRole must name a role from ${REMOTE_ROLES.join(", ")}; found ${String(value)}`);
+  }
+  return value as RemoteRole;
+}
+
+/**
+ * Derive the authoritative publication configuration from declared roles.
+ *
+ * This is the whole of RVR-017's "exactly one primary" rule, and it is pure so
+ * the rule can be tested without a repository. Exactly one declared primary is
+ * authoritative; two is a contradiction that names both offenders so an
+ * operator knows which to demote. With nothing declared, a single publishing
+ * remote is an unambiguous source and is reported as `inferred`, while zero or
+ * several is `unconfigured`. Absence is never damage.
+ *
+ * `knownRemotes` is the set of remotes Git actually has. A role for a name that
+ * does not exist is a contradiction rather than a dormant setting, because a
+ * typo would otherwise silently leave a repository believing it has a mirror it
+ * does not have. Only a `primary` must also publish; the other three roles are
+ * not publishers by definition.
+ */
+export function resolveAuthorityRoles(
+  publishingRemotes: readonly string[],
+  declaredRoles: Readonly<Record<string, RemoteRole>>,
+  knownRemotes?: readonly string[],
+): AuthorityResolution {
+  const roles = new Map<string, RemoteRole>();
+  for (const [remote, role] of Object.entries(declaredRoles)) {
+    roles.set(remote, remoteRole(role));
+  }
+  const publishing = new Set(publishingRemotes);
+  const known = knownRemotes === undefined ? null : new Set(knownRemotes);
+  const diagnostics: string[] = [];
+
+  for (const [remote, role] of [...roles].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (known !== null && !known.has(remote)) {
+      diagnostics.push(`reveries.remoteRole.${remote} names a role for a remote that does not exist`);
+    }
+    if (role === "primary" && !publishing.has(remote)) {
+      diagnostics.push(`reveries.remoteRole.${remote} names a primary that is not a publishing remote`);
+    }
+  }
+
+  const declared = [...roles].filter(([, role]) => role === "primary").map(([remote]) => remote).sort();
+  if (declared.length > 1) {
+    diagnostics.push(
+      `Authority must name exactly one primary; reveries.remoteRole declares ${declared.length} (${declared.join(", ")})`,
+    );
+  }
+  if (diagnostics.length > 0) {
+    return {
+      state: "invalid",
+      primary: null,
+      roles,
+      notice: `Authority configuration is invalid: ${diagnostics.length} problem(s).`,
+      diagnostics,
+    };
+  }
+
+  if (declared.length === 1) {
+    const primary = declared[0] as string;
+    return {
+      state: "configured",
+      primary,
+      roles,
+      notice: `Primary authority is ${primary}.`,
+      diagnostics: [],
+    };
+  }
+
+  const publishers = [...publishing].sort();
+  if (publishers.length === 1 && roles.size === 0) {
+    const primary = publishers[0] as string;
+    return {
+      state: "inferred",
+      primary,
+      roles,
+      notice: `Primary authority is ${primary}, inferred from the only publishing remote.`,
+      diagnostics: [],
+    };
+  }
+  if (publishers.length === 0 && roles.size === 0) {
+    return {
+      state: "absent",
+      primary: null,
+      roles,
+      notice: "No publishing remote is configured; this repository publishes nothing.",
+      diagnostics: [],
+    };
+  }
+  return {
+    state: "unconfigured",
+    primary: null,
+    roles,
+    notice: publishers.length === 0
+      ? `No primary is declared; ${roles.size} remote(s) have a non-publishing role.`
+      : `No primary is declared among publishing remotes (${publishers.join(", ")}); declare one with reveries.remoteRole.<remote>=primary.`,
+    diagnostics: [],
+  };
+}
+
+/**
+ * Where an authority's own append-only signed stream lives under optional
+ * federation (RVR-017). This names the grammar only: federation is off unless
+ * configured, and consuming an origin stream is later work.
+ */
+export const ORIGIN_REF_PREFIX = "refs/heads/reveries-origin/" as const;
+
+const REF_UNSAFE = /[~^?*[\]@{} \t\n\r\0\\]/;
+
+/**
+ * One authority id, which becomes a single ref segment. It is refused here
+ * rather than left to Git because an id Git would rewrite is an id that no
+ * longer names the authority the operator meant.
+ */
+export function authorityId(value: unknown): string {
+  if (typeof value !== "string") throw new Error("authority id must be a string");
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error("authority id must be a nonempty string");
+  if (trimmed !== value) throw new Error("authority id must not have surrounding whitespace");
+  if (trimmed.includes("/")) throw new Error("authority id must be a single ref path segment");
+  if (REF_UNSAFE.test(trimmed)) throw new Error("authority id must not contain whitespace, control, or ref-unsafe characters");
+  if (trimmed.includes("..")) throw new Error("authority id must not contain ..");
+  if (trimmed.startsWith(".")) throw new Error("authority id must not start with a dot");
+  if (trimmed.endsWith(".lock")) throw new Error("authority id must not end with .lock");
+  return trimmed;
+}
+
+/** The full ref an authority's origin stream occupies. */
+export function originStreamRef(value: string): string {
+  return `${ORIGIN_REF_PREFIX}${authorityId(value)}`;
+}
 
 /**
  * A signature over a fact record or a ledger manifest (RVR-009).
@@ -836,9 +1048,11 @@ function validateCount(value: unknown, field: string): void {
 }
 
 /**
- * The reserved authority name. Shape only: one trimmed token with no
- * whitespace or control characters. RVR-017 gives the field role semantics;
- * this check keeps it a single well-formed token until then.
+ * The primary remote name (RVR-017). Shape only: one trimmed token with no
+ * whitespace or control characters. The role vocabulary is deliberately not
+ * encoded here, because a checkpoint rebuilt from the same evidence must
+ * reproduce the same object ID, and a value that encodes a role would make the
+ * signed bytes depend on configuration the manifest cannot see.
  */
 function validateAuthority(value: unknown, limits: Readonly<ResourceLimits>): void {
   if (value === null) return;

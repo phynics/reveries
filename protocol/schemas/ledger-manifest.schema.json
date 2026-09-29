@@ -29,7 +29,7 @@
       "oneOf": [{ "$ref": "#/$defs/objectId" }, { "type": "null" }]
     },
     "authority": {
-      "description": "Reserved for RVR-017 authority roles. Exactly one documented value today: the configured primary remote name. Shape-validated as a single trimmed token with no whitespace or control characters; null when none is configured.",
+      "description": "The primary remote this checkpoint is published on behalf of (RVR-017). Exactly one remote is authoritative; the role vocabulary (primary, mirror, archive, import-only) lives in configuration and in verification, not in this field, so the manifest key set and the bytes RVR-009 signs are unchanged. Shape-validated as a single trimmed token with no whitespace or control characters; null when the repository declares no authority.",
       "type": ["string", "null"],
       "minLength": 1,
       "maxLength": 1024,

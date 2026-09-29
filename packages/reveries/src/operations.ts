@@ -25,8 +25,13 @@ import {
   readLedgerManifest,
   redactionPayload,
   recordFactId,
+  remoteRole,
   resolutionPayload,
+  resolveAuthorityRoles,
   resolveLimits,
+  rolePromotion,
+  rolePublishable,
+  roleSyncSource,
   semanticPayload,
   SIGNATURE_DOMAIN_MANIFEST,
   SIGNATURE_DOMAIN_RECORD,
@@ -36,6 +41,8 @@ import {
   transitionPayload,
   validateNote,
   type ActiveProjection,
+  type AuthorityResolution,
+  type AuthorityState,
   type BlobId,
   type CommitId,
   type CorrectionId,
@@ -53,6 +60,7 @@ import {
   type RedactionId,
   type RedactionInput,
   type RedactionRecord,
+  type RemoteRole,
   type ResolutionId,
   type ResolutionInput,
   type ResolutionRecord,
@@ -188,12 +196,18 @@ export type SyncResult =
       readonly diagnostics: readonly string[];
       readonly state: "fetched" | "remote-notes-absent";
       readonly conflicts: readonly [];
+      /**
+       * The ref a valid but unpromoted candidate was preserved at, or null when
+       * the sync promoted into canonical state (RVR-017).
+       */
+      readonly quarantineRef?: string | null;
     }
   | {
       readonly ok: false;
       readonly diagnostics: readonly string[];
       readonly state: "fetched";
       readonly conflicts: readonly SyncConflict[];
+      readonly quarantineRef?: string | null;
     };
 
 export interface DoctorResult extends CheckResult {
@@ -213,6 +227,15 @@ export interface DoctorResult extends CheckResult {
    * Presence and unknown keys are notices, never damage.
    */
   readonly signatures: SignatureStatus;
+  /**
+   * Primary authority, mirrors, and import quarantine (RVR-017). Additive
+   * field: a repository that declared no role is `inferred` or `unconfigured`
+   * and is never damaged, so its presence is a notice. `cli.ts` human rendering
+   * is owned separately, so these names are stable API, not display strings.
+   */
+  readonly authority: AuthorityStatus;
+  /** One entry per configured mirror, in remote-name order. */
+  readonly mirrors: readonly MirrorStatus[];
 }
 
 /**
@@ -309,6 +332,46 @@ export interface DoctorProtection {
   readonly helper: "available" | "unavailable";
   readonly local: "complete" | "partial" | "not-configured";
   readonly receiveSide: "unknown";
+}
+
+/**
+ * How authoritative publication is configured (RVR-017).
+ *
+ * The states mirror `LedgerState` and `SignatureStatus` on purpose: `absent`,
+ * `inferred`, and `unconfigured` are all ordinary, so a repository that never
+ * adopted roles, or that has a single publisher, is never reported as broken.
+ * Only `invalid` means the configuration contradicts itself, and only it
+ * contributes diagnostics.
+ */
+export interface AuthorityStatus {
+  readonly state: AuthorityState;
+  /** The single authoritative remote, or null when none is determined. */
+  readonly primary: string | null;
+  /** Every declared role, keyed by remote name, for reporting. */
+  readonly roles: ReadonlyMap<string, RemoteRole>;
+  /** Why there is no primary, or which remote is authoritative. */
+  readonly notice: string;
+  readonly diagnostics: readonly string[];
+}
+
+/**
+ * How one configured mirror relates to the primary checkpoint (RVR-017).
+ *
+ * A mirror is a replica, so the states are about agreement: `unavailable` means
+ * the mirror's envelope has not been fetched and is a notice, `unsigned` means
+ * the primary is unsigned so the stronger check could not run, and only
+ * `divergent` and `authority-mismatch` are damage.
+ */
+export type MirrorState = "matching" | "unavailable" | "unsigned" | "divergent" | "authority-mismatch";
+
+export interface MirrorStatus {
+  readonly remote: string;
+  readonly state: MirrorState;
+  /** The mirror's remote-tracking checkpoint, or null when it was never fetched. */
+  readonly checkpoint: ObjectId | null;
+  /** The trust state of the mirror's own manifest signature, when it has one. */
+  readonly signature: TrustState | null;
+  readonly diagnostics: readonly string[];
 }
 
 export const RETENTION_POLICIES = ["none", "active", "all", "archive"] as const;
@@ -1589,11 +1652,22 @@ export class Reveries {
   }
 
   async checkOutgoingUpdates(remote: string, updates: readonly PushUpdate[]): Promise<CheckResult> {
+    const diagnostics: string[] = [];
+    // An import-only remote is a source of someone else's history. Publishing
+    // into it would assert that this repository authored what is already there.
+    // This is checked before the adoption boundary because a destination that
+    // cannot be published to is wrong regardless of whether the repository has
+    // been adopted, and reporting only the missing boundary would hide the one
+    // problem the operator has to fix in configuration.
+    const role = await this.roleOf(remote);
+    if (role !== null && !rolePublishable(role)) {
+      diagnostics.push(`Remote ${remote} is an ${role} remote and is not a publication destination`);
+    }
     const initialization = await this.findInitialization();
     if (initialization === null) {
-      return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
+      diagnostics.push("Reveries initialization boundary is missing");
+      return { ok: false, diagnostics };
     }
-    const diagnostics: string[] = [];
     const notesUpdate = updates.find((update) => update.remoteRef === NOTES_REF);
     const ledgerUpdate = updates.find((update) => update.remoteRef === LEDGER_REF);
     // The ledger branch lives under refs/heads but carries evidence, not code,
@@ -2158,7 +2232,28 @@ export class Reveries {
     return [...targets.values()];
   }
 
+  /**
+   * Fetch a remote's notes and decide what may happen to canonical state.
+   *
+   * The role decides the outcome before anything is merged (RVR-017). Only the
+   * primary, and any remote that declared no role at all, may promote into
+   * `refs/notes/reveries`. A mirror, an import-only remote, and anything else
+   * non-primary runs the identical full-snapshot validation and is then
+   * *quarantined*: the evidence is preserved and inspectable at a quarantine ref
+   * while the canonical ref is left exactly as it was. An archive is not a
+   * synchronization source and is refused before any fetch.
+   */
   async syncPull(remote: string): Promise<SyncResult> {
+    const role = await this.roleOf(remote);
+    if (role !== null && !roleSyncSource(role)) {
+      return {
+        ok: false,
+        diagnostics: [`Remote ${remote} is an ${role} remote and is not a source of Reveries evidence`],
+        state: "fetched",
+        conflicts: [],
+      };
+    }
+    const promotes = role === null || rolePromotion(role) === "promote";
     const fetched = await this.liveRepository.fetchNotes(remote);
     if (fetched === "absent") {
       return { ok: true, diagnostics: [], state: "remote-notes-absent", conflicts: [] };
@@ -2175,6 +2270,17 @@ export class Reveries {
     }
     let quarantineRef: string | null = null;
     let conflict: SyncConflict | null = null;
+    // A non-primary sync takes the same path and the same validation, then stops
+    // short of the compare-and-swap. Promotion is withheld by construction, so
+    // an import cannot reach canonical state even if a caller expects it to.
+    const promotion: WithNotesWriteOptions = promotes
+      ? {}
+      : {
+          promote: false,
+          onCandidate: async (candidate: ObjectId) => {
+            quarantineRef = await this.repository.quarantineNotes(remote, candidate);
+          },
+        };
     try {
       await this.repository.mergeFetchedNotes(
         remote,
@@ -2191,8 +2297,24 @@ export class Reveries {
             quarantineRef,
           });
         },
+        promotion,
       );
-      return { ok: true, diagnostics: [], state: "fetched", conflicts: [] };
+      if (quarantineRef !== null) {
+        // A quarantined union is a success: the evidence is held, validated, and
+        // inspectable. Reporting it as a failure would train an operator to
+        // ignore this state, which is how silent promotion happens.
+        return {
+          ok: true,
+          diagnostics: [
+            `Notes from ${remote} are validated but quarantined at ${quarantineRef}; `
+            + `canonical ${NOTES_REF} is unchanged because ${remote} is ${role}`,
+          ],
+          state: "fetched",
+          conflicts: [],
+          quarantineRef,
+        };
+      }
+      return { ok: true, diagnostics: [], state: "fetched", conflicts: [], quarantineRef: null };
     } catch (error: unknown) {
       const diagnostics = [error instanceof Error ? error.message : String(error)];
       if (quarantineRef !== null) {
@@ -2203,6 +2325,7 @@ export class Reveries {
         diagnostics,
         state: "fetched",
         conflicts: conflict === null ? [] : [conflict],
+        quarantineRef,
       };
     }
   }
@@ -2633,6 +2756,12 @@ export class Reveries {
    * carries may only add canonical lines. Nothing moves when either check fails.
    */
   async buildLedgerCheckpoint(input: {
+    /**
+     * The primary remote this checkpoint is published on behalf of. Omitted
+     * resolves it from configuration, which is how RVR-017 finally gives the
+     * reserved `authority` field a value; pass `null` to declare a checkpoint
+     * with no authority at all.
+     */
     readonly authority?: string | null;
     /** The ledger tip this update expects to follow; defaults to the current tip. */
     readonly expectedLedger?: ObjectId | null;
@@ -2658,6 +2787,26 @@ export class Reveries {
       totals = Reveries.summarizeNoteLines(await this.canonicalNotesLines(notesTip));
     }
 
+    // The reserved authority field names the single remote this repository
+    // publishes on behalf of (RVR-017). The signed bytes do not change, because
+    // the field already existed and RVR-009 already signs it; only its meaning
+    // stops being reserved.
+    let authority: string | null;
+    try {
+      authority = input.authority !== undefined
+        ? input.authority
+        : (await this.authorityStatus()).primary;
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        diagnostics: [error instanceof Error ? error.message : String(error)],
+        state: "refused",
+        checkpoint: null,
+        previousLedger: expectedLedger,
+        notesTip,
+      };
+    }
+
     let manifest: LedgerManifest;
     try {
       manifest = createLedgerManifest({
@@ -2665,7 +2814,7 @@ export class Reveries {
         notes_tree: notesTree,
         previous_ledger: expectedLedger,
         retention_commit: retentionCommit,
-        authority: input.authority ?? null,
+        authority,
         annotated_subjects: totals.subjects,
         records: totals.records,
         note_bytes: totals.noteBytes,
@@ -2866,6 +3015,84 @@ export class Reveries {
       return { requiredRoles: this.signing.requiredRoles };
     }
     return { requiredRoles: await this.readSigningRoles() };
+  }
+
+  /**
+   * Read the declared remote roles (RVR-017) from
+   * `reveries.remoteRole.<remote>`. An absent key yields no roles, which is the
+   * ordinary V1 state. An unknown role throws, naming the offending value and
+   * the valid set, because silently ignoring a typo would leave a repository
+   * believing it has an authority boundary it does not have.
+   */
+  private async readRemoteRoles(): Promise<Record<string, RemoteRole>> {
+    const result = await this.repository.run(
+      ["config", "--get-regexp", "^reveries\\.remoteRole\\."],
+      { allowExitCodes: [0, 1] },
+    );
+    const roles: Record<string, RemoteRole> = {};
+    for (const line of result.stdout.split("\n")) {
+      if (line.trim().length === 0) continue;
+      // `--get-regexp` prints "<key> <value>" separated by the first space, and a
+      // remote name cannot contain whitespace, so the split is unambiguous.
+      const separator = line.indexOf(" ");
+      if (separator < 0) continue;
+      const key = line.slice(0, separator);
+      const remote = key.slice("reveries.remoteRole.".length);
+      if (remote.length === 0) continue;
+      roles[remote] = remoteRole(line.slice(separator + 1).trim());
+    }
+    return roles;
+  }
+
+  /**
+   * The publishing remotes this repository has adopted, from the initialization
+   * record when it exists and from configuration otherwise. This is the same
+   * resolution `doctor` already uses, so authority and the remote loop can never
+   * disagree about which remotes publish.
+   */
+  private async publishingRemotes(): Promise<readonly string[]> {
+    const initialization = await this.findInitialization();
+    if (initialization !== null) return initialization.record.publishing_remotes;
+    const configured = await this.repository.run(
+      ["config", "--get-all", "reveries.publishingRemote"],
+      { allowExitCodes: [0, 1] },
+    );
+    return configured.stdout.trim().split("\n").filter(Boolean);
+  }
+
+  private async configuredRemoteNames(): Promise<readonly string[]> {
+    return (await this.repository.run(["remote"])).stdout.trimEnd().split("\n").filter(Boolean);
+  }
+
+  /**
+   * Resolve the authoritative publication configuration (RVR-017). This is the
+   * single place roles are resolved, so the doctor report, the sync routing, the
+   * push refusal, and the manifest stamp can never read a different primary.
+   */
+  async authorityStatus(): Promise<AuthorityStatus> {
+    const [publishing, declared, known] = await Promise.all([
+      this.publishingRemotes(),
+      this.readRemoteRoles(),
+      this.configuredRemoteNames(),
+    ]);
+    const resolution: AuthorityResolution = resolveAuthorityRoles(publishing, declared, known);
+    return {
+      state: resolution.state,
+      primary: resolution.primary,
+      roles: resolution.roles,
+      notice: resolution.notice,
+      diagnostics: resolution.diagnostics,
+    };
+  }
+
+  /**
+   * The effective role of a remote, or null when it declared none. A remote with
+   * no declared role keeps the pre-RVR-017 behaviour, so a repository that never
+   * adopted roles publishes and syncs exactly as it did before.
+   */
+  private async roleOf(remote: string): Promise<RemoteRole | null> {
+    const { roles } = await this.authorityStatus();
+    return roles.get(remote) ?? null;
   }
 
   /**
@@ -3086,6 +3313,137 @@ export class Reveries {
       };
     }
     return { ok: true, diagnostics: [], state: "materialized", notesTip: manifest.notes_commit };
+  }
+
+  /** Report how the ledger envelope relates to local notes state. */
+  /**
+   * Compare each configured mirror's checkpoint against the primary's (RVR-017).
+   *
+   * A mirror is a replica, so the check is about agreement rather than
+   * correctness: the mirror must name the same authority, and it must not carry
+   * a notes commit the primary does not, which is what an independent write to a
+   * replica looks like. The signature comparison only runs when the primary's own
+   * checkpoint is signed; otherwise the mirror is reported `unsigned`, because
+   * demanding a signature nothing produces would make the check unpassable rather
+   * than strict.
+   *
+   * This is deliberately network-free. It reads only local remote-tracking refs,
+   * so `doctor` stays a local operation and a mirror that has not been fetched is
+   * `unavailable` rather than a fetch.
+   */
+  async verifyMirrorEnvelopes(): Promise<readonly MirrorStatus[]> {
+    const authority = await this.authorityStatus();
+    // An invalid authority configuration already reported itself, and its
+    // diagnostics are not mirror problems. Re-reporting them here would
+    // duplicate every message and make one root cause look like several.
+    if (authority.state === "invalid") return [];
+    const mirrors = [...authority.roles]
+      .filter(([, role]) => role === "mirror")
+      .map(([remote]) => remote)
+      .sort();
+    if (mirrors.length === 0) return [];
+    const local = await this.repository.ledgerTip();
+    const localStored = local === null ? null : await this.repository.readLedgerManifestAt(local);
+    const localManifest = localStored === null
+      ? null
+      : parseLedgerManifest(localStored, "tolerant").manifest;
+    const primarySigned = (await this.signatureStatus()).checkpointSigned;
+
+    const statuses: MirrorStatus[] = [];
+    for (const remote of mirrors) {
+      const ref = `refs/remotes/${remote}/reveries-ledger`;
+      const checkpoint = await this.repository.ledgerTip(ref);
+      if (checkpoint === null) {
+        // A mirror that has not been fetched is an ordinary state. The message
+        // stays in `diagnostics` because that is the detail field, but `doctor`
+        // promotes it to a notice by state, so an unfetched mirror is never
+        // reported as damage.
+        statuses.push({
+          remote,
+          state: "unavailable",
+          checkpoint: null,
+          signature: null,
+          diagnostics: [`Mirror ${remote} has no fetched ledger checkpoint at ${ref}`],
+        });
+        continue;
+      }
+      const stored = await this.repository.readLedgerManifestAt(checkpoint);
+      const manifest = stored === null ? null : parseLedgerManifest(stored, "tolerant").manifest;
+      if (manifest === null) {
+        statuses.push({
+          remote,
+          state: "divergent",
+          checkpoint,
+          signature: null,
+          diagnostics: [`Mirror ${remote} checkpoint ${checkpoint} has no readable ledger manifest`],
+        });
+        continue;
+      }
+      const diagnostics: string[] = [];
+      // The envelope structure itself must hold before its claims are compared,
+      // so a malformed mirror is damage rather than a trusted peer opinion.
+      const envelope = await this.verifyLedgerEnvelope(checkpoint);
+      diagnostics.push(...envelope.diagnostics.map((entry) => `Mirror ${remote}: ${entry}`));
+      let mismatchedAuthority = false;
+      if (manifest.authority !== authority.primary) {
+        mismatchedAuthority = true;
+        diagnostics.push(
+          `Mirror ${remote} names authority ${manifest.authority ?? "none"}, not the primary ${authority.primary ?? "none"}`,
+        );
+      }
+      if (localManifest?.notes_commit != null && manifest.notes_commit !== localManifest.notes_commit) {
+        const incorporated = manifest.notes_commit === null
+          ? 1
+          : (await this.repository.run(
+            ["merge-base", "--is-ancestor", manifest.notes_commit, localManifest.notes_commit],
+            { allowExitCodes: [0, 1] },
+          )).exitCode;
+        if (incorporated !== 0) {
+          diagnostics.push(
+            `Mirror ${remote} transports notes commit ${manifest.notes_commit ?? "none"}, `
+            + `which the primary checkpoint does not contain`,
+          );
+        }
+      }
+      const signatureState = primarySigned
+        ? await this.mirrorSignatureState(checkpoint, manifest)
+        : null;
+      if (primarySigned && signatureState === null) {
+        diagnostics.push(
+          `Mirror ${remote} checkpoint ${checkpoint} carries no signature over its own manifest, `
+          + `while the primary checkpoint is signed`,
+        );
+      } else if (signatureState === "invalid" || signatureState === "revoked") {
+        diagnostics.push(`Mirror ${remote} manifest signature is ${signatureState}`);
+      }
+      const state: MirrorState = mismatchedAuthority
+        ? "authority-mismatch"
+        : diagnostics.length > 0
+          ? "divergent"
+          : signatureState === null ? "unsigned" : "matching";
+      statuses.push({ remote, state, checkpoint, signature: signatureState, diagnostics });
+    }
+    return statuses;
+  }
+
+  /**
+   * The trust state of a checkpoint's newest manifest signature, or null when the
+   * checkpoint carries none. A mirror has to sign *its own* manifest bytes, so
+   * this compares `content_id` against the mirror's manifest rather than reusing
+   * the primary's verdict.
+   */
+  private async mirrorSignatureState(
+    checkpoint: ObjectId,
+    manifest: LedgerManifest,
+  ): Promise<TrustState | null> {
+    const stored = await this.repository.readLedgerSignaturesAt(checkpoint);
+    if (stored === null) return null;
+    const records = this.parseSignatureLines(stored);
+    const newest = records[records.length - 1];
+    if (newest === undefined) return null;
+    const contentId = await this.signatureContentId(Buffer.from(ledgerManifestPayload(manifest), "utf8"));
+    if (newest.content_id !== contentId) return "invalid";
+    return this.verifySignatureRecord(newest, await this.signingPolicy()).state;
   }
 
   /** Report how the ledger envelope relates to local notes state. */
@@ -3384,6 +3742,58 @@ export class Reveries {
       `Ledger: ${ledger.state}; tip ${ledger.tip ?? "none"}; `
       + `${ledger.annotatedSubjects} annotated subject(s) transported.`,
     );
+    // Authority (RVR-017). Only a contradictory configuration is damage: a
+    // repository with no primary, an inferred one, or a mirror that has not been
+    // fetched are all ordinary states, which is the same rule the ledger and
+    // signature blocks follow.
+    let authority: AuthorityStatus = {
+      state: "absent",
+      primary: null,
+      roles: new Map(),
+      notice: "No publishing remote is configured; this repository publishes nothing.",
+      diagnostics: [],
+    };
+    let mirrors: readonly MirrorStatus[] = [];
+    try {
+      authority = await this.authorityStatus();
+      diagnostics.push(...authority.diagnostics);
+    } catch (error: unknown) {
+      // A malformed role value is a diagnostic, never a crash, so `doctor` still
+      // reports the rest of the repository.
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      mirrors = await this.verifyMirrorEnvelopes();
+      for (const mirror of mirrors) {
+        // `unavailable` and `unsigned` are states a healthy repository can be in:
+        // a mirror nobody has fetched, or one that cannot be checked because the
+        // primary carries no signature. Only a contradiction is damage, and
+        // reporting the others as diagnostics would train an operator to ignore
+        // this block, which is how a real divergence would go unnoticed.
+        if (mirror.state === "divergent" || mirror.state === "authority-mismatch") {
+          diagnostics.push(...mirror.diagnostics);
+        }
+      }
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    notices.push(
+      `Authority: ${authority.state}; primary ${authority.primary ?? "none"}; `
+      + `${[...authority.roles].filter(([, role]) => role === "mirror").length} mirror(s), `
+      + `${[...authority.roles].filter(([, role]) => role === "archive").length} archive(s), `
+      + `${[...authority.roles].filter(([, role]) => role === "import-only").length} import-only.`,
+    );
+    for (const mirror of mirrors) {
+      // Detail a mirror reports goes in its notice rather than being repeated as
+      // a diagnostic, so the diagnostic list names each problem exactly once.
+      const alreadyReported = new Set(diagnostics);
+      const problems = mirror.diagnostics.filter((entry) => !alreadyReported.has(entry));
+      notices.push(
+        `Mirror ${mirror.remote}: ${mirror.state}; checkpoint ${mirror.checkpoint ?? "none"}`
+        + `${mirror.signature === null ? "" : `; signature ${mirror.signature}`}.`
+        + `${problems.length === 0 ? "" : ` ${problems.join(" ")}`}`,
+      );
+    }
     return {
       ok: diagnostics.length === 0,
       diagnostics,
@@ -3392,6 +3802,8 @@ export class Reveries {
       retention,
       ledger,
       signatures,
+      authority,
+      mirrors,
       state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
     };
   }
