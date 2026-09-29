@@ -38,6 +38,24 @@ is the checked-in App identity pin consumed by the controlled-merge workflow. Th
 requires the successful check's App slug and, when `REVERIES_APP_ID` is configured, its numeric
 App ID.
 
+## Adopting the checks
+
+The hosted checks ship as reusable composite actions under `.github/actions/`:
+
+- `reveries-receive-check` installs and builds the checker from the pinned action source, fetches
+  the proposed head and notes refs as Git objects into the target directory, and validates them
+  without executing pull-request code;
+- `reveries-post-merge` builds the synthesis library from the pinned action source and publishes
+  host-created summaries through the guarded notes transaction;
+- `reveries-evidence-import` imports a fork's notes into a read-only artifact without executing
+  fork code.
+
+An adopting repository needs only a SHA-pinned caller workflow plus a ruleset; this repository
+dogfoods the same actions through local-path callers in `.github/workflows/`. The check scripts
+take `--target-dir` (fallback `REVERIES_TARGET_DIR`) so the repository under check is explicit,
+while the checker binary stays anchored at the action source. The full pinning, upgrade, and
+ruleset runbook lives in `docs/adopt-hosted-checks.md`.
+
 ## Controlled merges
 
 `.github/workflows/reveries-controlled-merge.yml` requires an operator to provide the base-tree

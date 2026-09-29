@@ -7,6 +7,38 @@ const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const NOTES_REF = "refs/notes/reveries";
 const BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com";
 
+export function parseScriptArgs(argv) {
+  const options = { targetDir: null };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--target-dir") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error("--target-dir requires a value");
+      }
+      options.targetDir = value;
+      index += 1;
+    } else {
+      throw new Error(`unknown option ${token}`);
+    }
+  }
+  return options;
+}
+
+export function resolveTargetDir(options = {}) {
+  // The synthesis library stays anchored at this script's source tree (the
+  // action source). Only repository reads and notes publication move into
+  // the target directory.
+  if (typeof options.targetDir === "string" && options.targetDir.length > 0) {
+    return resolve(options.targetDir);
+  }
+  const fromEnv = process.env.REVERIES_TARGET_DIR;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    return resolve(fromEnv);
+  }
+  return workspace;
+}
+
 export function gitClient(run) {
   const failure = (args, result) =>
     new Error(`git ${args.join(" ")} failed (${result.exitCode}): ${result.stderr.trim()}`);
@@ -208,14 +240,16 @@ function githubClient(token) {
 }
 
 async function main() {
+  const options = parseScriptArgs(process.argv.slice(2));
+  const targetDir = resolveTargetDir(options);
   const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, "utf8"));
   const runId = process.env.GITHUB_RUN_ID;
   if (!runId) throw new Error("GITHUB_RUN_ID is required for post-merge summaries");
   const remote = process.env.REVERIES_POST_MERGE_REMOTE ?? "origin";
-  const git = gitClient((args, input) => spawnGit(workspace, args, input));
+  const git = gitClient((args, input) => spawnGit(targetDir, args, input));
   const plan = await planHostedSummaries({ event, git, api: githubClient(process.env.GITHUB_TOKEN) });
   const library = await import(pathToFileURL(join(workspace, "packages", "reveries", "dist", "src", "index.js")).href);
-  const reveries = await library.Reveries.open(workspace);
+  const reveries = await library.Reveries.open(targetDir);
   const report = await synthesize({
     plan,
     remote,

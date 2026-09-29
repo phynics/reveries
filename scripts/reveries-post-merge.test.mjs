@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { test } from "node:test";
 import {
   composeHostedSummary,
   gitClient,
   hasSessionSummary,
+  parseScriptArgs,
   planHostedSummaries,
+  resolveTargetDir,
 } from "./reveries-post-merge.mjs";
 
 const workflow = await readFile(new URL("../.github/workflows/reveries-post-merge.yml", import.meta.url), "utf8");
@@ -14,7 +17,7 @@ const a = (...args) => args;
 const NO_NOTE = { stdout: "", stderr: "no note found", exitCode: 1 };
 const PATCH_ID = "0123456789abcdef0123456789abcdef01234567 0000000000000000000000000000000000000000\n";
 
-test("the post-merge workflow trusts the pushed default-branch revision and writes only notes", () => {
+test("the post-merge workflow trusts the pushed default-branch revision and delegates writes to notes", () => {
   assert.match(workflow, /^on:\n  push:\n/m);
   assert.doesNotMatch(workflow, /pull_request/);
   assert.doesNotMatch(workflow, /merge_group/);
@@ -34,13 +37,16 @@ test("the post-merge workflow trusts the pushed default-branch revision and writ
   assert.match(workflow, /fetch-depth: 0/);
   assert.match(workflow, /persist-credentials: false/);
 
+  // Install, build, and synthesis live in the reusable action, which the
+  // caller pins to the protected default-branch revision.
+  assert.match(workflow, /uses: \.\/\.github\/actions\/reveries-post-merge/);
+  assert.doesNotMatch(workflow, /run: npm ci/);
+  assert.doesNotMatch(workflow, /run: npm run build/);
+  assert.doesNotMatch(workflow, /node scripts\/reveries-post-merge\.mjs/);
+
   const checkoutIndex = workflow.indexOf("actions/checkout@");
-  const installIndex = workflow.indexOf("run: npm ci");
-  const buildIndex = workflow.indexOf("run: npm run build");
-  const runIndex = workflow.indexOf("node scripts/reveries-post-merge.mjs");
-  assert.ok(checkoutIndex >= 0 && checkoutIndex < installIndex);
-  assert.ok(installIndex < buildIndex && buildIndex < runIndex);
-  assert.match(workflow, /REVERIES_POST_MERGE_REMOTE/);
+  const actionIndex = workflow.indexOf("./.github/actions/reveries-post-merge");
+  assert.ok(checkoutIndex >= 0 && checkoutIndex < actionIndex);
 });
 
 const out = (text) => ({ stdout: text, stderr: "", exitCode: 0 });
@@ -300,4 +306,24 @@ test("the workflow composes the host attestation and cites the pull request", ()
   ]);
   assert.equal(composed.entries[0].sources[1].relation, "requested-by");
   assert.equal(composed.entries[0].sources[1].kind, "issue");
+});
+
+test("the post-merge script accepts a target directory with an environment fallback", () => {
+  assert.deepEqual(parseScriptArgs([]), { targetDir: null });
+  assert.deepEqual(parseScriptArgs(["--target-dir", "/tmp/adopter"]), { targetDir: "/tmp/adopter" });
+  assert.throws(() => parseScriptArgs(["--target-dir"]), /requires a value/);
+  assert.throws(() => parseScriptArgs(["--unknown-flag"]), /unknown option/);
+
+  const sourceRoot = resolve(new URL(".", import.meta.url).pathname, "..");
+  const previous = process.env.REVERIES_TARGET_DIR;
+  try {
+    delete process.env.REVERIES_TARGET_DIR;
+    assert.equal(resolveTargetDir({ targetDir: null }), sourceRoot);
+    process.env.REVERIES_TARGET_DIR = "/tmp/from-env";
+    assert.equal(resolveTargetDir({ targetDir: null }), resolve("/tmp/from-env"));
+    assert.equal(resolveTargetDir({ targetDir: "relative/flag-wins" }), resolve("relative/flag-wins"));
+  } finally {
+    if (previous === undefined) delete process.env.REVERIES_TARGET_DIR;
+    else process.env.REVERIES_TARGET_DIR = previous;
+  }
 });

@@ -1,0 +1,63 @@
+name: Reveries post-merge summaries
+description: >-
+  Attach session summaries to host-created default-branch commits and publish
+  them through the guarded notes transaction. The synthesis library is built
+  from this action's source revision; pull-request commits are read as Git
+  objects only and never checked out. The caller job must grant
+  contents: write (branch rulesets do not cover refs/notes/reveries), check
+  out the pushed revision with fetch-depth 0 and persist-credentials: false,
+  and serialise runs with a concurrency group per branch
+  (reveries-post-merge-${{ github.ref }}, cancel-in-progress: false); the
+  compare-and-swap lease remains the real guard against concurrent writers.
+
+inputs:
+  target-directory:
+    description: >-
+      Protected default-branch checkout under check (the pushed revision,
+      fetched with fetch-depth 0 and no persisted credentials).
+    default: ${{ github.workspace }}
+  node-version:
+    description: Node.js version used to build the synthesis library.
+    default: "22.20.0"
+  notes-remote:
+    description: Git remote name carrying the authenticated notes push URL.
+    default: reveries-post-merge
+
+runs:
+  using: composite
+  steps:
+    # The action source is this repository at the pinned revision; its root
+    # sits two levels above the action directory. Install and build run
+    # there so synthesis never depends on target-directory code.
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ github.action_path }}/../../package-lock.json
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}/../..
+      run: npm ci
+
+    - name: Build the synthesis library
+      shell: bash
+      working-directory: ${{ github.action_path }}/../..
+      run: npm run build
+
+    - name: Configure the authenticated notes remote
+      shell: bash
+      working-directory: ${{ inputs.target-directory }}
+      env:
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        git remote add "${{ inputs.notes-remote }}" "https://x-access-token:${{ github.token }}@github.com/${REPOSITORY}.git"
+        git remote set-url --push "${{ inputs.notes-remote }}" "https://x-access-token:${{ github.token }}@github.com/${REPOSITORY}.git"
+
+    - name: Synthesize and publish host-created summaries
+      shell: bash
+      env:
+        REVERIES_POST_MERGE_REMOTE: ${{ inputs.notes-remote }}
+      run: node "${{ github.action_path }}/../../scripts/reveries-post-merge.mjs" --target-dir "${{ inputs.target-directory }}"

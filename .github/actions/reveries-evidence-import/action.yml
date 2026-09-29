@@ -1,0 +1,32 @@
+name: Reveries fork evidence import
+description: >-
+  Import a fork's refs/notes/reveries into a read-only manifest artifact
+  without executing fork code. Pair with reveries-receive-check by passing
+  the manifest path as fork-evidence-manifest.
+
+inputs:
+  target-directory:
+    description: Repository checkout the fork notes are fetched into.
+    default: ${{ github.workspace }}
+  output-path:
+    description: Manifest path written by the import script.
+    default: ${{ runner.temp }}/reveries-fork-evidence.json
+  artifact-name:
+    description: Uploaded artifact name. The caller appends the pull-request number.
+    default: reveries-fork-evidence
+
+runs:
+  using: composite
+  steps:
+    - name: Import notes without executing fork code
+      shell: bash
+      env:
+        REVERIES_EVIDENCE_OUTPUT: ${{ inputs.output-path }}
+      run: node "${{ github.action_path }}/../../scripts/import-fork-evidence.mjs" --target-dir "${{ inputs.target-directory }}"
+
+    - name: Publish the evidence manifest
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.output-path }}
+        if-no-files-found: error

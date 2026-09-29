@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { test } from "node:test";
-import { createReceiveProposal, formatFinding, formatReport, parseScriptArgs } from "./github-receive-check.mjs";
+import { createReceiveProposal, formatFinding, formatReport, parseScriptArgs, resolveTargetDir } from "./github-receive-check.mjs";
 
 const workflow = await readFile(new URL("../.github/workflows/reveries-receive-check.yml", import.meta.url), "utf8");
 
@@ -11,7 +12,7 @@ test("the receive check uses a trusted pull_request_target workflow and leaves m
   assert.doesNotMatch(workflow, /^  pull_request:\n/m);
 });
 
-test("the workflow uses read-only permissions and does not execute proposed code", () => {
+test("the workflow uses read-only permissions and delegates to the pinned action", () => {
   const permissions = workflow.match(/^permissions:\n((?:  .+\n)+)/m)?.[1];
   assert.ok(permissions, "workflow permissions are explicit");
   assert.deepEqual(
@@ -25,19 +26,20 @@ test("the workflow uses read-only permissions and does not execute proposed code
   );
   assert.doesNotMatch(workflow, /ref:.*(?:pull_request\.head\.sha|github\.sha)/);
   assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
-  assert.match(workflow, /HEAD_REPOSITORY: \$\{\{ github\.event\.pull_request\.head\.repo\.full_name \}\}/);
-  assert.doesNotMatch(workflow, /checkout.*(?:pull_request\.head\.sha|HEAD_SHA)/);
+  assert.doesNotMatch(workflow, /pull_request\.head\.sha/);
+
+  // Install, build, fetch, and check live in the reusable action, which the
+  // caller pins to its own base revision. The caller only checks out the
+  // trusted base revision and delegates.
+  assert.match(workflow, /uses: \.\/\.github\/actions\/reveries-receive-check/);
+  assert.equal((workflow.match(/uses: actions\/checkout@/g) ?? []).length, 1);
+  assert.doesNotMatch(workflow, /run: npm ci/);
+  assert.doesNotMatch(workflow, /run: npm run build/);
+  assert.doesNotMatch(workflow, /node scripts\/github-receive-check\.mjs/);
 
   const checkoutIndex = workflow.indexOf("Check out the trusted base revision");
-  const installIndex = workflow.indexOf("run: npm ci");
-  const buildIndex = workflow.indexOf("run: npm run build");
-  const fetchIndex = workflow.indexOf("Fetch proposed code and evidence objects");
-  const checkIndex = workflow.indexOf("node scripts/github-receive-check.mjs");
-  assert.ok(checkoutIndex >= 0 && checkoutIndex < installIndex);
-  assert.ok(installIndex < buildIndex && buildIndex < fetchIndex && fetchIndex < checkIndex);
-  assert.equal((workflow.match(/uses: actions\/checkout@/g) ?? []).length, 1);
-  assert.match(workflow, /git fetch --no-tags .*HEAD_SHA.*refs\/reveries\/proposed-head/);
+  const actionIndex = workflow.indexOf("./.github/actions/reveries-receive-check");
+  assert.ok(checkoutIndex >= 0 && checkoutIndex < actionIndex);
 });
 
 function gitFor(values) {
@@ -127,17 +129,43 @@ test("merge-group payloads remain supported by the script proposal adapter", asy
 });
 
 test("script arguments default to a disabled PR-description fallback", () => {
-  assert.deepEqual(parseScriptArgs([]), { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null });
+  assert.deepEqual(parseScriptArgs([]), { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null, targetDir: null });
   assert.deepEqual(parseScriptArgs(["--allow-pr-description-summary"]), {
     allowPrDescriptionSummary: true,
     forkEvidenceManifestPath: null,
+    targetDir: null,
   });
   assert.deepEqual(parseScriptArgs(["--fork-evidence-manifest", "/tmp/evidence.json"]), {
     allowPrDescriptionSummary: false,
     forkEvidenceManifestPath: "/tmp/evidence.json",
+    targetDir: null,
+  });
+  assert.deepEqual(parseScriptArgs(["--target-dir", "/tmp/adopter"]), {
+    allowPrDescriptionSummary: false,
+    forkEvidenceManifestPath: null,
+    targetDir: "/tmp/adopter",
   });
   assert.throws(() => parseScriptArgs(["--unknown-flag"]), /unknown option/);
   assert.throws(() => parseScriptArgs(["--fork-evidence-manifest"]), /requires a value/);
+  assert.throws(() => parseScriptArgs(["--target-dir"]), /requires a value/);
+});
+
+test("the target directory resolves from the flag, the environment, then the script source", () => {
+  const sourceRoot = resolve(new URL(".", import.meta.url).pathname, "..");
+  const previous = process.env.REVERIES_TARGET_DIR;
+  try {
+    delete process.env.REVERIES_TARGET_DIR;
+    assert.equal(resolveTargetDir({ targetDir: null }), sourceRoot);
+    process.env.REVERIES_TARGET_DIR = "/tmp/from-env";
+    assert.equal(resolveTargetDir({ targetDir: null }), resolve("/tmp/from-env"));
+    assert.equal(
+      resolveTargetDir({ targetDir: "relative/flag-wins" }),
+      resolve("relative/flag-wins"),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.REVERIES_TARGET_DIR;
+    else process.env.REVERIES_TARGET_DIR = previous;
+  }
 });
 
 test("the PR-description fallback stays off unless explicitly allowed", async () => {

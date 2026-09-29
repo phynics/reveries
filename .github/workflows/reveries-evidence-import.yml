@@ -18,14 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Import notes without executing fork code
-        env:
-          REVERIES_EVIDENCE_OUTPUT: ${{ runner.temp }}/reveries-fork-evidence.json
-        run: node scripts/import-fork-evidence.mjs
-
-      - name: Publish the evidence manifest
-        uses: actions/upload-artifact@v4
+      - name: Import fork evidence without executing fork code
+        uses: ./.github/actions/reveries-evidence-import
         with:
-          name: reveries-fork-evidence-${{ github.event.pull_request.number }}
-          path: ${{ runner.temp }}/reveries-fork-evidence.json
-          if-no-files-found: error
+          artifact-name: reveries-fork-evidence-${{ github.event.pull_request.number }}

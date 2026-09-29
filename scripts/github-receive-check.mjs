@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-function run(command, args, input = "") {
+function run(command, args, input = "", cwd = workspace) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
     const stdout = [];
     const stderr = [];
     child.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -25,18 +25,41 @@ function run(command, args, input = "") {
   });
 }
 
-async function git(...args) {
-  const result = await run("git", args);
-  if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed`);
-  return result.stdout.trim();
+export function gitIn(cwd) {
+  return async (...args) => {
+    const result = await run("git", args, "", cwd);
+    if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed`);
+    return result.stdout.trim();
+  };
+}
+
+export function resolveTargetDir(options = {}) {
+  // The checker binary stays anchored at this script's source tree (the
+  // action source). Only Git object reads move into the target directory,
+  // so building from a pinned action revision never executes target code.
+  if (typeof options.targetDir === "string" && options.targetDir.length > 0) {
+    return resolve(options.targetDir);
+  }
+  const fromEnv = process.env.REVERIES_TARGET_DIR;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    return resolve(fromEnv);
+  }
+  return workspace;
 }
 
 export function parseScriptArgs(argv) {
-  const options = { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null };
+  const options = { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null, targetDir: null };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--allow-pr-description-summary") {
       options.allowPrDescriptionSummary = true;
+    } else if (token === "--target-dir") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error("--target-dir requires a value");
+      }
+      options.targetDir = value;
+      index += 1;
     } else if (token === "--fork-evidence-manifest") {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith("--")) {
@@ -143,11 +166,12 @@ export function formatReport(output) {
 
 async function main() {
   const options = parseScriptArgs(process.argv.slice(2));
+  const targetGit = gitIn(resolveTargetDir(options));
   const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, "utf8"));
   const forkEvidence = options.forkEvidenceManifestPath === null
     ? null
     : await readForkEvidenceManifest(options.forkEvidenceManifestPath);
-  const proposal = await createReceiveProposal(event, git, {
+  const proposal = await createReceiveProposal(event, targetGit, {
     allowPrDescriptionSummary: options.allowPrDescriptionSummary,
     forkEvidence,
   });
