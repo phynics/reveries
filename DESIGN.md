@@ -1852,12 +1852,84 @@ Checks:
 * initialization boundary;
 * notes divergence;
 * record damage;
-* retention policy, vault coverage, and the annotated subjects a vault misses.
+* retention policy, vault coverage, and the annotated subjects a vault misses;
+* ledger envelope state: absent, valid, stale, or invalid.
 
 A retention gap is a diagnostic, not a notice: an annotated object the vault does not
 keep can be pruned, which would leave the evidence explaining bytes Git no longer has.
 
-### 27.3.1 Retention policy and vault
+The ledger reports four states, and only one of them is damage. `absent` means the
+repository never adopted the ledger. `valid` means the envelope verifies against its own
+manifest, tree, and parents and describes the current notes tip. `stale` means the
+envelope is structurally sound but the local notes ref has moved past it, which is an
+ordinary unpublished state. `invalid` means the envelope contradicts itself, and that
+is a diagnostic.
+
+### 27.3.1 Ledger envelope branch
+
+`refs/heads/reveries-ledger` carries evidence through ordinary branch fetches. A custom
+notes ref is not fetched by a normal clone and is barely represented by hosted branch
+governance, so the envelope makes the notes state reachable without either.
+
+```text
+refs/heads/reveries-ledger
+└── commit  "Reveries ledger checkpoint\n"
+    tree:
+      100644 blob  <manifest.json>
+      040000 tree  <exact notes tree OID>   notes/
+    parents, in this exact order:
+      [0] previous ledger commit      (absent only on a genesis checkpoint)
+      [1] notes commit                (absent only when no notes exist)
+      [2] retention checkpoint        (optional)
+```
+
+The `notes` entry is the existing notes tree grafted at its own object ID. Nothing is
+copied, so the envelope adds no note blobs, and the tree entry stays directly comparable
+to the manifest field that names it. Grafting by object ID is layout-agnostic: Git uses a
+flat notes tree below 256 notes and a fanout tree above.
+
+A checkpoint uses the fixed `Reveries Ledger <ledger@reveries.local>` identity and a fixed
+epoch date, the same construction the retention vault already uses, so a checkpoint
+rebuilt from the same evidence reproduces the same object ID. That is why the manifest
+carries no timestamp of its own: RVR-009 signs these canonical bytes instead.
+
+`manifest.json` is not a note record. It describes the notes boundary rather than living
+inside it, so it does not inherit note placement, union, or fork rules. Its fields are
+the protocol version, both ref names, the notes commit and notes tree, the previous
+ledger, the optional retention checkpoint, the reserved `authority` name, and three
+informational totals recomputed from the grafted tree. `authority` has exactly one
+documented value today, the configured primary remote name; RVR-017 gives it role
+semantics and RVR-009 signs it, so both extend a stable field instead of breaking the
+schema.
+
+Verification fails closed on the three structural classes, and reports the fourth:
+
+| Class | Outcome |
+| --- | --- |
+| manifest | rejects a body that is absent, malformed, noncanonical, or that describes a different envelope |
+| tree | rejects a tree entry beyond `manifest.json` and `notes`, or a `notes` subtree whose OID is not the manifest's `notes_tree` |
+| parent | rejects a parent list that is not exactly `[previous ledger, notes commit, retention checkpoint]` in that order, a dangling parent, or a retention parent that is not a retention checkpoint |
+| notes tip | does not reject: a local `refs/notes/reveries` that has moved past the envelope is reported as `stale`, because unpublished notes are an ordinary state and not damage |
+
+Updates are fast-forward by construction: the previous ledger is always the first
+parent, and the branch moves only through an expected-old-OID compare-and-swap, so a
+non-fast-forward ledger update is impossible rather than merely reported.
+
+Updates are append-only in the strong sense. The check compares per-subject canonical
+line sets between the previous checkpoint and the new one, so appending a line inside one
+note is allowed while removing a line is rejected even when the subject still exists and
+the blob object ID changed. A proposed checkpoint is verified as a loose object before it
+can become the branch tip, so a failed check moves no ref.
+
+Materializing the local notes ref verifies the envelope first and only then moves
+`refs/notes/reveries` to the manifest's notes commit under the same expected-old-OID
+guard. It never runs against an unverified envelope.
+
+`refs/heads/reveries-ledger` lives under `refs/heads` but carries evidence, not code, so
+the outgoing checker excludes it from session-summary and transition coverage while still
+verifying its envelope.
+
+### 27.3.2 Retention policy and vault
 
 `git config reveries.retention <none|active|all|archive>` selects which annotated
 subjects the vault keeps. An unset key means `active`.

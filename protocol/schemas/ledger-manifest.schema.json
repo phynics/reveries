@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reveries.dev/protocol/v1/schemas/ledger-manifest.schema.json",
+  "title": "Reveries V2 ledger envelope manifest (RVR-005)",
+  "description": "The manifest.json a refs/heads/reveries-ledger checkpoint stores. It is not a note record: it describes the notes boundary rather than living inside it. It carries no timestamp so a checkpoint rebuilt from the same evidence reproduces the same object ID; RVR-009 signs these canonical bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "protocol", "ledger_ref", "notes_ref", "notes_commit", "notes_tree", "previous_ledger", "retention_commit", "authority", "annotated_subjects", "records", "note_bytes"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": { "const": "ledger-manifest" },
+    "protocol": { "const": 1 },
+    "ledger_ref": { "const": "refs/heads/reveries-ledger" },
+    "notes_ref": { "const": "refs/notes/reveries" },
+    "notes_commit": {
+      "description": "The exact notes commit transported as a typed parent. Null exactly when notes_tree is null.",
+      "oneOf": [{ "$ref": "#/$defs/objectId" }, { "type": "null" }]
+    },
+    "notes_tree": {
+      "description": "The notes tree OID grafted at the ledger notes entry. The verifier compares it against the real tree entry, which is what detects a graft swap. Null exactly when notes_commit is null.",
+      "oneOf": [{ "$ref": "#/$defs/objectId" }, { "type": "null" }]
+    },
+    "previous_ledger": {
+      "description": "The previous ledger checkpoint; the first parent, which makes every update a fast-forward. Null only on a genesis checkpoint.",
+      "oneOf": [{ "$ref": "#/$defs/objectId" }, { "type": "null" }]
+    },
+    "retention_commit": {
+      "description": "The retention checkpoint this ledger anchors; the optional third parent. Null when no retention vault exists.",
+      "oneOf": [{ "$ref": "#/$defs/objectId" }, { "type": "null" }]
+    },
+    "authority": {
+      "description": "Reserved for RVR-017 authority roles. Exactly one documented value today: the configured primary remote name. Shape-validated as a single trimmed token with no whitespace or control characters; null when none is configured.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!.*\\s)[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "annotated_subjects": { "$ref": "#/$defs/count" },
+    "records": { "$ref": "#/$defs/count" },
+    "note_bytes": { "$ref": "#/$defs/count" }
+  },
+  "$defs": {
+    "objectId": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "count": { "type": "integer", "minimum": 0 }
+  }
+}

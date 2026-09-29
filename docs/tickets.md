@@ -157,7 +157,7 @@ RVR-006 provides the local plumbing path. RVR-007 generalizes immutable facts. R
 **Priority:** P0
 **Feasibility:** Core / V2 plus Adapter
 **Stage:** 3
-**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5)
+**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5). The envelope, manifest contract, and mismatch validation are implemented. Signed checkpoints (RVR-009) and authority acceptance (RVR-017) are still open, so this ticket is not yet complete.
 
 ### Problem
 
@@ -188,6 +188,17 @@ RVR-008 supplies retention. RVR-009 supplies signed checkpoints. RVR-017 defines
 - Manifest, parent, and subtree mismatches are rejected.
 - V1 notes history imports without rewriting.
 - Ledger additions cannot remove existing facts.
+
+### Remaining
+
+- Signed ledger checkpoints over the manifest (RVR-009).
+- Authority role semantics for the reserved `manifest.authority` field (RVR-017).
+- A generated `review/` projection subtree (RVR-019).
+- Receive-side classification of `refs/heads/reveries-ledger` as evidence rather than a
+  code ref. The outgoing checker already excludes it; `receive.ts` `isCodeRef` does not.
+- CLI surfaces: a `reveries ledger` command, a human-readable doctor ledger line, and
+  `sync --pull` wiring for envelope materialization.
+- Publishing the ledger branch alongside the code and notes refs in one atomic push.
 
 ## RVR-006: Add atomic local commit-and-summary creation
 

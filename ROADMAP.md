@@ -81,6 +81,14 @@ Tickets: [RVR-003](https://github.com/phynics/reveries/issues/3),
 [RVR-017](https://github.com/phynics/reveries/issues/17), and
 [RVR-019](https://github.com/phynics/reveries/issues/19).
 
+The protected `reveries-ledger` envelope branch exists. It carries a canonical manifest
+and the exact notes tree grafted at its own object ID, records the notes commit as a
+typed parent, and is validated for manifest, tree, parent, and notes-tip mismatches.
+Updates are fast-forward and append-only by construction. The envelope is **not**
+complete: RVR-009 still has to add signed checkpoints over the manifest, and RVR-017 still
+has to give the reserved `authority` field its role semantics. Nothing here is a
+signed-checkpoint or authority acceptance claim.
+
 ### Stage 4: Define governance boundaries
 
 Set the policy for secrets, redaction, confidential evidence, hosted compatibility, and recovery
@@ -96,7 +104,7 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 | RVR-002 | P0 | [Eliminate unsafe non-atomic publication paths](https://github.com/phynics/reveries/issues/2) | Core / V1 + Boundary |
 | RVR-003 | P0 | [Add receive-side and hosted-merge enforcement](https://github.com/phynics/reveries/issues/3) | Core + Adapter + Boundary |
 | RVR-004 | P0 | [Introduce tree-transition summaries](https://github.com/phynics/reveries/issues/4) | Core / V2 |
-| RVR-005 | P0 | [Introduce a protected ledger envelope branch](https://github.com/phynics/reveries/issues/5) | Core / V2 + Adapter |
+| RVR-005 | P0 | [Introduce a protected ledger envelope branch](https://github.com/phynics/reveries/issues/5) — envelope, manifest, and mismatch validation landed; signed checkpoints and authority acceptance remain in RVR-009 and RVR-017 | Core / V2 + Adapter |
 | RVR-006 | P0 | [Add atomic local commit-and-summary creation](https://github.com/phynics/reveries/issues/6) | Core / V1 |
 | RVR-007 | P1 | [Generalize all evidence into a monotonic immutable fact graph](https://github.com/phynics/reveries/issues/7) | Core / V2 |
 | RVR-008 | P0 | [Preserve annotated objects against garbage collection](https://github.com/phynics/reveries/issues/8) | Core / V1 |

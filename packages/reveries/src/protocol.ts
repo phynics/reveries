@@ -1,4 +1,5 @@
 export const NOTES_REF = "refs/notes/reveries" as const;
+export const LEDGER_REF = "refs/heads/reveries-ledger" as const;
 
 export type Brand<T, Name extends string> = T & { readonly __brand: Name };
 export type ObjectId = Brand<string, "git-object-id">;
@@ -151,6 +152,50 @@ export type ReveriesInit = {
   hosts: string[];
   author_email: string;
   created_at: string;
+};
+
+/**
+ * Ledger envelope manifest (RVR-005). It describes the boundary of one
+ * `refs/heads/reveries-ledger` checkpoint: the exact notes commit and notes
+ * tree it transports, the checkpoint it follows, the optional retention
+ * checkpoint it anchors, and the reserved authority name.
+ *
+ * This is deliberately not a `NoteRecord`. A manifest describes the notes state
+ * rather than living inside it, so it must not inherit note placement, union, or
+ * fork rules. It carries no timestamp so that a checkpoint rebuilt from the same
+ * evidence reproduces the same object ID; RVR-009 signs these canonical bytes.
+ */
+export type LedgerManifest = {
+  v: 1;
+  type: "ledger-manifest";
+  protocol: 1;
+  ledger_ref: typeof LEDGER_REF;
+  notes_ref: typeof NOTES_REF;
+  /** The exact notes commit transported as a typed parent; null when no notes exist. */
+  notes_commit: CommitId | null;
+  /** The notes tree OID grafted at the ledger `notes` entry; null exactly when `notes_commit` is null. */
+  notes_tree: ObjectId | null;
+  /** The previous ledger checkpoint; null only on a genesis checkpoint. */
+  previous_ledger: CommitId | null;
+  /** The retention checkpoint this ledger anchors; null when no vault exists. */
+  retention_commit: CommitId | null;
+  /** Reserved for RVR-017 authority roles: the configured primary remote name, or null. */
+  authority: string | null;
+  /** Informational totals recomputed from the grafted notes tree. */
+  annotated_subjects: number;
+  records: number;
+  note_bytes: number;
+};
+
+export type LedgerManifestInput = {
+  readonly notes_commit: string | null;
+  readonly notes_tree: string | null;
+  readonly previous_ledger: string | null;
+  readonly retention_commit: string | null;
+  readonly authority: string | null;
+  readonly annotated_subjects: number;
+  readonly records: number;
+  readonly note_bytes: number;
 };
 
 export type CorrectionSemantic = {
@@ -382,6 +427,22 @@ const RELATIONS = new Set<SourceRelation>([
 ]);
 const KINDS = new Set<SourceKind>(["commit", "blob", "path", "note", "git-email", "issue"]);
 const HOSTS = new Set(["pi", "claude", "opencode", "codex", "gemini"]);
+/** The exact key set of a canonical ledger manifest; anything else is rejected. */
+const LEDGER_MANIFEST_KEYS = new Set([
+  "v",
+  "type",
+  "protocol",
+  "ledger_ref",
+  "notes_ref",
+  "notes_commit",
+  "notes_tree",
+  "previous_ledger",
+  "retention_commit",
+  "authority",
+  "annotated_subjects",
+  "records",
+  "note_bytes",
+]);
 const EMAIL = /^[^\s@]+@[^\s@]+$/;
 const ISSUE = /^(?:github:[^\s#]+\/[^\s#]+#\d+|gitlab:[^\s#]+\/[^\s#]+#\d+|linear:[A-Z][A-Z0-9]*-\d+|jira:[A-Z][A-Z0-9]*-\d+|generic:[^\s:]+:[^\s:]+)$/;
 
@@ -654,6 +715,212 @@ export function createAttestation(
 
 function sortedUniqueFactHeads(values: readonly FactHeadId[]): FactHeadId[] {
   return [...new Set(values.map((value) => factHeadId(value)))].sort(compareUtf8);
+}
+
+/**
+ * The exact canonical JSON a ledger checkpoint stores as `manifest.json`.
+ * The key order below is the contract; it never depends on object insertion
+ * order in the parsed manifest.
+ */
+function canonicalLedgerManifestValue(manifest: LedgerManifest): Record<string, unknown> {
+  return {
+    v: 1,
+    type: "ledger-manifest",
+    protocol: 1,
+    ledger_ref: LEDGER_REF,
+    notes_ref: NOTES_REF,
+    notes_commit: manifest.notes_commit,
+    notes_tree: manifest.notes_tree,
+    previous_ledger: manifest.previous_ledger,
+    retention_commit: manifest.retention_commit,
+    authority: manifest.authority,
+    annotated_subjects: manifest.annotated_subjects,
+    records: manifest.records,
+    note_bytes: manifest.note_bytes,
+  };
+}
+
+/** Canonical manifest bytes, without the trailing LF that the stored blob carries. */
+export function ledgerManifestPayload(manifest: LedgerManifest): string {
+  return JSON.stringify(canonicalLedgerManifestValue(manifest));
+}
+
+/** Canonical manifest bytes exactly as the ledger tree stores them. */
+export function canonicalLedgerManifest(manifest: LedgerManifest): string {
+  return `${ledgerManifestPayload(manifest)}\n`;
+}
+
+function validateCount(value: unknown, field: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a nonnegative integer`);
+  }
+}
+
+/**
+ * The reserved authority name. Shape only: one trimmed token with no
+ * whitespace or control characters. RVR-017 gives the field role semantics;
+ * this check keeps it a single well-formed token until then.
+ */
+function validateAuthority(value: unknown, limits: Readonly<ResourceLimits>): void {
+  if (value === null) return;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error("authority must be a nonempty string or null");
+  }
+  const authority = value;
+  checkChars(authority, limits.maxRefChars, "maxRefChars", "authority");
+  if (authority !== authority.trim()) throw new Error("authority must not have surrounding whitespace");
+  if (/\s/.test(authority)) throw new Error("authority must be a single token without whitespace");
+  if (/[\u0000-\u001f\u007f]/.test(authority)) throw new Error("authority must not contain control characters");
+}
+
+/** Wrap a branded-ID constructor so the manifest field name reaches the diagnostic. */
+function identifiedField(
+  value: unknown,
+  field: string,
+  narrow: (candidate: string) => unknown,
+): void {
+  const candidate = typeof value === "string" ? value : String(value);
+  try {
+    narrow(candidate);
+  } catch (error: unknown) {
+    throw new Error(`${field}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function validateLedgerManifest(
+  manifest: LedgerManifest,
+  limits: Partial<ResourceLimits> = {},
+): LedgerManifest {
+  const resolved = resolveLimits(limits);
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error("ledger manifest must be a JSON object");
+  }
+  const value = manifest as unknown as Record<string, unknown>;
+  if (value.type !== "ledger-manifest") throw new Error("type must be ledger-manifest");
+  if (value.v !== 1) throw new Error("v must be exactly 1");
+  if (value.protocol !== 1) throw new Error("protocol must be exactly 1");
+  for (const key of Object.keys(value)) {
+    if (!LEDGER_MANIFEST_KEYS.has(key)) throw new Error(`unknown ledger manifest field: ${key}`);
+  }
+  for (const key of LEDGER_MANIFEST_KEYS) {
+    if (!(key in value)) throw new Error(`ledger manifest is missing ${key}`);
+  }
+  if (value.ledger_ref !== LEDGER_REF) throw new Error(`ledger_ref must be ${LEDGER_REF}`);
+  if (value.notes_ref !== NOTES_REF) throw new Error(`notes_ref must be ${NOTES_REF}`);
+
+  const commit = (field: string): void => identifiedField(value[field], field, commitId);
+  const anyObject = (field: string): void => identifiedField(value[field], field, objectId);
+  if (value.notes_commit !== null) commit("notes_commit");
+  if (value.notes_tree !== null) anyObject("notes_tree");
+  // A notes commit names the exact notes tree that travels with it, so the two
+  // are present or absent together. A manifest that claims a notes tree without
+  // a notes commit would let a grafted subtree claim an authority it has none of.
+  if ((value.notes_commit === null) !== (value.notes_tree === null)) {
+    throw new Error("notes_commit and notes_tree must both be present or both be null");
+  }
+  if (value.previous_ledger !== null) commit("previous_ledger");
+  if (value.retention_commit !== null) commit("retention_commit");
+  if (value.previous_ledger !== null && value.previous_ledger === value.retention_commit) {
+    throw new Error("previous_ledger and retention_commit must be distinct parents");
+  }
+  validateAuthority(value.authority, resolved);
+  validateCount(value.annotated_subjects, "annotated_subjects");
+  validateCount(value.records, "records");
+  validateCount(value.note_bytes, "note_bytes");
+  return manifest;
+}
+
+export function createLedgerManifest(input: LedgerManifestInput, limits: Partial<ResourceLimits> = {}): LedgerManifest {
+  // The brands are asserted here and actually narrowed by `validateLedgerManifest`,
+  // so a malformed identifier is reported with its manifest field name instead of a
+  // bare "Invalid Git object ID".
+  const manifest: LedgerManifest = {
+    v: 1,
+    type: "ledger-manifest",
+    protocol: 1,
+    ledger_ref: LEDGER_REF,
+    notes_ref: NOTES_REF,
+    notes_commit: input.notes_commit as CommitId | null,
+    notes_tree: input.notes_tree as ObjectId | null,
+    previous_ledger: input.previous_ledger as CommitId | null,
+    retention_commit: input.retention_commit as CommitId | null,
+    authority: input.authority,
+    annotated_subjects: input.annotated_subjects,
+    records: input.records,
+    note_bytes: input.note_bytes,
+  };
+  const resolved = resolveLimits(limits);
+  validateLedgerManifest(manifest, resolved);
+  assertNoteSize(utf8Length(canonicalLedgerManifest(manifest)), resolved);
+  return manifest;
+}
+
+function asLedgerManifest(value: unknown): LedgerManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("ledger manifest must be a JSON object");
+  }
+  return value as LedgerManifest;
+}
+
+export type ParsedLedgerManifest = {
+  /** The validated manifest, or null when the bytes could not be trusted. */
+  readonly manifest: LedgerManifest | null;
+  readonly diagnostics: Diagnostic[];
+};
+
+/**
+ * Parse a stored `manifest.json`. `strict` requires the exact canonical bytes,
+ * so a reordered, reformatted, or extended body is rejected rather than
+ * silently accepted; `tolerant` reports the problem and returns no manifest.
+ */
+export function parseLedgerManifest(
+  text: string,
+  mode: "strict" | "tolerant",
+  options: ValidateOptions = {},
+): ParsedLedgerManifest {
+  const limits = resolveLimits(options.limits);
+  const diagnostics: Diagnostic[] = [];
+  const fail = (message: string): ParsedLedgerManifest => {
+    if (mode === "strict") throw new Error(message);
+    if (diagnostics.length < limits.maxDiagnostics) diagnostics.push({ message });
+    return { manifest: null, diagnostics };
+  };
+  if (text.length === 0) return fail("manifest is empty");
+  if (!text.endsWith("\n")) return fail("manifest must end with one LF");
+  if (text.includes("\r")) return fail("manifest must not contain CR");
+  try {
+    assertNoteSize(utf8Length(text), limits);
+    // A manifest is one record-sized document, so it answers to the per-record
+    // budget as well as the whole-note budget.
+    const bytes = utf8Length(text);
+    if (bytes > limits.maxRecordBytes) {
+      throw new LimitExceededError("maxRecordBytes", bytes, limits.maxRecordBytes, "ledger manifest");
+    }
+  } catch (error: unknown) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  const body = text.slice(0, -1);
+  let manifest: LedgerManifest;
+  try {
+    manifest = asLedgerManifest(JSON.parse(body));
+    validateLedgerManifest(manifest, limits);
+  } catch (error: unknown) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  // Canonical bytes are the storage contract: a manifest that parses but was
+  // written with different key order or spacing is not the manifest this
+  // protocol publishes, so it is reported rather than normalized on read.
+  if (ledgerManifestPayload(manifest) !== body) return fail("manifest is not canonical JSON");
+  return { manifest, diagnostics };
+}
+
+/** Parse a stored manifest and fail closed on any structural problem. */
+export function readLedgerManifest(
+  text: string,
+  options: ValidateOptions = {},
+): LedgerManifest {
+  const parsed = parseLedgerManifest(text, "strict", options);
+  return parsed.manifest as LedgerManifest;
 }
 
 function normalizeCorrectionSemantic(input: CorrectionSemantic): CorrectionSemantic {

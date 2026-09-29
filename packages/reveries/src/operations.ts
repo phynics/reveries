@@ -6,17 +6,21 @@ import {
   correctionPayload,
   createAttestation,
   createCorrection,
+  createLedgerManifest,
   createRedaction,
   createResolution,
   createReverie,
   createTransition,
   createEvidenceSnapshot,
   factGraphDiagnostics,
+  LEDGER_REF,
   NOTES_REF,
   objectId,
+  parseLedgerManifest,
   parseNote,
   projectActiveReveries,
   projectFactGraph,
+  readLedgerManifest,
   redactionPayload,
   recordFactId,
   resolutionPayload,
@@ -35,6 +39,7 @@ import {
   type EvidenceSnapshot,
   type FactGraphProjection,
   type FactTargetId,
+  type LedgerManifest,
   type NoteRecord,
   type ObjectId,
   type PublicationAttestation,
@@ -64,6 +69,8 @@ import {
   GitRepository,
   cloneEvidenceGrade,
   hashBlobContent,
+  LEDGER_MANIFEST_PATH,
+  LEDGER_NOTES_PATH,
   RETENTION_COMMITS_REF,
   RETENTION_OBJECTS_REF,
   SnapshotIndexCorruptError,
@@ -175,6 +182,45 @@ export interface DoctorResult extends CheckResult {
   readonly notices: readonly string[];
   readonly protection: DoctorProtection;
   readonly retention: RetentionStatus;
+  /**
+   * The ledger envelope state. `stale` means the envelope is valid but the
+   * local notes ref has moved past it, which is an ordinary unpublished state
+   * and never damage; only `invalid` is a diagnostic.
+   */
+  readonly ledger: LedgerStatus;
+}
+
+/**
+ * How the ledger envelope relates to local state. The four states are
+ * deliberately distinct so a healthy repository that simply has not published
+ * its newest notes is never reported as damaged.
+ */
+export type LedgerState = "absent" | "valid" | "stale" | "invalid";
+
+export interface LedgerStatus {
+  readonly state: LedgerState;
+  /** The ledger branch tip, or null when no checkpoint exists. */
+  readonly tip: ObjectId | null;
+  /** The notes commit the verified envelope transports. */
+  readonly notesCommit: ObjectId | null;
+  /** The current local notes tip, which may lead the envelope. */
+  readonly notesTip: ObjectId | null;
+  readonly previousLedger: ObjectId | null;
+  readonly retentionCommit: ObjectId | null;
+  readonly annotatedSubjects: number;
+  readonly diagnostics: readonly string[];
+}
+
+export interface LedgerCheckpointResult extends CheckResult {
+  readonly state: "created" | "unchanged" | "refused";
+  readonly checkpoint: ObjectId | null;
+  readonly previousLedger: ObjectId | null;
+  readonly notesTip: ObjectId | null;
+}
+
+export interface LedgerMaterializeResult extends CheckResult {
+  readonly state: "materialized" | "unchanged";
+  readonly notesTip: ObjectId | null;
 }
 
 export interface DoctorProtection {
@@ -1461,7 +1507,13 @@ export class Reveries {
     }
     const diagnostics: string[] = [];
     const notesUpdate = updates.find((update) => update.remoteRef === NOTES_REF);
-    const branchUpdates = updates.filter((update) => update.localRef.startsWith("refs/heads/") && update.localObject !== null);
+    const ledgerUpdate = updates.find((update) => update.remoteRef === LEDGER_REF);
+    // The ledger branch lives under refs/heads but carries evidence, not code,
+    // so it must not be held to session-summary and transition coverage.
+    const branchUpdates = updates.filter((update) =>
+      update.localRef.startsWith("refs/heads/")
+      && update.localRef !== LEDGER_REF
+      && update.localObject !== null);
     if (branchUpdates.length > 0 && notesUpdate === undefined) {
       diagnostics.push("The push publishes a branch without refs/notes/reveries");
     }
@@ -1479,6 +1531,10 @@ export class Reveries {
         update.remoteObject,
         update.remoteRef,
       ));
+    }
+    if (ledgerUpdate !== undefined && ledgerUpdate.localObject !== null) {
+      const verification = await this.verifyLedgerEnvelope(ledgerUpdate.localObject);
+      diagnostics.push(...verification.diagnostics);
     }
     try {
       await this.validateNotesRef(NOTES_REF);
@@ -2280,6 +2336,350 @@ export class Reveries {
     return { ...(await this.retentionStatus(policy)), changed: true };
   }
 
+  // ---------------------------------------------------------------------------
+  // Ledger envelope (RVR-005)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Verify a ledger checkpoint against its own manifest, tree, and parents.
+   * Fails closed: any structural disagreement is a diagnostic, never a warning.
+   * A notes tip that merely leads the envelope is staleness, reported by
+   * `ledgerStatus`, not a verification failure.
+   */
+  async verifyLedgerEnvelope(revision?: string): Promise<CheckResult> {
+    const diagnostics: string[] = [];
+    const checkpoint = revision === undefined ? await this.repository.ledgerTip() : await this.repository.resolveCommit(revision);
+    if (checkpoint === null) return { ok: false, diagnostics: ["The Reveries ledger branch does not exist"] };
+    if (!(await this.repository.isLedgerCheckpoint(checkpoint))) {
+      return { ok: false, diagnostics: [`${checkpoint} is not a Reveries ledger checkpoint`] };
+    }
+
+    // The envelope may carry only the manifest and the grafted notes subtree.
+    // `review/` belongs to RVR-019 and is rejected until that contract is agreed.
+    const entries = await this.repository.ledgerTreeEntries(checkpoint);
+    const allowed = new Set([LEDGER_MANIFEST_PATH, LEDGER_NOTES_PATH]);
+    for (const entry of entries) {
+      if (!allowed.has(entry.path)) diagnostics.push(`Ledger tree entry ${entry.path} is not part of the ledger envelope`);
+    }
+
+    let manifest: LedgerManifest | null = null;
+    const stored = await this.repository.readLedgerManifestAt(checkpoint);
+    if (stored === null) {
+      diagnostics.push("Ledger checkpoint has no manifest.json");
+    } else {
+      const parsed = parseLedgerManifest(stored, "tolerant");
+      manifest = parsed.manifest;
+      for (const diagnostic of parsed.diagnostics) diagnostics.push(`Ledger manifest: ${diagnostic.message}`);
+    }
+
+    if (manifest === null) return { ok: false, diagnostics };
+
+    // Parent roles are positional and validated, never inferred: the manifest
+    // names the previous ledger, the notes commit, and the optional retention
+    // checkpoint, and the commit must carry exactly those parents in that order.
+    const parents = await this.repository.ledgerParents(checkpoint);
+    const expected: readonly ObjectId[] = [
+      manifest.previous_ledger,
+      manifest.notes_commit,
+      manifest.retention_commit,
+    ].filter((parent): parent is CommitId => parent !== null);
+    if (parents.length !== expected.length || parents.some((parent, index) => parent !== expected[index])) {
+      diagnostics.push(
+        `Ledger parents [${parents.join(", ") || "none"}] do not match the manifest `
+        + `[previous_ledger ${manifest.previous_ledger ?? "null"}, notes_commit ${manifest.notes_commit ?? "null"}, `
+        + `retention_commit ${manifest.retention_commit ?? "null"}]`,
+      );
+    }
+
+    // The grafted subtree must be the exact notes tree the manifest claims, and
+    // that tree must belong to the notes commit the manifest claims. Comparing
+    // both directions is what detects a graft swap.
+    let notesTree: ObjectId | null = null;
+    try {
+      notesTree = await this.repository.notesTreeAt(checkpoint);
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    if (notesTree !== null && manifest.notes_tree !== null && notesTree !== manifest.notes_tree) {
+      diagnostics.push(`Ledger notes subtree ${notesTree} does not match manifest notes_tree ${manifest.notes_tree}`);
+    }
+    if (manifest.notes_commit !== null) {
+      if (await this.repository.objectType(manifest.notes_commit) !== "commit") {
+        diagnostics.push(`Ledger manifest notes_commit ${manifest.notes_commit} is not available as a commit`);
+      } else if (notesTree !== null && (await this.repository.treeForCommit(manifest.notes_commit)) !== notesTree) {
+        diagnostics.push(`Ledger notes commit ${manifest.notes_commit} does not carry the grafted notes tree ${notesTree}`);
+      }
+    }
+
+    if (manifest.retention_commit !== null
+      && !(await this.repository.isRetentionCheckpoint(manifest.retention_commit))) {
+      diagnostics.push(`Ledger retention_commit ${manifest.retention_commit} is not a retention checkpoint`);
+    }
+
+    // Append-only: every canonical line the previous checkpoint carried must
+    // still be present. Comparing per-subject line sets is stronger than tree
+    // monotonicity, because a modified note blob can still lose a line.
+    if (manifest.previous_ledger !== null && notesTree !== null) {
+      const previous = await this.repository.isLedgerCheckpoint(manifest.previous_ledger)
+        ? await this.repository.ledgerNotesLines(manifest.previous_ledger)
+        : new Map<ObjectId, readonly string[]>();
+      const current = await this.repository.ledgerNotesLines(checkpoint);
+      for (const [subject, lines] of previous) {
+        const now = new Set(current.get(subject) ?? []);
+        for (const line of lines) {
+          if (!now.has(line)) {
+            diagnostics.push(`Ledger update removes canonical line from ${subject}, which is not append-only`);
+            break;
+          }
+        }
+      }
+    }
+
+    if (notesTree !== null) {
+      const totals = Reveries.summarizeNoteLines(await this.repository.ledgerNotesLines(checkpoint));
+      if (manifest.annotated_subjects !== totals.subjects) {
+        diagnostics.push(`Ledger manifest annotated_subjects ${manifest.annotated_subjects} does not match ${totals.subjects}`);
+      }
+      if (manifest.records !== totals.records) {
+        diagnostics.push(`Ledger manifest records ${manifest.records} does not match ${totals.records}`);
+      }
+      if (manifest.note_bytes !== totals.noteBytes) {
+        diagnostics.push(`Ledger manifest note_bytes ${manifest.note_bytes} does not match ${totals.noteBytes}`);
+      }
+    }
+
+    return { ok: diagnostics.length === 0, diagnostics };
+  }
+
+  /** Informational totals recomputed from a set of per-subject canonical lines. */
+  private static summarizeNoteLines(lines: ReadonlyMap<ObjectId, readonly string[]>): {
+    readonly subjects: number;
+    readonly records: number;
+    readonly noteBytes: number;
+  } {
+    let records = 0;
+    let noteBytes = 0;
+    for (const body of lines.values()) {
+      records += body.length;
+      noteBytes += [...body].reduce((total, line) => total + Buffer.byteLength(`${line}\n`, "utf8"), 0);
+    }
+    return { subjects: lines.size, records, noteBytes };
+  }
+
+  /** The canonical lines the local notes ref currently holds, keyed by subject. */
+  private async canonicalNotesLines(notesTip: ObjectId): Promise<Map<ObjectId, readonly string[]>> {
+    const lines = new Map<ObjectId, readonly string[]>();
+    for (const entry of await this.repository.listNotes()) {
+      const body = await this.repository.readNoteAt(notesTip, entry.object);
+      if (body === null) continue;
+      lines.set(entry.object, body.split("\n").filter((line) => line.length > 0));
+    }
+    return lines;
+  }
+
+  /**
+   * Advance the ledger envelope. The new checkpoint's first parent is the
+   * current ledger tip, so every update is a fast-forward, and the notes it
+   * carries may only add canonical lines. Nothing moves when either check fails.
+   */
+  async buildLedgerCheckpoint(input: {
+    readonly authority?: string | null;
+    /** The ledger tip this update expects to follow; defaults to the current tip. */
+    readonly expectedLedger?: ObjectId | null;
+    readonly retentionCommit?: ObjectId | null;
+  }): Promise<LedgerCheckpointResult> {
+    const expectedLedger = input.expectedLedger !== undefined ? input.expectedLedger : await this.repository.ledgerTip();
+    const notesTip = await this.repository.notesTip();
+    const notesTree = notesTip === null ? null : await this.repository.treeForCommit(notesTip);
+    const retentionCommit = input.retentionCommit !== undefined
+      ? input.retentionCommit
+      : (await this.repository.retentionCommits()).tip;
+    let totals = { subjects: 0, records: 0, noteBytes: 0 };
+    if (notesTip !== null) {
+      // The totals come from the canonical notes ref rather than from the ledger
+      // being built, so a manifest never describes itself.
+      totals = Reveries.summarizeNoteLines(await this.canonicalNotesLines(notesTip));
+    }
+
+    let manifest: LedgerManifest;
+    try {
+      manifest = createLedgerManifest({
+        notes_commit: notesTip,
+        notes_tree: notesTree,
+        previous_ledger: expectedLedger,
+        retention_commit: retentionCommit,
+        authority: input.authority ?? null,
+        annotated_subjects: totals.subjects,
+        records: totals.records,
+        note_bytes: totals.noteBytes,
+      });
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        diagnostics: [error instanceof Error ? error.message : String(error)],
+        state: "refused",
+        checkpoint: null,
+        previousLedger: expectedLedger,
+        notesTip,
+      };
+    }
+
+    const checkpoint = await this.repository.commitLedgerCheckpoint({ manifest });
+    if (checkpoint === await this.repository.ledgerTip()) {
+      return {
+        ok: true,
+        diagnostics: [],
+        state: "unchanged",
+        checkpoint,
+        previousLedger: expectedLedger,
+        notesTip,
+      };
+    }
+
+    // A proposed checkpoint is verified on its own object before it can become
+    // the branch tip, so an append-only or structural failure never publishes.
+    const verification = await this.verifyLedgerEnvelope(checkpoint);
+    if (!verification.ok) {
+      return {
+        ok: false,
+        diagnostics: verification.diagnostics,
+        state: "refused",
+        checkpoint: null,
+        previousLedger: expectedLedger,
+        notesTip,
+      };
+    }
+    try {
+      await this.repository.updateLedgerRef({ next: checkpoint, expected: expectedLedger });
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        diagnostics: [error instanceof Error ? error.message : String(error)],
+        state: "refused",
+        checkpoint: null,
+        previousLedger: expectedLedger,
+        notesTip,
+      };
+    }
+    return {
+      ok: true,
+      diagnostics: [],
+      state: "created",
+      checkpoint,
+      previousLedger: expectedLedger,
+      notesTip,
+    };
+  }
+
+  /**
+   * Verify the ledger envelope, then move the local notes ref to the notes
+   * commit the envelope transports. The ref move is guarded by an
+   * expected-old-OID compare-and-swap, so it never overwrites a tip the caller
+   * did not expect and never runs against an unverified envelope.
+   */
+  async materializeNotesFromLedger(input: {
+    /** The local notes tip this call expects to replace; null when absent. */
+    readonly expectedNotes: ObjectId | null;
+    /**
+     * The envelope to materialize. Defaults to the local ledger branch tip; a
+     * fresh clone passes its remote-tracking ref, because that is the only
+     * place an ordinary branch fetch leaves the envelope.
+     */
+    readonly revision?: string;
+  }): Promise<LedgerMaterializeResult> {
+    const { revision } = input;
+    const verification = await this.verifyLedgerEnvelope(revision);
+    if (!verification.ok) {
+      return { ok: false, diagnostics: verification.diagnostics, state: "unchanged", notesTip: await this.repository.notesTip() };
+    }
+    const checkpoint = revision === undefined ? await this.repository.ledgerTip() : await this.repository.resolveCommit(revision);
+    const manifest = checkpoint === null
+      ? null
+      : readLedgerManifest((await this.repository.readLedgerManifestAt(checkpoint)) as string);
+    if (manifest === null || manifest.notes_commit === null) {
+      return {
+        ok: false,
+        diagnostics: ["The verified ledger envelope transports no notes commit"],
+        state: "unchanged",
+        notesTip: await this.repository.notesTip(),
+      };
+    }
+    const current = await this.repository.notesTip();
+    if (current === manifest.notes_commit) {
+      return { ok: true, diagnostics: [], state: "unchanged", notesTip: current };
+    }
+    const format = await this.repository.objectFormat();
+    const absent = "0".repeat(format === "sha1" ? 40 : 64);
+    const moved = await this.repository.run(
+      ["update-ref", NOTES_REF, manifest.notes_commit, input.expectedNotes ?? absent],
+      { allowExitCodes: [0, 1, 128] },
+    );
+    if (moved.exitCode !== 0) {
+      return {
+        ok: false,
+        diagnostics: [`The local ${NOTES_REF} ref changed while materializing the ledger envelope`],
+        state: "unchanged",
+        notesTip: await this.repository.notesTip(),
+      };
+    }
+    return { ok: true, diagnostics: [], state: "materialized", notesTip: manifest.notes_commit };
+  }
+
+  /** Report how the ledger envelope relates to local notes state. */
+  async ledgerStatus(): Promise<LedgerStatus> {
+    const notesTip = await this.repository.notesTip();
+    const tip = await this.repository.ledgerTip();
+    if (tip === null) {
+      return {
+        state: "absent",
+        tip: null,
+        notesCommit: null,
+        notesTip,
+        previousLedger: null,
+        retentionCommit: null,
+        annotatedSubjects: 0,
+        diagnostics: [],
+      };
+    }
+    const stored = await this.repository.readLedgerManifestAt(tip);
+    let manifest: LedgerManifest | null = null;
+    const diagnostics: string[] = [];
+    if (stored === null) {
+      diagnostics.push("Ledger checkpoint has no manifest.json");
+    } else {
+      const parsed = parseLedgerManifest(stored, "tolerant");
+      manifest = parsed.manifest;
+      for (const diagnostic of parsed.diagnostics) diagnostics.push(`Ledger manifest: ${diagnostic.message}`);
+    }
+    const verification = manifest === null ? { ok: false, diagnostics } : await this.verifyLedgerEnvelope(tip);
+    const annotatedSubjects = manifest?.annotated_subjects ?? 0;
+    if (!verification.ok) {
+      return {
+        state: "invalid",
+        tip,
+        notesCommit: manifest?.notes_commit ?? null,
+        notesTip,
+        previousLedger: manifest?.previous_ledger ?? null,
+        retentionCommit: manifest?.retention_commit ?? null,
+        annotatedSubjects,
+        diagnostics: [...diagnostics, ...verification.diagnostics],
+      };
+    }
+    // A structurally valid envelope that no longer describes the local notes
+    // ref is stale. That is an ordinary unpublished state, not damage.
+    const state: LedgerState = notesTip !== manifest?.notes_commit ? "stale" : "valid";
+    return {
+      state,
+      tip,
+      notesCommit: manifest?.notes_commit ?? null,
+      notesTip,
+      previousLedger: manifest?.previous_ledger ?? null,
+      retentionCommit: manifest?.retention_commit ?? null,
+      annotatedSubjects,
+      diagnostics: [],
+    };
+  }
+
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
     const notices: string[] = [];
@@ -2458,6 +2858,25 @@ export class Reveries {
             : "partial",
       receiveSide: "unknown",
     };
+    let ledger: LedgerStatus = {
+      state: "absent",
+      tip: null,
+      notesCommit: null,
+      notesTip: null,
+      previousLedger: null,
+      retentionCommit: null,
+      annotatedSubjects: 0,
+      diagnostics: [],
+    };
+    try {
+      ledger = await this.ledgerStatus();
+      // Only a structurally invalid envelope is damage. `absent` means the
+      // repository never adopted the ledger, and `stale` means it simply has
+      // not been rebuilt over the newest notes; both are notices.
+      if (ledger.state === "invalid") diagnostics.push(...ledger.diagnostics);
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
     notices.push(
       `Protection: helper ${protection.helper}; local ${protection.local}; receive-side ${protection.receiveSide}. `
       + "Local hooks are not a security boundary and may be bypassed with --no-verify.",
@@ -2466,12 +2885,17 @@ export class Reveries {
       `Retention: policy ${retention.policy}; ${retention.state}; `
       + `${retention.retained.length} of ${retention.expected.length} annotated subject(s) kept.`,
     );
+    notices.push(
+      `Ledger: ${ledger.state}; tip ${ledger.tip ?? "none"}; `
+      + `${ledger.annotatedSubjects} annotated subject(s) transported.`,
+    );
     return {
       ok: diagnostics.length === 0,
       diagnostics,
       notices,
       protection,
       retention,
+      ledger,
       state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
     };
   }

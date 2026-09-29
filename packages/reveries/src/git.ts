@@ -6,16 +6,23 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   assertNoteSize,
   blobId,
+  canonicalLedgerManifest,
   commitId,
   objectId,
   type BlobId,
   type CommitId,
+  type LedgerManifest,
   type ObjectId,
   type ResourceLimits,
 } from "./protocol.ts";
 
 export const NOTES_REF = "refs/notes/reveries";
 export const LEDGER_REF = "refs/heads/reveries-ledger";
+/** The fixed commit message that identifies a ledger checkpoint (RVR-005). */
+export const LEDGER_MESSAGE = "Reveries ledger checkpoint\n";
+/** The only tree entries a ledger checkpoint envelope may carry. */
+export const LEDGER_MANIFEST_PATH = "manifest.json";
+export const LEDGER_NOTES_PATH = "notes";
 export const RETENTION_OBJECTS_REF = "refs/reveries/retention/objects";
 export const RETENTION_COMMITS_REF = "refs/reveries/retention/commits";
 export const RETENTION_BUNDLE_REFS = [
@@ -70,6 +77,20 @@ const RETENTION_IDENTITY = {
   GIT_AUTHOR_DATE: "@0 +0000",
   GIT_COMMITTER_NAME: "Reveries Retention",
   GIT_COMMITTER_EMAIL: "retention@reveries.local",
+  GIT_COMMITTER_DATE: "@0 +0000",
+} as const;
+
+/**
+ * A ledger checkpoint uses the same fixed identity and fixed epoch date as a
+ * retention checkpoint, so a checkpoint rebuilt from the same evidence
+ * reproduces the same object ID.
+ */
+const LEDGER_IDENTITY = {
+  GIT_AUTHOR_NAME: "Reveries Ledger",
+  GIT_AUTHOR_EMAIL: "ledger@reveries.local",
+  GIT_AUTHOR_DATE: "@0 +0000",
+  GIT_COMMITTER_NAME: "Reveries Ledger",
+  GIT_COMMITTER_EMAIL: "ledger@reveries.local",
   GIT_COMMITTER_DATE: "@0 +0000",
 } as const;
 
@@ -189,6 +210,14 @@ export type TreeEntry =
 
 export const RETENTION_MESSAGE = "Reveries retention checkpoint\n";
 
+/** One immediate entry of a ledger checkpoint tree. */
+export type LedgerTreeEntry = {
+  readonly path: string;
+  readonly object: ObjectId;
+  readonly mode: string;
+  readonly kind: string;
+};
+
 export interface RetentionSubject {
   readonly object: ObjectId;
   readonly type: "blob" | "tree" | "commit" | "tag";
@@ -234,6 +263,28 @@ function compareUtf8(left: string, right: string): number {
 
 function isObjectId(value: string): value is ObjectId {
   return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
+}
+
+/**
+ * The annotated subject a Git notes tree path names. Git uses a flat `<oid>`
+ * path below 256 notes and a fanout `<oid[0:2]>/<oid[2:]>` path above, so both
+ * shapes are accepted and the fanout prefix is rejoined.
+ */
+function notesSubjectFromPath(path: string): ObjectId {
+  const separator = path.indexOf("/");
+  if (separator < 0) {
+    if (!/^[0-9a-f]+$/.test(path) || (path.length !== 40 && path.length !== 64)) {
+      throw new Error(`Malformed Git notes tree path: ${path}`);
+    }
+    return objectId(path);
+  }
+  const prefix = path.slice(0, separator);
+  const suffix = path.slice(separator + 1);
+  if (separator !== 2 || !/^[0-9a-f]{2}$/.test(prefix) || !/^[0-9a-f]+$/.test(suffix)
+    || (suffix.length !== 38 && suffix.length !== 62)) {
+    throw new Error(`Malformed Git notes tree path: ${path}`);
+  }
+  return objectId(`${prefix}${suffix}`);
 }
 
 function parseObjectId(value: string, context: string): ObjectId {
@@ -335,6 +386,12 @@ export class GitRepository {
 
   async hashObject(input: string): Promise<ObjectId> {
     const result = await this.run(["hash-object", "--stdin"], { input });
+    return parseObjectId(result.stdout, "git hash-object");
+  }
+
+  /** Hash text into a blob and store it, so a tree can reference it. */
+  async writeBlob(input: string): Promise<ObjectId> {
+    const result = await this.run(["hash-object", "-w", "--stdin"], { input });
     return parseObjectId(result.stdout, "git hash-object");
   }
 
@@ -765,19 +822,7 @@ export class GitRepository {
   async listNotesAt(revision: ObjectId): Promise<readonly NoteListEntry[]> {
     return (await this.listTree(revision))
       .filter((entry) => entry.type === "blob")
-      .map((entry) => {
-        const separator = entry.path.indexOf("/");
-        if (separator < 0 && (entry.path.length === 40 || entry.path.length === 64) && /^[0-9a-f]+$/.test(entry.path)) {
-          return { note: entry.object, object: objectId(entry.path) };
-        }
-        const prefix = entry.path.slice(0, separator);
-        const suffix = entry.path.slice(separator + 1);
-        if (separator !== 2 || !/^[0-9a-f]{2}$/.test(prefix) || !/^[0-9a-f]+$/.test(suffix)
-          || (suffix.length !== 38 && suffix.length !== 62)) {
-          throw new Error(`Malformed Git notes tree path: ${entry.path}`);
-        }
-        return { note: entry.object, object: objectId(`${prefix}${suffix}`) };
-      });
+      .map((entry) => ({ note: entry.object, object: notesSubjectFromPath(entry.path) }));
   }
 
   async listTree(revision = "HEAD"): Promise<readonly TreeEntry[]> {
@@ -1085,6 +1130,180 @@ export class GitRepository {
     await this.run(["update-ref", "--stdin"], { input: transaction });
   }
 
+  // ---------------------------------------------------------------------------
+  // Ledger envelope (RVR-005)
+  // ---------------------------------------------------------------------------
+
+  async ledgerTip(): Promise<ObjectId | null> {
+    return this.notesTip(LEDGER_REF);
+  }
+
+  /** The OID of a path inside a tree, or null when the path is absent. */
+  async treeEntryAt(tree: ObjectId, path: string): Promise<ObjectId | null> {
+    const result = await this.run(["rev-parse", "--verify", `${tree}:${path}`], { allowExitCodes: [0, 1, 128] });
+    return result.exitCode === 0 ? parseObjectId(result.stdout.trim(), `git rev-parse ${tree}:${path}`) : null;
+  }
+
+  /** The immediate entries of a ledger checkpoint tree. */
+  async ledgerTreeEntries(checkpoint: ObjectId): Promise<readonly LedgerTreeEntry[]> {
+    const tree = await this.treeForCommit(checkpoint);
+    const result = await this.run(["ls-tree", "-z", tree]);
+    return result.stdout.split("\0").filter((record) => record.length > 0).map((record) => {
+      const separator = record.indexOf("\t");
+      if (separator < 0) throw new Error("Malformed git ls-tree record");
+      const [mode, type, objectValue] = record.slice(0, separator).split(" ");
+      if (mode === undefined || type === undefined || objectValue === undefined) {
+        throw new Error("Malformed git ls-tree metadata");
+      }
+      return {
+        path: record.slice(separator + 1),
+        object: parseObjectId(objectValue, "git ls-tree"),
+        mode,
+        kind: type,
+      };
+    });
+  }
+
+  /** The notes tree grafted at the ledger `notes` entry. */
+  async notesTreeAt(checkpoint: ObjectId): Promise<ObjectId> {
+    const tree = await this.treeForCommit(checkpoint);
+    const notes = await this.treeEntryAt(tree, LEDGER_NOTES_PATH);
+    if (notes === null) throw new Error(`Ledger checkpoint ${checkpoint} has no ${LEDGER_NOTES_PATH} subtree`);
+    return notes;
+  }
+
+  /** The canonical manifest bytes stored by a ledger checkpoint. */
+  async readLedgerManifestAt(checkpoint: ObjectId): Promise<string | null> {
+    const tree = await this.treeForCommit(checkpoint);
+    const manifest = await this.treeEntryAt(tree, LEDGER_MANIFEST_PATH);
+    return manifest === null ? null : this.readBlobAt(manifest);
+  }
+
+  async readBlobAt(object: ObjectId): Promise<string> {
+    return (await this.runBinary(["cat-file", "blob", object])).toString("utf8");
+  }
+
+  /** The ordered parents of a ledger checkpoint: previous ledger, notes, retention. */
+  async ledgerParents(checkpoint: ObjectId): Promise<readonly ObjectId[]> {
+    const result = await this.run(["show", "-s", "--format=%P", checkpoint], { allowExitCodes: [0, 1, 128] });
+    if (result.exitCode !== 0) throw new Error(`Ledger checkpoint ${checkpoint} is not a commit`);
+    return result.stdout.trim().split(" ").filter((parent) => parent.length > 0).map((parent) => objectId(parent));
+  }
+
+  /** True when the object is a commit carrying the fixed ledger checkpoint message. */
+  async isLedgerCheckpoint(commit: string): Promise<boolean> {
+    if (!isObjectId(commit)) return false;
+    const result = await this.run(["show", "-s", "--format=%s", commit], { allowExitCodes: [0, 1, 128] });
+    return result.exitCode === 0 && result.stdout.trim() === LEDGER_MESSAGE.trimEnd();
+  }
+
+  /**
+   * Build a ledger checkpoint commit without moving any ref. The tree is the
+   * canonical manifest blob plus the exact notes tree grafted at `notes`, and
+   * the parents are the previous ledger, the notes commit, and the optional
+   * retention checkpoint, in that fixed order.
+   */
+  async commitLedgerCheckpoint(input: {
+    readonly manifest: LedgerManifest;
+    /** Overrides the manifest's own parent claims; used to detect a mismatch before writing. */
+    readonly previousLedger?: ObjectId | null;
+    readonly notesCommit?: ObjectId | null;
+    readonly retentionCommit?: ObjectId | null;
+  }): Promise<ObjectId> {
+    const manifest = input.manifest;
+    const previousLedger = input.previousLedger !== undefined ? input.previousLedger : manifest.previous_ledger;
+    const notesCommit = input.notesCommit !== undefined ? input.notesCommit : manifest.notes_commit;
+    const retentionCommit = input.retentionCommit !== undefined ? input.retentionCommit : manifest.retention_commit;
+    // The manifest is the authority on the parent roles, so a caller that
+    // disagrees with it must fail here rather than write an envelope whose own
+    // description contradicts its parents.
+    if (previousLedger !== manifest.previous_ledger) {
+      throw new Error(`Ledger parent mismatch: manifest names previous_ledger ${manifest.previous_ledger}, got ${previousLedger}`);
+    }
+    if (notesCommit !== manifest.notes_commit) {
+      throw new Error(`Ledger parent mismatch: manifest names notes_commit ${manifest.notes_commit}, got ${notesCommit}`);
+    }
+    if (retentionCommit !== manifest.retention_commit) {
+      throw new Error(`Ledger parent mismatch: manifest names retention_commit ${manifest.retention_commit}, got ${retentionCommit}`);
+    }
+
+    const manifestBlob = await this.writeBlob(canonicalLedgerManifest(manifest));
+    const notesTree = notesCommit === null
+      ? await this.emptyTreeObjectId()
+      : await this.treeForCommit(notesCommit);
+    if (manifest.notes_tree !== null && manifest.notes_tree !== notesTree) {
+      throw new Error(
+        `Ledger subtree mismatch: manifest names notes_tree ${manifest.notes_tree}, notes commit ${notesCommit} has ${notesTree}`,
+      );
+    }
+    // Grafting the existing notes tree by OID keeps the envelope free of copied
+    // note blobs and makes the tree entry comparable to the manifest field.
+    const tree = parseObjectId((await this.run([
+      "mktree",
+    ], {
+      input: [
+        `100644 blob ${manifestBlob}\t${LEDGER_MANIFEST_PATH}`,
+        `040000 tree ${notesTree}\t${LEDGER_NOTES_PATH}`,
+        "",
+      ].join("\n"),
+    })).stdout, "git mktree");
+
+    const argumentsList = ["commit-tree", tree];
+    for (const parent of [previousLedger, notesCommit, retentionCommit]) {
+      if (parent !== null) argumentsList.push("-p", parent);
+    }
+    argumentsList.push("-F", "-");
+    return parseObjectId(
+      (await this.run(argumentsList, { input: LEDGER_MESSAGE, environment: { ...LEDGER_IDENTITY } })).stdout,
+      "git commit-tree",
+    );
+  }
+
+  /**
+   * Move the ledger branch with an expected-old-OID compare-and-swap. The
+   * previous ledger is always the first parent, so this single guard makes a
+   * ledger update fast-forward or nothing.
+   */
+  async updateLedgerRef(update: {
+    readonly next: ObjectId;
+    readonly expected?: ObjectId | null;
+  }): Promise<void> {
+    try {
+      await this.updateRefsAtomically([
+        { ref: LEDGER_REF, next: update.next, expected: update.expected ?? null },
+      ]);
+    } catch (error: unknown) {
+      throw new Error(`The Reveries ledger ${LEDGER_REF} changed concurrently`, { cause: error });
+    }
+  }
+
+  /**
+   * Every canonical note line carried by a checkpoint's grafted notes tree,
+   * keyed by annotated subject. Reading through the commit keeps this
+   * layout-agnostic: Git uses a flat notes tree below 256 notes and a fanout
+   * tree above.
+   */
+  async ledgerNotesLines(checkpoint: ObjectId): Promise<Map<ObjectId, readonly string[]>> {
+    const result = await this.run(["ls-tree", "-r", "-z", `${checkpoint}:${LEDGER_NOTES_PATH}`], {
+      allowExitCodes: [0, 1, 128],
+    });
+    const subjects = new Map<ObjectId, readonly string[]>();
+    if (result.exitCode !== 0) return subjects;
+    for (const record of result.stdout.split("\0").filter((entry) => entry.length > 0)) {
+      const separator = record.indexOf("\t");
+      if (separator < 0) throw new Error("Malformed git ls-tree record");
+      const object = parseObjectId(record.slice(0, separator).split(" ")[2] ?? "", "git ls-tree");
+      const subject = notesSubjectFromPath(record.slice(separator + 1));
+      const body = await this.readBlobAt(object);
+      subjects.set(subject, body.split("\n").filter((line) => line.length > 0));
+    }
+    return subjects;
+  }
+
+  async emptyTreeObjectId(): Promise<ObjectId> {
+    return parseObjectId((await this.run(["mktree"], { input: "" })).stdout.trim(), "git mktree");
+  }
+
   /** Build the retention fanout tree for blob and tree subjects. */
   async writeRetentionObjects(subjects: readonly RetentionSubject[]): Promise<ObjectId> {
     const unique = new Map<string, RetentionSubject["type"]>();
@@ -1181,7 +1400,8 @@ export class GitRepository {
     return { chain: null, retained: parents.map((parent) => objectId(parent)) };
   }
 
-  private async isRetentionCheckpoint(commit: string): Promise<boolean> {
+  /** True when the commit is a retention checkpoint: the fixed identity, message, and empty tree. */
+  async isRetentionCheckpoint(commit: string): Promise<boolean> {
     if (!isObjectId(commit)) return false;
     const result = await this.run(["show", "-s", "--format=%T%n%s", commit], { allowExitCodes: [0, 1, 128] });
     if (result.exitCode !== 0) return false;
