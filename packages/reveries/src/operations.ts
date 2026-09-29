@@ -31,10 +31,12 @@ import {
 } from "./protocol.ts";
 import {
   GitRepository,
+  cloneEvidenceGrade,
   hashBlobContent,
   RETENTION_COMMITS_REF,
   RETENTION_OBJECTS_REF,
   SnapshotIndexCorruptError,
+  type CompletenessGrade,
   type NoteListEntry,
   type NotesTransaction,
   type RetentionSubject,
@@ -70,6 +72,7 @@ export interface ShowResult {
   readonly historical: readonly ReverieRecord[];
   readonly diagnostics: readonly string[];
   readonly paths: readonly string[];
+  readonly completeness: CompletenessInfo;
 }
 
 export interface CheckResult {
@@ -172,12 +175,53 @@ export interface SearchInput {
   readonly author?: string;
   readonly all?: boolean;
   readonly revision?: string;
+  /**
+   * Opt out of the strict default: return whatever the incomplete local view
+   * holds, graded, instead of throwing `IncompleteEvidenceError`. Reads never
+   * fetch either way; only explicit sync/fetch commands touch the network.
+   */
+  readonly allowIncomplete?: boolean;
 }
 
 export interface SearchHit {
   readonly object: ObjectId;
   readonly record: NoteRecord;
   readonly paths: readonly string[];
+}
+
+/**
+ * How authoritative the local evidence behind a result is. Any grade other
+ * than `complete` means the result must not be read as proof that evidence
+ * does not exist.
+ */
+export interface CompletenessInfo {
+  readonly grade: CompletenessGrade;
+  readonly reasons: readonly string[];
+  /** True only when every reachable evidence object was examined locally. */
+  readonly authoritative: boolean;
+}
+
+export interface SearchResult {
+  readonly hits: readonly SearchHit[];
+  readonly completeness: CompletenessInfo;
+}
+
+export interface HistoryOptions {
+  readonly allowIncomplete?: boolean;
+}
+
+/** Thrown instead of reporting incomplete local state as evidence absence. */
+export class IncompleteEvidenceError extends Error {
+  readonly completeness: CompletenessInfo;
+
+  constructor(completeness: CompletenessInfo, detail?: string) {
+    const suffix = detail === undefined ? "" : `: ${detail}`;
+    super(
+      `incomplete-evidence ${completeness.grade}${suffix}; ${completeness.reasons.join("; ")}`,
+    );
+    this.name = "IncompleteEvidenceError";
+    this.completeness = completeness;
+  }
 }
 
 export interface HistoryEntry {
@@ -416,12 +460,25 @@ function parseSnapshotIndexPayload(raw: string, tip: ObjectId): SnapshotIndexPay
 
 export class Reveries {
   private constructor(
+    /**
+     * Evidence reads run through this suppressed handle: no read may lazily
+     * fetch promisor objects, so incomplete local state surfaces as a
+     * completeness grade instead of healing silently or being misreported.
+     */
     readonly repository: GitRepository,
+    /**
+     * Explicit network operations (fetch, push, ls-remote) and only those
+     * use the live handle. RVR-016 note: the notes-mutation retry/replay
+     * loop must stay on `repository` (suppressed) and keep using
+     * `withNotesWrite` as its publication primitive.
+     */
+    private readonly liveRepository: GitRepository,
     private readonly proposedNotesTip?: ObjectId,
   ) {}
 
   static async open(cwd: string): Promise<Reveries> {
-    return new Reveries(await GitRepository.open(cwd));
+    const repository = await GitRepository.open(cwd);
+    return new Reveries(repository.withoutLazyFetch(), repository);
   }
 
   static async openBareForReceive(cwd: string, notesTip: ObjectId): Promise<Reveries> {
@@ -429,7 +486,111 @@ export class Reveries {
     if (await repository.objectType(notesTip) !== "commit") {
       throw new Error(`Proposed Reveries notes object is not a commit: ${notesTip}`);
     }
-    return new Reveries(repository, notesTip);
+    return new Reveries(repository.withoutLazyFetch(), repository, notesTip);
+  }
+
+  /**
+   * Grade the local evidence behind a result without touching the network.
+   * Accepts an already-loaded snapshot view to avoid rescanning notes, and
+   * an explicit object list whose local presence is required.
+   */
+  async assessCompleteness(input: {
+    readonly annotatedObjects?: readonly ObjectId[];
+    readonly view?: EvidenceSnapshotView;
+  } = {}): Promise<CompletenessInfo> {
+    const reader = this.repository;
+    const [shallow, promisor] = await Promise.all([
+      reader.isShallowRepository(),
+      reader.hasPromisorRemote(),
+    ]);
+    const view = input.view ?? await this.loadEvidenceSnapshot({});
+    const examined = input.annotatedObjects ?? [];
+    const missing = examined.length === 0
+      ? new Set<ObjectId>()
+      : await reader.missingObjects(examined);
+    const missingBodies = view.stats.notesListed - view.stats.notesRead;
+    const missingSubjects = view.entries.filter((entry) => entry.objectType === "missing").length;
+    const missingCount = missing.size + missingBodies + missingSubjects;
+    const tracking = await reader.notesTrackingTips();
+    const staleRefs: string[] = [];
+    if (view.tip !== null) {
+      for (const [ref, tip] of tracking) {
+        if (tip !== view.tip && !(await reader.isAncestor(tip, view.tip))) {
+          staleRefs.push(ref);
+        }
+      }
+    } else if (tracking.size > 0) {
+      staleRefs.push(...tracking.keys());
+    }
+    const reasons: string[] = [];
+    if (shallow) {
+      reasons.push("the repository is shallow: history before the boundary is unavailable locally");
+    }
+    if (promisor) {
+      reasons.push("the repository has a promisor remote: unmaterialized objects need an explicit fetch");
+    }
+    if (missingCount > 0) {
+      reasons.push(`${missingCount} evidence object(s) are unavailable locally`);
+    }
+    for (const ref of staleRefs) {
+      reasons.push(`fetched notes at ${ref} are not incorporated into the local notes tip`);
+    }
+    if (view.tip === null && (shallow || promisor)) {
+      reasons.push("the local notes ref is absent in an incomplete clone");
+    }
+    let grade: CompletenessGrade;
+    if (missingCount > 0) {
+      grade = promisor ? "promisor-object-missing" : shallow ? "shallow-boundary" : "unknown";
+    } else if (staleRefs.length > 0) {
+      grade = "notes-stale";
+    } else if (view.tip === null && (shallow || promisor)) {
+      grade = "notes-unfetched";
+    } else {
+      grade = "complete";
+    }
+    if (grade === "complete") {
+      reasons.push("every reachable evidence object was examined locally");
+    }
+    return { grade, reasons, authoritative: grade === "complete" };
+  }
+
+  /**
+   * Reframe a resolution failure as incompleteness when the clone cannot
+   * vouch for absence; otherwise rethrow the original error so complete
+   * clones keep their authoritative behavior. A raw "unknown revision"
+   * error inside an incomplete clone is effectively an absence claim, so
+   * incomplete clones always report the grade and keep the original message
+   * as detail.
+   */
+  private async gradedFailure(error: unknown, objects: readonly ObjectId[] = []): Promise<never> {
+    const reader = this.repository;
+    const [shallow, promisor] = await Promise.all([
+      reader.isShallowRepository(),
+      reader.hasPromisorRemote(),
+    ]);
+    const missing = objects.length === 0
+      ? new Set<ObjectId>()
+      : await reader.missingObjects(objects);
+    if (missing.size === 0 && !shallow && !promisor) {
+      throw error;
+    }
+    const reasons: string[] = [];
+    if (shallow) {
+      reasons.push("the repository is shallow: history before the boundary is unavailable locally");
+    }
+    if (promisor) {
+      reasons.push("the repository has a promisor remote: unmaterialized objects need an explicit fetch");
+    }
+    if (missing.size > 0) {
+      reasons.push(`${missing.size} referenced object(s) are unavailable locally`);
+    }
+    const grade: CompletenessGrade = missing.size > 0
+      ? promisor ? "promisor-object-missing" : shallow ? "shallow-boundary" : "unknown"
+      : cloneEvidenceGrade({ shallow, promisor });
+    throw new IncompleteEvidenceError(
+      { grade, reasons, authoritative: false },
+      error instanceof Error ? error.message : String(error),
+    );
   }
 
   async recordNew(input: RecordNewInput): Promise<RecordResult> {
@@ -497,7 +658,19 @@ export class Reveries {
     const target = await this.resolveTarget(input.target, input.revision ?? "HEAD");
     const note = await this.readEvidenceNote(target.object);
     if (note === null) {
-      return { ...target, records: [], active: [], historical: [], diagnostics: [], paths: target.paths };
+      const completeness = await this.assessCompleteness({ annotatedObjects: [target.object] });
+      const diagnostics = completeness.authoritative
+        ? []
+        : [`Evidence may be incomplete (${completeness.grade}): ${completeness.reasons.join("; ")}`];
+      return {
+        ...target,
+        records: [],
+        active: [],
+        historical: [],
+        diagnostics,
+        paths: target.paths,
+        completeness,
+      };
     }
     const parsed = parseNote(note, "tolerant", { verifyIds: false });
     const diagnostics = parsed.diagnostics.map((diagnostic) => diagnostic.message);
@@ -516,6 +689,7 @@ export class Reveries {
       validRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
     );
     diagnostics.push(...this.projectionDiagnostics(projection));
+    const completeness = await this.assessCompleteness({});
     return {
       ...target,
       records: validRecords,
@@ -523,6 +697,7 @@ export class Reveries {
       historical: projection.historical,
       diagnostics,
       paths: target.paths,
+      completeness,
     };
   }
 
@@ -638,7 +813,7 @@ export class Reveries {
     }
     const diagnostics: string[] = [];
     for (let attempt = 1; attempt <= maximum; attempt += 1) {
-      const expected = await this.repository.remoteObject(remote, NOTES_REF);
+      const expected = await this.liveRepository.remoteObject(remote, NOTES_REF);
       const incorporated = await this.checkRemoteNotesIncorporated(remote, expected);
       if (!incorporated.ok) {
         const synced = await this.syncPull(remote);
@@ -652,7 +827,7 @@ export class Reveries {
         }
       }
       const lease = expected ?? "0".repeat((await this.repository.objectFormat()) === "sha1" ? 40 : 64);
-      const push = await this.repository.run(
+      const push = await this.liveRepository.run(
         [
           "push",
           `--force-with-lease=${NOTES_REF}:${lease}`,
@@ -669,7 +844,7 @@ export class Reveries {
     return {
       ok: false,
       attempts: maximum,
-      remoteTip: await this.repository.remoteObject(remote, NOTES_REF),
+      remoteTip: await this.liveRepository.remoteObject(remote, NOTES_REF),
       diagnostics,
     };
   }
@@ -879,10 +1054,39 @@ export class Reveries {
   }
 
   async search(input: SearchInput): Promise<readonly SearchHit[]> {
-    return this.searchWithView(await this.loadEvidenceSnapshot({}), input);
+    return (await this.searchWithCompleteness(input)).hits;
   }
 
-  async history(path: string): Promise<readonly HistoryEntry[]> {
+  /**
+   * Search evidence with its completeness grade. Refuses to report an
+   * incomplete local view as authoritative absence unless the caller opts
+   * into `allowIncomplete`. Reads never fetch either way.
+   */
+  async searchWithCompleteness(input: SearchInput): Promise<SearchResult> {
+    const view = await this.loadEvidenceSnapshot({});
+    const completeness = await this.assessCompleteness({ view });
+    if (!completeness.authoritative && input.allowIncomplete !== true) {
+      throw new IncompleteEvidenceError(completeness);
+    }
+    return { hits: await this.searchWithView(view, input), completeness };
+  }
+
+  async history(path: string, options: HistoryOptions = {}): Promise<readonly HistoryEntry[]> {
+    if (options.allowIncomplete !== true && await this.repository.isShallowRepository()) {
+      const completeness = await this.assessCompleteness({});
+      throw new IncompleteEvidenceError(
+        completeness.grade === "complete"
+          ? {
+            grade: "shallow-boundary",
+            reasons: [
+              "the repository is shallow: history before the boundary is unavailable locally",
+              ...completeness.reasons,
+            ],
+            authoritative: false,
+          }
+          : completeness,
+      );
+    }
     const log = await this.repository.run(["log", "--format=%H", "--", path]);
     const history: HistoryEntry[] = [];
     const seen = new Set<string>();
@@ -899,8 +1103,11 @@ export class Reveries {
           blob,
           records: note === null ? [] : parseNote(note, "tolerant", { verifyIds: false }).records,
         });
-      } catch {
-        continue;
+      } catch (error: unknown) {
+        if (options.allowIncomplete !== true
+          && (await this.repository.isShallowRepository() || await this.repository.hasPromisorRemote())) {
+          await this.gradedFailure(error);
+        }
       }
     }
     return history;
@@ -1007,7 +1214,7 @@ export class Reveries {
           object: entry.object,
           records: [],
           projection: projectActiveReveries([]),
-          objectType: details.get(entry.object)?.type ?? await this.noteObjectType(entry.object),
+          objectType: await this.snapshotObjectType(details, entry.object),
           error: message,
           snapshot: createEvidenceSnapshot({ notesTip: tip, records: [], limits }),
         });
@@ -1017,7 +1224,7 @@ export class Reveries {
         records.filter((record): record is ReverieRecord => record.type === "reverie"),
       );
       const projectionDiagnostics = this.projectionDiagnostics(projection);
-      const objectType = details.get(entry.object)?.type ?? await this.noteObjectType(entry.object);
+      const objectType = await this.snapshotObjectType(details, entry.object);
       entries.push({
         object: entry.object,
         records,
@@ -1093,6 +1300,25 @@ export class Reveries {
   }
 
   /**
+   * Annotated-subject type for the snapshot view. A locally missing subject
+   * (shallow boundary, unfetched promisor object) is recorded as "missing"
+   * so completeness grading can see it instead of crashing the whole load.
+   * Validation still fails closed per entry for such subjects.
+   */
+  private async snapshotObjectType(
+    details: ReadonlyMap<ObjectId, { readonly type: string; readonly size: number } | null>,
+    object: ObjectId,
+  ): Promise<string> {
+    const known = details.get(object)?.type;
+    if (known !== undefined) return known;
+    try {
+      return await this.noteObjectType(object);
+    } catch {
+      return "missing";
+    }
+  }
+
+  /**
    * Strict authority check over a loaded view: the same rules `validateNotesRef`
    * enforces, with `note`-kind sources resolved from the snapshot ID map
    * instead of rescanning every note.
@@ -1136,7 +1362,7 @@ export class Reveries {
         if (source.kind === "commit" || source.kind === "blob") {
           const object = objectId(source.ref);
           if (!(await this.repository.objectExists(source.kind, object))) {
-            throw new Error(`Broken local ${source.kind} source: ${source.ref}`);
+            throw await this.gradedSourceError(source.kind, source.ref, object);
           }
         } else if (source.kind === "path") {
           if (source.at === undefined) throw new Error("A path source requires an at commit");
@@ -1150,6 +1376,43 @@ export class Reveries {
         }
       }
     }
+  }
+
+  /**
+   * A missing source behind an incomplete clone is graded incompleteness,
+   * never a broken-source verdict: the clone cannot vouch for absence.
+   * Complete clones keep the exact historical message.
+   */
+  private async gradedSourceError(
+    kind: "commit" | "blob",
+    ref: string,
+    object: ObjectId,
+  ): Promise<Error> {
+    const reader = this.repository;
+    const [shallow, promisor] = await Promise.all([
+      reader.isShallowRepository(),
+      reader.hasPromisorRemote(),
+    ]);
+    const missing = await reader.missingObjects([object]);
+    if (missing.size === 0 || (!shallow && !promisor)) {
+      // Present-but-wrong-type, or any absence inside a complete clone, is
+      // an authoritative broken-source verdict: the clone can vouch for it.
+      return new Error(`Broken local ${kind} source: ${ref}`);
+    }
+    const reasons: string[] = [];
+    if (shallow) {
+      reasons.push("the repository is shallow: history before the boundary is unavailable locally");
+    }
+    if (promisor) {
+      reasons.push("the repository has a promisor remote: unmaterialized objects need an explicit fetch");
+    }
+    if (missing.size > 0) {
+      reasons.push(`the ${kind} source ${ref} is unavailable locally`);
+    }
+    const grade: CompletenessGrade = missing.size > 0
+      ? promisor ? "promisor-object-missing" : shallow ? "shallow-boundary" : "unknown"
+      : cloneEvidenceGrade({ shallow, promisor });
+    return new IncompleteEvidenceError({ grade, reasons, authoritative: false });
   }
 
   async cachedSearch(input: SearchInput): Promise<readonly SearchHit[]> {
@@ -1196,7 +1459,7 @@ export class Reveries {
   }
 
   async syncPull(remote: string): Promise<SyncResult> {
-    const fetched = await this.repository.fetchNotes(remote);
+    const fetched = await this.liveRepository.fetchNotes(remote);
     if (fetched === "absent") {
       return { ok: true, diagnostics: [], state: "remote-notes-absent", conflicts: [] };
     }
@@ -1318,15 +1581,15 @@ export class Reveries {
       localRef: branchRef,
       localObject: await this.repository.resolveCommit("HEAD"),
       remoteRef: branchRef,
-      remoteObject: await this.repository.remoteObject(remote, branchRef),
+      remoteObject: await this.liveRepository.remoteObject(remote, branchRef),
     }, {
       localRef: NOTES_REF,
       localObject: await this.repository.notesTip(),
       remoteRef: NOTES_REF,
-      remoteObject: await this.repository.remoteObject(remote, NOTES_REF),
+      remoteObject: await this.liveRepository.remoteObject(remote, NOTES_REF),
     }]);
     if (!check.ok) return check;
-    await this.repository.pushAtomically(remote);
+    await this.liveRepository.pushAtomically(remote);
     return check;
   }
 
@@ -1697,16 +1960,25 @@ export class Reveries {
     readonly objectType: string;
     readonly paths: readonly string[];
   }> {
-    const object = isFullObjectId(target)
-      ? objectId(target)
-      : await this.repository.resolvePath({ path: target, revision });
-    const objectType = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
-    const paths = objectType !== "blob"
-      ? []
-      : revision === "index"
-        ? await this.repository.indexPathsForBlob(blobId(object))
-        : await this.repository.pathsForBlob(blobId(object), revision);
-    return { object, objectType, paths };
+    let object: ObjectId;
+    try {
+      object = isFullObjectId(target)
+        ? objectId(target)
+        : await this.repository.resolvePath({ path: target, revision });
+    } catch (error: unknown) {
+      return this.gradedFailure(error);
+    }
+    try {
+      const objectType = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
+      const paths = objectType !== "blob"
+        ? []
+        : revision === "index"
+          ? await this.repository.indexPathsForBlob(blobId(object))
+          : await this.repository.pathsForBlob(blobId(object), revision);
+      return { object, objectType, paths };
+    } catch (error: unknown) {
+      return this.gradedFailure(error, [object]);
+    }
   }
 
   private async pathsForObject(object: ObjectId, revision: string): Promise<readonly string[]> {

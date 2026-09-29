@@ -106,6 +106,10 @@ class FakeRepository implements HookRepository {
   async listNotes(): Promise<readonly { readonly object: ObjectId }[]> {
     return [...this.notes.keys()].map((object) => ({ object }));
   }
+
+  async hasPromisorRemote(): Promise<boolean> {
+    return false;
+  }
 }
 
 function makeRecord(decision = "Use one guarded state boundary.", driving = "Two writers can race."): ReverieRecord {
@@ -160,7 +164,7 @@ async function setup(marker = true): Promise<{ repository: FakeRepository; recor
 test("inactive repositories receive no automatic context", async () => {
   const { repository } = await setup(false);
   const result = await handleHookEvent(event(), { repository });
-  assert.deepEqual(result, { context: null, user_message: null, block: false, reason: null });
+  assert.deepEqual(result, { context: null, user_message: null, block: false, reason: null, completeness: null });
   assert.equal(repository.reads, 0);
 });
 
@@ -410,6 +414,28 @@ test("forged semantic IDs and broken local sources are not delivered", async () 
   const missingSource = await handleHookEvent(event(), { repository });
   assert.equal(missingSource.context, null);
   assert.equal(missingSource.reason, "broken-source");
+});
+
+test("a missing source behind a promisor-shaped clone grades incomplete-evidence", async () => {
+  const { repository, record } = await setup();
+  repository.hasPromisorRemote = async () => true;
+  const sourced = createReverie(
+    {
+      ...record,
+      sources: [{
+        relation: "derived-from",
+        kind: "blob",
+        ref: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }],
+    },
+    record,
+    (bytes) => objectId(createHash("sha1").update(Buffer.from(`blob ${bytes.byteLength}\0`)).update(bytes).digest("hex")),
+  );
+  repository.notes.set(BLOB_A, canonicalRecord(sourced));
+  const result = await handleHookEvent(event(), { repository });
+  assert.equal(result.context, null);
+  assert.equal(result.reason, "incomplete-evidence");
+  assert.equal(result.completeness, "promisor-object-missing");
 });
 
 test("control bytes are neutralized in model-visible evidence", async () => {

@@ -26,6 +26,44 @@ export const RETENTION_BUNDLE_REFS = [
 ] as const;
 export const INTERNAL_ATOMIC_PUSH_ENV = "REVERIES_INTERNAL_ATOMIC_PUSH";
 
+/**
+ * Environment that disables on-demand (lazy) fetching of promisor objects.
+ * Verified against git 2.39.5: with the variable set, access to a missing
+ * promisor object fails fast (`fatal: could not fetch ... from promisor
+ * remote`) instead of transparently fetching. Automatic paths (hooks,
+ * evidence reads) must use it; only explicit user-invoked sync/fetch/push
+ * commands may touch the network.
+ */
+export const NO_LAZY_FETCH_ENV = { GIT_NO_LAZY_FETCH: "1" } as const;
+
+/**
+ * How authoritative a local evidence view is. Incomplete local state must
+ * never be reported as authoritative evidence absence; every grade other
+ * than `complete` refuses that claim.
+ */
+export type CompletenessGrade =
+  | "complete"
+  | "notes-unfetched"
+  | "notes-stale"
+  | "shallow-boundary"
+  | "promisor-object-missing"
+  | "subject-pruned"
+  | "unknown";
+
+/**
+ * Grade a clone from its local shape alone, without touching the network.
+ * A missing note or object under a shallow or promisor clone is
+ * incompleteness, never authoritative absence.
+ */
+export function cloneEvidenceGrade(input: {
+  readonly shallow: boolean;
+  readonly promisor: boolean;
+}): CompletenessGrade {
+  if (input.promisor) return "promisor-object-missing";
+  if (input.shallow) return "shallow-boundary";
+  return "complete";
+}
+
 const RETENTION_IDENTITY = {
   GIT_AUTHOR_NAME: "Reveries Retention",
   GIT_AUTHOR_EMAIL: "retention@reveries.local",
@@ -194,6 +232,7 @@ export class GitRepository {
     readonly root: string,
     private readonly commonDir: string,
     private readonly commandCwd = root,
+    private readonly noLazyFetch = false,
   ) {}
 
   static async open(cwd: string): Promise<GitRepository> {
@@ -214,7 +253,7 @@ export class GitRepository {
   }
 
   async run(args: readonly string[], options: RunOptions = {}): Promise<GitResult> {
-    return runGit(this.commandCwd, args, options);
+    return runGit(this.commandCwd, args, this.suppressLazyFetch(options));
   }
 
   async commonDirectory(): Promise<string> {
@@ -300,11 +339,25 @@ export class GitRepository {
    * Report every object type and size with one `cat-file --batch-check`
    * process. Missing objects map to null; the caller decides whether that is
    * an error.
+   *
+   * A suppressed handle (`withoutLazyFetch`) cannot use the batch fast path:
+   * one unfetched promisor object aborts the whole batch with a fatal exit
+   * instead of a per-object `missing` line. Suppressed reads therefore probe
+   * objects individually (in parallel), mapping any failure to null. Call
+   * `missingObjects` on a suppressed handle when the goal is assessment:
+   * probing through a live handle would lazily fetch what it measures.
    */
   async batchObjectDetails(
     objects: readonly ObjectId[],
   ): Promise<ReadonlyMap<ObjectId, { readonly type: string; readonly size: number } | null>> {
     const unique = [...new Set(objects)];
+    if (this.noLazyFetch) {
+      const assessed = await Promise.all(unique.map(async (object) => {
+        const detail = await this.batchObjectDetailIndividually(object);
+        return [object, detail] as const;
+      }));
+      return new Map(assessed);
+    }
     const details = new Map<ObjectId, { readonly type: string; readonly size: number } | null>();
     if (unique.length === 0) return details;
     const raw = await this.runBinary(
@@ -329,6 +382,28 @@ export class GitRepository {
   }
 
   /**
+   * One object's type and size without ever fetching. Any failure (unfetched
+   * promisor object, unknown OID) maps to null; the caller grades the cause.
+   */
+  private async batchObjectDetailIndividually(
+    object: ObjectId,
+  ): Promise<{ readonly type: string; readonly size: number } | null> {
+    const result = await this.run(["cat-file", "--batch-check"], {
+      input: `${object}\n`,
+      allowExitCodes: [0, 128],
+    });
+    if (result.exitCode !== 0) return null;
+    const line = result.stdout.split("\n").find((entry) => entry.length > 0);
+    if (line === undefined) return null;
+    const [oid, kind, sizeText] = line.split(" ");
+    if (oid === undefined || kind === undefined) throw new Error("Malformed git cat-file --batch-check line");
+    if (kind === "missing") return null;
+    const size = Number(sizeText);
+    if (!Number.isInteger(size) || size < 0) throw new Error("Malformed git cat-file --batch-check size");
+    return { type: kind, size };
+  }
+
+  /**
    * Report every object size with one `cat-file --batch-check` process.
    * Missing objects map to null; the caller decides whether that is an error.
    */
@@ -349,6 +424,16 @@ export class GitRepository {
   ): Promise<ReadonlyMap<ObjectId, string | null>> {
     const bodies = new Map<ObjectId, string | null>();
     if (entries.length === 0) return bodies;
+    // A suppressed handle cannot use the batch fast paths: one unfetched
+    // promisor body aborts the whole batch with a fatal exit. Read
+    // individually (in parallel) instead, keeping the size gate before every
+    // body load. Missing bodies map to null; the caller grades the cause.
+    if (this.noLazyFetch) {
+      await Promise.all(entries.map(async (entry) => {
+        bodies.set(entry.object, await this.readNoteBodyIndividually(entry.note, options));
+      }));
+      return bodies;
+    }
     const noteToObject = new Map<ObjectId, ObjectId>();
     for (const entry of entries) noteToObject.set(entry.note, entry.object);
     const sizes = await this.batchObjectSizes([...noteToObject.keys()]);
@@ -396,8 +481,99 @@ export class GitRepository {
     return bodies;
   }
 
+  /**
+   * One note body without ever fetching. The size gate runs before the body
+   * load, mirroring the batch path. Any local absence maps to null.
+   */
+  private async readNoteBodyIndividually(
+    note: ObjectId,
+    options: BatchReadOptions,
+  ): Promise<string | null> {
+    const detail = await this.batchObjectDetailIndividually(note);
+    if (detail === null) return null;
+    assertNoteSize(detail.size, options.limits);
+    const body = await this.run(["cat-file", "-p", note], { allowExitCodes: [0, 128] });
+    return body.exitCode === 0 ? body.stdout : null;
+  }
+
   async runBinary(args: readonly string[], options: RunOptions = {}): Promise<Buffer> {
-    return runGitBinary(this.commandCwd, args, options);
+    return runGitBinary(this.commandCwd, args, this.suppressLazyFetch(options));
+  }
+
+  /**
+   * A view over the same repository whose Git invocations never lazily
+   * fetch promisor objects. Use it for every automatic or evidence-read
+   * path; explicit sync/fetch/push commands keep using the live repository.
+   */
+  withoutLazyFetch(): GitRepository {
+    if (this.noLazyFetch) return this;
+    return new GitRepository(this.root, this.commonDir, this.commandCwd, true);
+  }
+
+  private suppressLazyFetch(options: RunOptions): RunOptions {
+    if (!this.noLazyFetch || options.environment?.["GIT_NO_LAZY_FETCH"] !== undefined) {
+      return options;
+    }
+    return { ...options, environment: { ...options.environment, ...NO_LAZY_FETCH_ENV } };
+  }
+
+  /**
+   * Local clone-shape signals for completeness grading. Every detector is a
+   * local read: none may fetch, and none consult the network.
+   */
+  async isShallowRepository(): Promise<boolean> {
+    return (await this.run(["rev-parse", "--is-shallow-repository"])).stdout.trim() === "true";
+  }
+
+  async hasPromisorRemote(): Promise<boolean> {
+    const extension = await this.run(["config", "--get", "extensions.partialClone"], {
+      allowExitCodes: [0, 1],
+    });
+    if (extension.exitCode === 0 && extension.stdout.trim().length > 0) return true;
+    const promisors = await this.run(["config", "--get-regexp", "\\.promisor$"], {
+      allowExitCodes: [0, 1],
+    });
+    if (promisors.exitCode !== 0) return false;
+    return promisors.stdout.split("\n").some((line) => /\s+true\s*$/i.test(line));
+  }
+
+  /**
+   * Locally missing objects, probed one by one without ever fetching.
+   * Prefer a suppressed handle (`withoutLazyFetch`): through a live handle
+   * the probe itself would lazily fetch a promisor object and report it
+   * present. Any local absence (unfetched, unknown, or corrupt) maps to
+   * membership; the caller grades the cause from the clone shape.
+   */
+  async missingObjects(objects: readonly ObjectId[]): Promise<ReadonlySet<ObjectId>> {
+    const unique = [...new Set(objects)];
+    const probed = await Promise.all(unique.map(async (object) => {
+      const result = await this.run(["cat-file", "-e", object], { allowExitCodes: [0, 1, 128] });
+      return [object, result.exitCode !== 0] as const;
+    }));
+    return new Set(probed.filter(([, missing]) => missing).map(([object]) => object));
+  }
+
+  /** Local remote-tracking tips for the notes ref, keyed by full refname. */
+  async notesTrackingTips(): Promise<ReadonlyMap<string, ObjectId>> {
+    const result = await this.run(
+      ["for-each-ref", "--format=%(objectname) %(refname)", "refs/notes/remotes/"],
+    );
+    const tips = new Map<string, ObjectId>();
+    for (const line of result.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const [oid, ref] = trimmed.split(" ");
+      if (oid === undefined || ref === undefined || !ref.endsWith("/reveries")) continue;
+      tips.set(ref, objectId(oid));
+    }
+    return tips;
+  }
+
+  async isAncestor(object: ObjectId, descendant: ObjectId): Promise<boolean> {
+    const result = await this.run(["merge-base", "--is-ancestor", object, descendant], {
+      allowExitCodes: [0, 1],
+    });
+    return result.exitCode === 0;
   }
 
   /** Disposable snapshot-index directory; the index is a cache, never authority. */
