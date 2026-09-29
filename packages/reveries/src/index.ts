@@ -1,6 +1,14 @@
 export * from "./protocol.ts";
-export { AtomicPushUnavailableError, GitCommandError, GitRepository, NotesLockError } from "./git.ts";
+export {
+  AtomicPushUnavailableError,
+  GitCommandError,
+  GitRepository,
+  hashBlobContent,
+  NotesLockError,
+  SnapshotIndexCorruptError,
+} from "./git.ts";
 export type {
+  BatchReadOptions,
   GitResult,
   NoteListEntry,
   NotesRefValidator,

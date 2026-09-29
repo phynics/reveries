@@ -4,17 +4,22 @@ import {
   canonicalRecord,
   commitId,
   createReverie,
+  createEvidenceSnapshot,
   NOTES_REF,
   objectId,
   parseNote,
   projectActiveReveries,
+  resolveLimits,
   semanticPayload,
   validateNote,
   type ActiveProjection,
   type BlobId,
   type CommitId,
+  type Diagnostic,
+  type EvidenceSnapshot,
   type NoteRecord,
   type ObjectId,
+  type ResourceLimits,
   type ReverieId,
   type ReverieInput,
   type ReverieMetadata,
@@ -26,8 +31,10 @@ import {
 } from "./protocol.ts";
 import {
   GitRepository,
+  hashBlobContent,
   RETENTION_COMMITS_REF,
   RETENTION_OBJECTS_REF,
+  SnapshotIndexCorruptError,
   type NoteListEntry,
   type NotesTransaction,
   type RetentionSubject,
@@ -319,6 +326,92 @@ function emptySummary(): SessionSummary {
       retirements: [],
     }],
   };
+}
+
+export interface SnapshotNoteEntry {
+  readonly object: ObjectId;
+  readonly records: readonly NoteRecord[];
+  readonly projection: ActiveProjection;
+  readonly objectType: string;
+  /** Null when the note parses, validates, and projects cleanly; otherwise the first failure. */
+  readonly error: string | null;
+  readonly snapshot: EvidenceSnapshot;
+}
+
+export interface SnapshotStats {
+  readonly notesListed: number;
+  readonly notesRead: number;
+  readonly bytesRead: number;
+  readonly notesParsed: number;
+  readonly indexHit: boolean;
+}
+
+export interface EvidenceSnapshotView {
+  readonly tip: ObjectId | null;
+  readonly entries: readonly SnapshotNoteEntry[];
+  readonly byId: ReadonlyMap<ReverieId, { readonly record: NoteRecord; readonly object: ObjectId }>;
+  readonly backlinks: ReadonlyMap<ReverieId, readonly ObjectId[]>;
+  readonly init: { readonly commit: CommitId; readonly record: ReveriesInit } | null;
+  readonly initError: string | null;
+  readonly diagnostics: readonly Diagnostic[];
+  readonly diagnosticsTruncated: boolean;
+  readonly limits: Readonly<ResourceLimits>;
+  readonly stats: SnapshotStats;
+}
+
+export interface SnapshotLoadOptions {
+  readonly ref?: string;
+  readonly limits?: Partial<ResourceLimits>;
+}
+
+interface SnapshotIndexPayload {
+  readonly v: 1;
+  readonly tip: string;
+  readonly bodies: readonly { readonly object: string; readonly body: string | null }[];
+}
+
+function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotView {
+  return {
+    tip: null,
+    entries: [],
+    byId: new Map(),
+    backlinks: new Map(),
+    init: null,
+    initError: null,
+    diagnostics: [],
+    diagnosticsTruncated: false,
+    limits,
+    stats: { notesListed: 0, notesRead: 0, bytesRead: 0, notesParsed: 0, indexHit: false },
+  };
+}
+
+function parseSnapshotIndexPayload(raw: string, tip: ObjectId): SnapshotIndexPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new SnapshotIndexCorruptError(tip);
+  }
+  if (
+    !parsed || typeof parsed !== "object" || Array.isArray(parsed)
+    || (parsed as { v?: unknown }).v !== 1
+    || (parsed as { tip?: unknown }).tip !== tip
+    || !Array.isArray((parsed as { bodies?: unknown }).bodies)
+  ) {
+    throw new SnapshotIndexCorruptError(tip);
+  }
+  const bodies = (parsed as SnapshotIndexPayload).bodies;
+  for (const entry of bodies) {
+    if (
+      !entry || typeof entry !== "object"
+      || typeof entry.object !== "string"
+      || (typeof entry.body !== "string" && entry.body !== null)
+    ) {
+      throw new SnapshotIndexCorruptError(tip);
+    }
+    objectId(entry.object);
+  }
+  return parsed as SnapshotIndexPayload;
 }
 
 export class Reveries {
@@ -786,27 +879,7 @@ export class Reveries {
   }
 
   async search(input: SearchInput): Promise<readonly SearchHit[]> {
-    const revision = input.revision ?? "HEAD";
-    const candidates = input.all === true
-      ? await this.evidenceNotes()
-      : await this.currentNoteTargets(revision);
-    const hits: SearchHit[] = [];
-    for (const candidate of candidates) {
-      const note = await this.readEvidenceNote(candidate.object);
-      if (note === null) continue;
-      const parsed = parseNote(note, "tolerant", { verifyIds: false });
-      for (const record of parsed.records) {
-        if (input.query !== undefined && !searchText(record).includes(input.query.toLocaleLowerCase())) continue;
-        if (input.source !== undefined && !allSources(record).some((source) => source.ref === input.source)) continue;
-        if (input.author !== undefined && recordAuthor(record) !== input.author) continue;
-        hits.push({
-          object: candidate.object,
-          record,
-          paths: await this.pathsForObject(candidate.object, revision),
-        });
-      }
-    }
-    return hits;
+    return this.searchWithView(await this.loadEvidenceSnapshot({}), input);
   }
 
   async history(path: string): Promise<readonly HistoryEntry[]> {
@@ -831,6 +904,295 @@ export class Reveries {
       }
     }
     return history;
+  }
+
+  /**
+   * Load every note under one evidence tip with exactly one parse per note.
+   * Bodies travel through the size-gated batch reader, so oversized input is
+   * rejected before any body loads. The view carries parsed records, per-note
+   * projections, the global ID map, source backlinks, and init discovery, so
+   * validation, search, and retention share it instead of rescanning notes.
+   */
+  async loadEvidenceSnapshot(options: SnapshotLoadOptions = {}): Promise<EvidenceSnapshotView> {
+    const ref = options.ref ?? NOTES_REF;
+    const limits = resolveLimits(options.limits);
+    const tip = await this.repository.notesTip(ref);
+    if (tip === null) return emptySnapshotView(limits);
+    const listed = await this.repository.listNotes(ref);
+    const bodies = await this.repository.readNotesBatch(listed, { limits: options.limits });
+    return this.buildSnapshotView(tip, listed, bodies, limits, false);
+  }
+
+  /**
+   * Load the snapshot through the disposable file index. A hit parses the same
+   * bodies once from the cache; a miss, a deletion, or corruption rebuilds
+   * from Git and rewrites the index. The index is never authority: every view
+   * derives from note bodies either way.
+   */
+  async loadCachedEvidenceSnapshot(options: SnapshotLoadOptions = {}): Promise<EvidenceSnapshotView> {
+    const ref = options.ref ?? NOTES_REF;
+    const limits = resolveLimits(options.limits);
+    const tip = await this.repository.notesTip(ref);
+    if (tip === null) return emptySnapshotView(limits);
+    const raw = await this.repository.readSnapshotIndex(tip);
+    if (raw !== null) {
+      try {
+        const payload = parseSnapshotIndexPayload(raw, tip);
+        const cached = new Map<ObjectId, string | null>(
+          payload.bodies.map((entry) => [objectId(entry.object), entry.body] as const),
+        );
+        return await this.buildSnapshotView(tip, await this.repository.listNotes(ref), cached, limits, true);
+      } catch (error: unknown) {
+        if (!(error instanceof SnapshotIndexCorruptError)) throw error;
+      }
+    }
+    const listed = await this.repository.listNotes(ref);
+    const bodies = await this.repository.readNotesBatch(listed, { limits: options.limits });
+    const view = await this.buildSnapshotView(tip, listed, bodies, limits, false);
+    await this.repository.writeSnapshotIndex(tip, JSON.stringify({
+      v: 1,
+      tip,
+      bodies: listed.map((entry) => ({
+        object: entry.object,
+        body: bodies.get(entry.object) ?? null,
+      })),
+    }));
+    return view;
+  }
+
+  private async buildSnapshotView(
+    tip: ObjectId,
+    listed: readonly NoteListEntry[],
+    bodies: ReadonlyMap<ObjectId, string | null>,
+    limits: Readonly<ResourceLimits>,
+    indexHit: boolean,
+  ): Promise<EvidenceSnapshotView> {
+    const format = await this.repository.objectFormat();
+    const details = await this.repository.batchObjectDetails(listed.map((item) => item.object));
+    const entries: SnapshotNoteEntry[] = [];
+    const diagnostics: Diagnostic[] = [];
+    let diagnosticsTruncated = false;
+    let bytesRead = 0;
+    let notesRead = 0;
+    const pushDiagnostic = (diagnostic: Diagnostic): void => {
+      if (diagnostics.length >= limits.maxDiagnostics) {
+        diagnosticsTruncated = true;
+        return;
+      }
+      diagnostics.push(diagnostic);
+    };
+    for (const entry of listed) {
+      const body = bodies.get(entry.object) ?? null;
+      if (body === null) {
+        pushDiagnostic({ message: `Note blob is missing for annotated object ${entry.object}` });
+        continue;
+      }
+      notesRead += 1;
+      bytesRead += Buffer.byteLength(body, "utf8");
+      let records: NoteRecord[];
+      try {
+        const parsed = parseNote(body, "strict", { limits });
+        records = validateNote(parsed, { limits });
+        for (const record of records) {
+          if (record.type !== "reverie") continue;
+          const expected = `rv:${hashBlobContent(`${semanticPayload(record)}\n`, format)}`;
+          if (expected !== record.id) {
+            throw new Error(`Semantic ID mismatch for ${record.id}; expected ${expected}`);
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        pushDiagnostic({ message: `${entry.object}: ${message}` });
+        entries.push({
+          object: entry.object,
+          records: [],
+          projection: projectActiveReveries([]),
+          objectType: details.get(entry.object)?.type ?? await this.noteObjectType(entry.object),
+          error: message,
+          snapshot: createEvidenceSnapshot({ notesTip: tip, records: [], limits }),
+        });
+        continue;
+      }
+      const projection = projectActiveReveries(
+        records.filter((record): record is ReverieRecord => record.type === "reverie"),
+      );
+      const projectionDiagnostics = this.projectionDiagnostics(projection);
+      const objectType = details.get(entry.object)?.type ?? await this.noteObjectType(entry.object);
+      entries.push({
+        object: entry.object,
+        records,
+        projection,
+        objectType,
+        error: projectionDiagnostics.length > 0 ? projectionDiagnostics.join("; ") : null,
+        snapshot: createEvidenceSnapshot({ notesTip: tip, records, limits }),
+      });
+      if (projectionDiagnostics.length > 0) {
+        pushDiagnostic({ message: `${entry.object}: ${projectionDiagnostics.join("; ")}` });
+      }
+    }
+    const byId = new Map<ReverieId, { readonly record: NoteRecord; readonly object: ObjectId }>();
+    for (const entry of entries) {
+      for (const record of entry.records) {
+        if (record.type !== "reverie" || byId.has(record.id)) continue;
+        byId.set(record.id, { record, object: entry.object });
+      }
+    }
+    const backlinkSets = new Map<ReverieId, Set<ObjectId>>();
+    for (const entry of entries) {
+      for (const record of entry.records) {
+        for (const source of allSources(record)) {
+          if (source.kind !== "note") continue;
+          const set = backlinkSets.get(source.ref as ReverieId) ?? new Set<ObjectId>();
+          set.add(entry.object);
+          backlinkSets.set(source.ref as ReverieId, set);
+        }
+      }
+    }
+    const backlinks = new Map<ReverieId, readonly ObjectId[]>(
+      [...backlinkSets].map(([id, objects]) => [id, [...objects].sort()]),
+    );
+    let init: EvidenceSnapshotView["init"] = null;
+    let initError: string | null = null;
+    for (const entry of entries) {
+      for (const record of entry.records) {
+        if (record.type !== "reveries-init") continue;
+        if (init !== null) {
+          initError = "More than one Reveries initialization boundary exists";
+          break;
+        }
+        if (entry.objectType !== "commit") {
+          initError = "The Reveries initialization record is not attached to a commit";
+          break;
+        }
+        init = { commit: commitId(entry.object), record };
+      }
+      if (initError !== null) break;
+    }
+    return {
+      tip,
+      entries,
+      byId,
+      backlinks,
+      init,
+      initError,
+      diagnostics,
+      diagnosticsTruncated,
+      limits,
+      stats: {
+        notesListed: listed.length,
+        notesRead,
+        bytesRead,
+        notesParsed: notesRead,
+        indexHit,
+      },
+    };
+  }
+
+  private async noteObjectType(object: ObjectId): Promise<string> {
+    return (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
+  }
+
+  /**
+   * Strict authority check over a loaded view: the same rules `validateNotesRef`
+   * enforces, with `note`-kind sources resolved from the snapshot ID map
+   * instead of rescanning every note.
+   */
+  async validateNotesSnapshot(view: EvidenceSnapshotView): Promise<void> {
+    let initialization: ObjectId | null = null;
+    for (const entry of view.entries) {
+      try {
+        if (entry.error !== null) throw new Error(entry.error);
+        if (entry.records.some((record) => record.type === "reveries-init")) {
+          if (entry.objectType !== "commit") {
+            throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
+          }
+          if (initialization !== null) {
+            throw new Error("More than one Reveries initialization boundary exists");
+          }
+          initialization = entry.object;
+        }
+        if (entry.objectType === "blob" && entry.records.some((record) => record.type !== "reverie")) {
+          throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
+        }
+        if (entry.objectType === "commit" && entry.records.some((record) => record.type === "reverie")) {
+          throw new Error(`Commit ${entry.object} has a file reverie record`);
+        }
+        if (entry.objectType !== "blob" && entry.objectType !== "commit" && entry.records.length > 0) {
+          throw new Error(`Protocol records cannot be attached to ${entry.objectType} object ${entry.object}`);
+        }
+        await this.validateSourcesWithLookup(entry.records, (id) => view.byId.has(id as ReverieId));
+      } catch (error: unknown) {
+        throw new NotesRefValidationError(entry.object, error);
+      }
+    }
+  }
+
+  private async validateSourcesWithLookup(
+    records: readonly NoteRecord[],
+    hasReverie: (id: string) => boolean | Promise<boolean>,
+  ): Promise<void> {
+    for (const record of records) {
+      for (const source of allSources(record)) {
+        if (source.kind === "commit" || source.kind === "blob") {
+          const object = objectId(source.ref);
+          if (!(await this.repository.objectExists(source.kind, object))) {
+            throw new Error(`Broken local ${source.kind} source: ${source.ref}`);
+          }
+        } else if (source.kind === "path") {
+          if (source.at === undefined) throw new Error("A path source requires an at commit");
+          await this.repository.resolvePath({ path: source.ref, revision: source.at });
+        } else if (source.kind === "note") {
+          if (!(await hasReverie(source.ref))) throw new Error(`Referenced reverie does not exist: ${source.ref}`);
+        } else if (source.kind === "git-email") {
+          if (!/^[^\s@]+@[^\s@]+$/.test(source.ref)) throw new Error(`Invalid Git email source: ${source.ref}`);
+        } else if (!/^(?:github|gitlab|linear|jira|generic):\S+$/.test(source.ref)) {
+          throw new Error(`Invalid issue source: ${source.ref}`);
+        }
+      }
+    }
+  }
+
+  async cachedSearch(input: SearchInput): Promise<readonly SearchHit[]> {
+    return this.searchWithView(await this.loadCachedEvidenceSnapshot({}), input);
+  }
+
+  private async searchWithView(view: EvidenceSnapshotView, input: SearchInput): Promise<readonly SearchHit[]> {
+    const revision = input.revision ?? "HEAD";
+    const allowed = input.all === true
+      ? new Set(view.entries.map((entry) => entry.object as string))
+      : new Set((await this.snapshotTargets(view, revision)).map((entry) => entry.object as string));
+    const hits: SearchHit[] = [];
+    for (const entry of view.entries) {
+      if (!allowed.has(entry.object as string)) continue;
+      for (const record of entry.records) {
+        if (input.query !== undefined && !searchText(record).includes(input.query.toLocaleLowerCase())) continue;
+        if (input.source !== undefined && !allSources(record).some((source) => source.ref === input.source)) continue;
+        if (input.author !== undefined && recordAuthor(record) !== input.author) continue;
+        hits.push({
+          object: entry.object,
+          record,
+          paths: await this.pathsForObject(entry.object, revision),
+        });
+      }
+    }
+    return hits;
+  }
+
+  private async snapshotTargets(
+    view: EvidenceSnapshotView,
+    revision: string,
+  ): Promise<readonly SnapshotNoteEntry[]> {
+    const tree = await this.repository.listTree(revision);
+    const available = new Map(view.entries.map((entry) => [entry.object as string, entry]));
+    const targets = new Map<string, SnapshotNoteEntry>();
+    for (const item of tree) {
+      const entry = available.get(item.object as string);
+      if (entry !== undefined) targets.set(entry.object as string, entry);
+    }
+    const commit = await this.repository.resolveCommit(revision);
+    const commitEntry = available.get(commit as string);
+    if (commitEntry !== undefined) targets.set(commitEntry.object as string, commitEntry);
+    return [...targets.values()];
   }
 
   async syncPull(remote: string): Promise<SyncResult> {
@@ -995,14 +1357,22 @@ export class Reveries {
   }
 
   private async retentionSelection(policy: RetentionPolicy): Promise<readonly RetentionSubject[]> {
+    const view = await this.loadCachedEvidenceSnapshot({});
+    const byObject = new Map(view.entries.map((entry) => [entry.object as string, entry]));
     const subjects: { readonly object: ObjectId; readonly type: RetentionSubject["type"]; readonly reveries: readonly ReverieRecord[] }[] = [];
-    for (const entry of await this.repository.listNotes()) {
-      const type = await this.repository.objectType(entry.object);
+    for (const listEntry of await this.repository.listNotes()) {
+      const entry = byObject.get(listEntry.object as string);
+      const type = entry?.objectType ?? await this.repository.objectType(listEntry.object);
       if (type === null) continue;
       if (type === "tag") {
-        throw new Error(`Retention cannot anchor annotated tag ${entry.object}`);
+        throw new Error(`Retention cannot anchor annotated tag ${listEntry.object}`);
       }
-      subjects.push({ object: entry.object, type, reveries: await this.subjectReveries(entry.object) });
+      if (type !== "blob" && type !== "tree" && type !== "commit") continue;
+      subjects.push({
+        object: listEntry.object,
+        type,
+        reveries: (entry?.records ?? []).filter((record): record is ReverieRecord => record.type === "reverie"),
+      });
     }
     // A supersession recorded on any subject retires the predecessor everywhere, so the
     // active set must be projected across the whole evidence set rather than per note.
@@ -1028,13 +1398,6 @@ export class Reveries {
     return [...selected]
       .map(([object, type]) => ({ object, type }))
       .sort((left, right) => (left.object < right.object ? -1 : left.object > right.object ? 1 : 0));
-  }
-
-  private async subjectReveries(object: ObjectId): Promise<readonly ReverieRecord[]> {
-    const note = await this.repository.readNoteFromRef(NOTES_REF, object);
-    if (note === null) return [];
-    const parsed = parseNote(note, "tolerant", { verifyIds: false });
-    return parsed.records.filter((record): record is ReverieRecord => record.type === "reverie");
   }
 
   private async retentionVault(): Promise<{
@@ -1400,57 +1763,11 @@ export class Reveries {
   }
 
   private async validateNotesRef(ref: string): Promise<void> {
-    const entries = await this.repository.listNotes(ref);
-    let initialization: ObjectId | null = null;
-    for (const entry of entries) {
-      try {
-        const strict = await this.strictRead(entry.object, ref);
-        const objectType = (await this.repository.run(["cat-file", "-t", entry.object])).stdout.trim();
-        if (strict.records.some((record) => record.type === "reveries-init")) {
-          if (objectType !== "commit") {
-            throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
-          }
-          if (initialization !== null) {
-            throw new Error("More than one Reveries initialization boundary exists");
-          }
-          initialization = entry.object;
-        }
-        if (objectType === "blob" && strict.records.some((record) => record.type !== "reverie")) {
-          throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
-        }
-        if (objectType === "commit" && strict.records.some((record) => record.type === "reverie")) {
-          throw new Error(`Commit ${entry.object} has a file reverie record`);
-        }
-        if (objectType !== "blob" && objectType !== "commit" && strict.records.length > 0) {
-          throw new Error(`Protocol records cannot be attached to ${objectType} object ${entry.object}`);
-        }
-      } catch (error: unknown) {
-        throw new NotesRefValidationError(entry.object, error);
-      }
-    }
+    await this.validateNotesSnapshot(await this.loadEvidenceSnapshot({ ref }));
   }
 
   private async validateSources(records: readonly NoteRecord[], ref: string): Promise<void> {
-    for (const record of records) {
-      for (const source of allSources(record)) {
-        if (source.kind === "commit" || source.kind === "blob") {
-          const object = objectId(source.ref);
-          if (!(await this.repository.objectExists(source.kind, object))) {
-            throw new Error(`Broken local ${source.kind} source: ${source.ref}`);
-          }
-        } else if (source.kind === "path") {
-          if (source.at === undefined) throw new Error("A path source requires an at commit");
-          await this.repository.resolvePath({ path: source.ref, revision: source.at });
-        } else if (source.kind === "note") {
-          const found = await this.findReverie(source.ref, ref);
-          if (!found) throw new Error(`Referenced reverie does not exist: ${source.ref}`);
-        } else if (source.kind === "git-email") {
-          if (!/^[^\s@]+@[^\s@]+$/.test(source.ref)) throw new Error(`Invalid Git email source: ${source.ref}`);
-        } else if (!/^(?:github|gitlab|linear|jira|generic):\S+$/.test(source.ref)) {
-          throw new Error(`Invalid issue source: ${source.ref}`);
-        }
-      }
-    }
+    await this.validateSourcesWithLookup(records, (id) => this.findReverie(id, ref));
   }
 
   private async findReverie(id: string, ref: string): Promise<boolean> {
@@ -1464,35 +1781,9 @@ export class Reveries {
   }
 
   private async findInitialization(): Promise<{ readonly commit: CommitId; readonly record: ReveriesInit } | null> {
-    let found: { readonly commit: CommitId; readonly record: ReveriesInit } | null = null;
-    for (const entry of await this.evidenceNotes()) {
-      const note = await this.readEvidenceNote(entry.object);
-      if (note === null) continue;
-      const parsed = parseNote(note, "tolerant", { verifyIds: false });
-      for (const record of parsed.records) {
-        if (record.type !== "reveries-init") continue;
-        if (found !== null) throw new Error("More than one Reveries initialization boundary exists");
-        if (!(await this.repository.objectExists("commit", entry.object))) {
-          throw new Error("The Reveries initialization record is not attached to a commit");
-        }
-        found = { commit: commitId(entry.object), record };
-      }
-    }
-    return found;
-  }
-
-  private async currentNoteTargets(revision: string): Promise<readonly NoteListEntry[]> {
-    const tree = await this.repository.listTree(revision);
-    const notes = new Map<string, NoteListEntry>();
-    const available = new Map((await this.evidenceNotes()).map((entry) => [entry.object, entry]));
-    for (const entry of tree) {
-      const note = available.get(entry.object);
-      if (note !== undefined) notes.set(note.object, note);
-    }
-    const commit = await this.repository.resolveCommit(revision);
-    const commitNote = available.get(commit);
-    if (commitNote !== undefined) notes.set(commitNote.object, commitNote);
-    return [...notes.values()];
+    const view = await this.loadCachedEvidenceSnapshot({});
+    if (view.initError !== null) throw new Error(view.initError);
+    return view.init;
   }
 
   private async stagedTransitions(): Promise<readonly DiffTransition[]> {

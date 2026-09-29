@@ -1,9 +1,18 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { blobId, commitId, objectId, type BlobId, type CommitId, type ObjectId } from "./protocol.ts";
+import {
+  assertNoteSize,
+  blobId,
+  commitId,
+  objectId,
+  type BlobId,
+  type CommitId,
+  type ObjectId,
+  type ResourceLimits,
+} from "./protocol.ts";
 
 export const NOTES_REF = "refs/notes/reveries";
 export const LEDGER_REF = "refs/heads/reveries-ledger";
@@ -106,6 +115,27 @@ interface GitStateFileSnapshot {
   readonly name: string;
   readonly path: string;
   readonly contents: Buffer | null;
+}
+
+export class SnapshotIndexCorruptError extends Error {
+  constructor(readonly tip: string) {
+    super(`Reveries snapshot index for ${tip} is corrupt and must be rebuilt`);
+    this.name = "SnapshotIndexCorruptError";
+  }
+}
+
+export interface BatchReadOptions {
+  readonly limits?: Partial<ResourceLimits> | undefined;
+}
+
+/** Pure Git blob hash of UTF-8 text or bytes; must match `git hash-object`. */
+export function hashBlobContent(
+  content: string | Uint8Array,
+  format: "sha1" | "sha256",
+): ObjectId {
+  const body = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+  const header = Buffer.from(`blob ${body.byteLength}\0`, "utf8");
+  return parseObjectId(createHash(format).update(header).update(body).digest("hex"), "blob content hash");
 }
 
 function compareUtf8(left: string, right: string): number {
@@ -264,6 +294,145 @@ export class GitRepository {
       if (result.exitCode === 0) return result.stdout;
     }
     return null;
+  }
+
+  /**
+   * Report every object type and size with one `cat-file --batch-check`
+   * process. Missing objects map to null; the caller decides whether that is
+   * an error.
+   */
+  async batchObjectDetails(
+    objects: readonly ObjectId[],
+  ): Promise<ReadonlyMap<ObjectId, { readonly type: string; readonly size: number } | null>> {
+    const unique = [...new Set(objects)];
+    const details = new Map<ObjectId, { readonly type: string; readonly size: number } | null>();
+    if (unique.length === 0) return details;
+    const raw = await this.runBinary(
+      ["cat-file", "--batch-check"],
+      { input: unique.map((object) => `${object}\n`).join("") },
+    );
+    for (const line of raw.toString("utf8").split("\n").filter((entry) => entry.length > 0)) {
+      const [oid, kind, sizeText] = line.split(" ");
+      if (oid === undefined || kind === undefined) throw new Error("Malformed git cat-file --batch-check line");
+      if (kind === "missing") {
+        details.set(oid as ObjectId, null);
+        continue;
+      }
+      const size = Number(sizeText);
+      if (!Number.isInteger(size) || size < 0) throw new Error("Malformed git cat-file --batch-check size");
+      details.set(oid as ObjectId, { type: kind, size });
+    }
+    for (const object of unique) {
+      if (!details.has(object)) details.set(object, null);
+    }
+    return details;
+  }
+
+  /**
+   * Report every object size with one `cat-file --batch-check` process.
+   * Missing objects map to null; the caller decides whether that is an error.
+   */
+  async batchObjectSizes(objects: readonly ObjectId[]): Promise<ReadonlyMap<ObjectId, number | null>> {
+    const details = await this.batchObjectDetails(objects);
+    return new Map([...details].map(([object, detail]) => [object, detail === null ? null : detail.size] as const));
+  }
+
+  /**
+   * Read every note body with one size pass and one body pass, no matter how
+   * many notes the snapshot holds. Note blobs over budget throw
+   * `LimitExceededError` before any body is loaded. The result maps each
+   * annotated object to its note body (null when the note blob is missing).
+   */
+  async readNotesBatch(
+    entries: readonly NoteListEntry[],
+    options: BatchReadOptions = {},
+  ): Promise<ReadonlyMap<ObjectId, string | null>> {
+    const bodies = new Map<ObjectId, string | null>();
+    if (entries.length === 0) return bodies;
+    const noteToObject = new Map<ObjectId, ObjectId>();
+    for (const entry of entries) noteToObject.set(entry.note, entry.object);
+    const sizes = await this.batchObjectSizes([...noteToObject.keys()]);
+    const wanted: ObjectId[] = [];
+    for (const [note, object] of noteToObject) {
+      const size = sizes.get(note);
+      if (size === null || size === undefined) {
+        bodies.set(object, null);
+        continue;
+      }
+      assertNoteSize(size, options.limits);
+      wanted.push(note);
+    }
+    if (wanted.length === 0) return bodies;
+    const raw = await this.runBinary(
+      ["cat-file", "--batch"],
+      { input: wanted.map((note) => `${note}\n`).join("") },
+    );
+    const bodyByNote = new Map<ObjectId, string | null>();
+    let offset = 0;
+    while (offset < raw.length) {
+      const newline = raw.indexOf(0x0a, offset);
+      if (newline < 0) throw new Error("Malformed git cat-file --batch output");
+      const [oid, kind, sizeText] = raw.subarray(offset, newline).toString("utf8").split(" ");
+      offset = newline + 1;
+      if (kind === "missing") {
+        bodyByNote.set(oid as ObjectId, null);
+        continue;
+      }
+      const size = Number(sizeText);
+      if (oid === undefined || !Number.isInteger(size) || size < 0) {
+        throw new Error("Malformed git cat-file --batch header");
+      }
+      const body = raw.subarray(offset, offset + size);
+      if (body.length !== size) throw new Error("Truncated git cat-file --batch output");
+      offset += size;
+      if (raw[offset] !== 0x0a) throw new Error("Malformed git cat-file --batch terminator");
+      offset += 1;
+      bodyByNote.set(oid as ObjectId, body.toString("utf8"));
+    }
+    for (const [note, object] of noteToObject) {
+      if (bodies.has(object)) continue;
+      bodies.set(object, bodyByNote.get(note) ?? null);
+    }
+    return bodies;
+  }
+
+  async runBinary(args: readonly string[], options: RunOptions = {}): Promise<Buffer> {
+    return runGitBinary(this.commandCwd, args, options);
+  }
+
+  /** Disposable snapshot-index directory; the index is a cache, never authority. */
+  snapshotIndexDirectory(): string {
+    return join(this.commonDir, "reveries", "snapshot-index");
+  }
+
+  snapshotIndexPath(notesTip: ObjectId | string): string {
+    const tip = String(notesTip);
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(tip)) {
+      throw new Error(`Invalid snapshot index tip: ${tip}`);
+    }
+    return join(this.snapshotIndexDirectory(), `${tip}.json`);
+  }
+
+  async readSnapshotIndex(notesTip: ObjectId | string): Promise<string | null> {
+    try {
+      return await readFile(this.snapshotIndexPath(notesTip), "utf8");
+    } catch (error: unknown) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async writeSnapshotIndex(notesTip: ObjectId | string, payload: string): Promise<void> {
+    await mkdir(this.snapshotIndexDirectory(), { recursive: true });
+    await writeFile(this.snapshotIndexPath(notesTip), payload, "utf8");
+  }
+
+  async clearSnapshotIndex(notesTip?: ObjectId | string): Promise<void> {
+    if (notesTip === undefined) {
+      await rm(this.snapshotIndexDirectory(), { recursive: true, force: true });
+      return;
+    }
+    await rm(this.snapshotIndexPath(notesTip), { force: true });
   }
 
   async notesTip(ref = NOTES_REF): Promise<ObjectId | null> {
@@ -836,6 +1005,43 @@ export class GitRepository {
       { environment: { [INTERNAL_ATOMIC_PUSH_ENV]: "1" } },
     );
   }
+}
+
+async function runGitBinary(cwd: string, args: readonly string[], options: RunOptions = {}): Promise<Buffer> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      env: { ...process.env, ...options.environment },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", reject);
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE") reject(error);
+    });
+    child.on("close", (exitCode) => {
+      const code = exitCode ?? 128;
+      const allowed = options.allowExitCodes ?? [0];
+      if (!allowed.includes(code)) {
+        reject(new GitCommandError(args, {
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
+          exitCode: code,
+        }));
+        return;
+      }
+      resolvePromise(Buffer.concat(stdout));
+    });
+    if (options.input !== undefined) {
+      child.stdin.end(options.input, "utf8");
+    } else {
+      child.stdin.end();
+    }
+  });
 }
 
 async function runGit(cwd: string, args: readonly string[], options: RunOptions = {}): Promise<GitResult> {
