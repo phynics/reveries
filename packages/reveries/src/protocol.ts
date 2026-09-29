@@ -95,7 +95,122 @@ export type Diagnostic = {
 export type ParsedNote = {
   records: NoteRecord[];
   diagnostics: Diagnostic[];
+  truncated: boolean;
 };
+
+export type ResourceLimits = {
+  maxNoteBytes: number;
+  maxRecordsPerNote: number;
+  maxRecordBytes: number;
+  maxNarrativeChars: number;
+  maxRefChars: number;
+  maxAlternatives: number;
+  maxSources: number;
+  maxSupersedes: number;
+  maxReveries: number;
+  maxRetirements: number;
+  maxEntries: number;
+  maxGraphVisits: number;
+  maxDiagnostics: number;
+};
+
+export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
+  maxNoteBytes: 1_048_576,
+  maxRecordsPerNote: 1_024,
+  maxRecordBytes: 65_536,
+  maxNarrativeChars: 8_192,
+  maxRefChars: 1_024,
+  maxAlternatives: 32,
+  maxSources: 64,
+  maxSupersedes: 64,
+  maxReveries: 64,
+  maxRetirements: 64,
+  maxEntries: 64,
+  maxGraphVisits: 131_072,
+  maxDiagnostics: 32,
+});
+
+export class LimitExceededError extends Error {
+  readonly limit: keyof ResourceLimits;
+  readonly actual: number;
+  readonly budget: number;
+
+  constructor(limit: keyof ResourceLimits, actual: number, budget: number, detail = "value") {
+    super(`${detail} exceeds ${limit}: ${actual} > ${budget}`);
+    this.name = "LimitExceededError";
+    this.limit = limit;
+    this.actual = actual;
+    this.budget = budget;
+  }
+}
+
+export function resolveLimits(overrides: Partial<ResourceLimits> = {}): Readonly<ResourceLimits> {
+  return Object.freeze({ ...DEFAULT_LIMITS, ...overrides });
+}
+
+function utf8Length(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+export type NoteSizeCheck =
+  | { ok: true; byteLength: number }
+  | { ok: false; byteLength: number; budget: number };
+
+export function checkNoteSize(byteLength: number, limits: Partial<ResourceLimits> = {}): NoteSizeCheck {
+  const budget = resolveLimits(limits).maxNoteBytes;
+  if (byteLength <= budget) return { ok: true, byteLength };
+  return { ok: false, byteLength, budget };
+}
+
+export function assertNoteSize(byteLength: number, limits: Partial<ResourceLimits> = {}): void {
+  const resolved = resolveLimits(limits);
+  if (byteLength > resolved.maxNoteBytes) {
+    throw new LimitExceededError("maxNoteBytes", byteLength, resolved.maxNoteBytes, "note body");
+  }
+}
+
+export type EvidenceSnapshot = {
+  readonly notesTip: string;
+  readonly records: readonly NoteRecord[];
+  readonly byId: ReadonlyMap<ReverieId, NoteRecord>;
+  readonly diagnostics: readonly Diagnostic[];
+  readonly diagnosticsTruncated: boolean;
+  readonly limits: Readonly<ResourceLimits>;
+};
+
+export type EvidenceSnapshotInput = {
+  notesTip: string;
+  records: readonly NoteRecord[];
+  diagnostics?: readonly Diagnostic[];
+  diagnosticsTruncated?: boolean;
+  limits?: Partial<ResourceLimits>;
+  hashObject?: HashObject;
+};
+
+export function createEvidenceSnapshot(input: EvidenceSnapshotInput): EvidenceSnapshot {
+  const limits = resolveLimits(input.limits);
+  objectId(input.notesTip);
+  const records = validateNote(input.records, {
+    ...(input.hashObject === undefined ? {} : { hashObject: input.hashObject }),
+    limits,
+  });
+  const byId = new Map<ReverieId, NoteRecord>();
+  for (const record of records) {
+    if (record.type !== "reverie") continue;
+    if (!byId.has(record.id)) byId.set(record.id, record);
+  }
+  const diagnostics = (input.diagnostics ?? []).slice(0, limits.maxDiagnostics);
+  const diagnosticsTruncated = (input.diagnosticsTruncated ?? false)
+    || (input.diagnostics ?? []).length > limits.maxDiagnostics;
+  return {
+    notesTip: input.notesTip,
+    records,
+    byId,
+    diagnostics,
+    diagnosticsTruncated,
+    limits,
+  };
+}
 
 export type HashObject = (bytes: Uint8Array) => ObjectId;
 
@@ -134,14 +249,36 @@ function trimText(value: string, field: string): string {
   return trimmed;
 }
 
-function recurrenceText(value: string, field: string): string {
+function checkChars(value: string, budget: number, limit: keyof ResourceLimits, field: string): void {
+  const actual = [...value].length;
+  if (actual > budget) throw new LimitExceededError(limit, actual, budget, field);
+}
+
+function checkArrayLength(values: readonly unknown[], budget: number, limit: keyof ResourceLimits, field: string): void {
+  if (values.length > budget) throw new LimitExceededError(limit, values.length, budget, field);
+}
+
+function trimNarrative(value: string, field: string, limits: Readonly<ResourceLimits>): string {
   const trimmed = trimText(value, field);
+  checkChars(trimmed, limits.maxNarrativeChars, "maxNarrativeChars", field);
+  return trimmed;
+}
+
+function trimRef(value: string, field: string, limits: Readonly<ResourceLimits>): string {
+  const trimmed = trimText(value, field);
+  checkChars(trimmed, limits.maxRefChars, "maxRefChars", field);
+  return trimmed;
+}
+
+function recurrenceText(value: string, field: string, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): string {
+  const trimmed = trimNarrative(value, field, limits);
   if (/^(?:n\/a|none|tests pass)\.?$/i.test(trimmed)) throw new Error(`${field} cannot be a placeholder`);
   return trimmed;
 }
 
-function validateEmail(value: unknown, field: string): asserts value is string {
+function validateEmail(value: unknown, field: string, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): asserts value is string {
   if (typeof value !== "string" || !EMAIL.test(value)) throw new Error(`${field} must be a Git email address`);
+  checkChars(value, limits.maxRefChars, "maxRefChars", field);
 }
 
 function normalizeSource(source: Source): Source {
@@ -202,7 +339,9 @@ export function createReverie(
   input: ReverieInput,
   metadata: ReverieMetadata,
   hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
 ): ReverieRecord {
+  const resolved = resolveLimits(limits);
   const semantic = normalizeSemantic(input);
   validateTimestamp(metadata.created_at, "created_at");
   const id = `rv:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as ReverieId;
@@ -210,11 +349,11 @@ export function createReverie(
     ...semantic,
     type: "reverie",
     id,
-    author_email: trimText(metadata.author_email, "author_email"),
-    session: metadata.session === null ? null : trimText(metadata.session, "session"),
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
     created_at: metadata.created_at,
   };
-  validateRecord(record, hashObject);
+  validateRecord(record, hashObject, resolved);
   return record;
 }
 
@@ -296,35 +435,40 @@ function validateTimestamp(value: unknown, field: string): asserts value is stri
   }
 }
 
-function validateSource(source: unknown): asserts source is Source {
+function validateSource(source: unknown, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): asserts source is Source {
   if (!source || typeof source !== "object" || Array.isArray(source)) throw new Error("source must be an object");
   const value = source as Record<string, unknown>;
   if (typeof value.relation !== "string" || !RELATIONS.has(value.relation as SourceRelation)) throw new Error("invalid source relation");
   if (typeof value.kind !== "string" || !KINDS.has(value.kind as SourceKind)) throw new Error("invalid source kind");
   if (typeof value.ref !== "string" || !value.ref.trim()) throw new Error("source.ref must be nonempty");
+  checkChars(value.ref.trim(), limits.maxRefChars, "maxRefChars", "source.ref");
   if (value.kind === "path") {
     if (value.at === undefined) throw new Error("path source requires an at commit");
     commitId(String(value.at));
   } else if (value.at !== undefined) throw new Error("source.at is valid only for a path source");
   if (value.kind === "commit" || value.kind === "blob") objectId(value.ref);
   else if (value.kind === "note") reverieId(value.ref);
-  else if (value.kind === "git-email") validateEmail(value.ref, "source.ref");
+  else if (value.kind === "git-email") validateEmail(value.ref, "source.ref", limits);
   else if (value.kind === "issue" && !ISSUE.test(value.ref)) throw new Error("invalid issue source reference");
 }
 
-function validateRecord(record: NoteRecord, hashObject?: HashObject): void {
+function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): void {
   if (record.v !== 1) throw new Error("v must be exactly 1");
   if (record.type === "reverie") {
     if (!REVERIE_ID.test(record.id)) throw new Error("invalid reverie ID");
     if (!Array.isArray(record.alternatives) || !Array.isArray(record.sources) || !Array.isArray(record.supersedes)) throw new Error("reverie arrays are required");
-    for (const source of record.sources) validateSource(source);
+    checkArrayLength(record.alternatives, limits.maxAlternatives, "maxAlternatives", "alternatives");
+    checkArrayLength(record.sources, limits.maxSources, "maxSources", "sources");
+    checkArrayLength(record.supersedes, limits.maxSupersedes, "maxSupersedes", "supersedes");
+    for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
+    for (const source of record.sources) validateSource(source, limits);
     for (const id of record.supersedes) reverieId(id);
-    trimText(record.driving_event, "driving_event");
-    trimText(record.decision, "decision");
-    trimText(record.impact, "impact");
-    if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control");
-    validateEmail(record.author_email, "author_email");
-    if (record.session !== null) trimText(record.session, "session");
+    trimNarrative(record.driving_event, "driving_event", limits);
+    trimNarrative(record.decision, "decision", limits);
+    trimNarrative(record.impact, "impact", limits);
+    if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control", limits);
+    validateEmail(record.author_email, "author_email", limits);
+    if (record.session !== null) trimRef(record.session, "session", limits);
     validateTimestamp(record.created_at, "created_at");
     if (hashObject) {
       const expected = `rv:${hashObject(Buffer.from(`${semanticPayload(record)}\n`, "utf8"))}`;
@@ -333,34 +477,41 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject): void {
     return;
   }
   if (record.type === "session-summary") {
-    validateEmail(record.author_email, "author_email");
-    if (record.session !== null) trimText(record.session, "session");
+    validateEmail(record.author_email, "author_email", limits);
+    if (record.session !== null) trimRef(record.session, "session", limits);
     validateTimestamp(record.created_at, "created_at");
     if (!Array.isArray(record.entries) || record.entries.length === 0) throw new Error("entries must be nonempty");
+    checkArrayLength(record.entries, limits.maxEntries, "maxEntries", "entries");
     for (const entry of record.entries) {
-      trimText(entry.driving_event, "entry.driving_event");
-      trimText(entry.decision, "entry.decision");
-      trimText(entry.impact, "entry.impact");
-      if (entry.recurrence_control !== null) recurrenceText(entry.recurrence_control, "entry.recurrence_control");
+      trimNarrative(entry.driving_event, "entry.driving_event", limits);
+      trimNarrative(entry.decision, "entry.decision", limits);
+      trimNarrative(entry.impact, "entry.impact", limits);
+      if (entry.recurrence_control !== null) recurrenceText(entry.recurrence_control, "entry.recurrence_control", limits);
       if (!Array.isArray(entry.alternatives) || !Array.isArray(entry.sources) || !Array.isArray(entry.reveries) || !Array.isArray(entry.retirements)) throw new Error("summary entry arrays are required");
-      for (const source of entry.sources) validateSource(source);
+      checkArrayLength(entry.alternatives, limits.maxAlternatives, "maxAlternatives", "entry.alternatives");
+      checkArrayLength(entry.sources, limits.maxSources, "maxSources", "entry.sources");
+      checkArrayLength(entry.reveries, limits.maxReveries, "maxReveries", "entry.reveries");
+      checkArrayLength(entry.retirements, limits.maxRetirements, "maxRetirements", "entry.retirements");
+      for (const alternative of entry.alternatives) trimNarrative(alternative, "entry.alternatives item", limits);
+      for (const source of entry.sources) validateSource(source, limits);
       for (const id of entry.reveries) reverieId(id);
       for (const retirement of entry.retirements) {
         reverieId(retirement.reverie);
         blobId(retirement.from_blob);
-        trimText(retirement.reason, "retirement.reason");
+        trimNarrative(retirement.reason, "retirement.reason", limits);
       }
     }
-    if (record.correction_reason !== undefined) trimText(record.correction_reason, "correction_reason");
+    if (record.correction_reason !== undefined) trimNarrative(record.correction_reason, "correction_reason", limits);
     return;
   }
   if (record.protocol !== 1 || record.notes_ref !== NOTES_REF) throw new Error("invalid Reveries initialization record");
   if (!Array.isArray(record.publishing_remotes) || !Array.isArray(record.hosts)) throw new Error("initialization arrays are required");
-  for (const remote of record.publishing_remotes) trimText(remote, "publishing remote");
+  for (const remote of record.publishing_remotes) trimRef(remote, "publishing remote", limits);
   for (const host of record.hosts) {
     if (typeof host !== "string" || !HOSTS.has(host)) throw new Error(`unsupported initialization host: ${String(host)}`);
+    checkChars(host, limits.maxRefChars, "maxRefChars", "initialization host");
   }
-  validateEmail(record.author_email, "author_email");
+  validateEmail(record.author_email, "author_email", limits);
   validateTimestamp(record.created_at, "created_at");
 }
 
@@ -368,6 +519,7 @@ export type ValidateOptions = {
   hashObject?: HashObject;
   requireCanonical?: boolean;
   verifyIds?: boolean;
+  limits?: Partial<ResourceLimits>;
 };
 
 export function validateNote(
@@ -378,11 +530,13 @@ export function validateNote(
   const parsed = isRecordList ? undefined : input as ParsedNote;
   const records = isRecordList ? [...input as readonly NoteRecord[]] : [...parsed!.records];
   if (parsed !== undefined && parsed.diagnostics.length > 0) throw new Error("note contains malformed records");
+  const limits = resolveLimits(options.limits);
+  checkArrayLength(records, limits.maxRecordsPerNote, "maxRecordsPerNote", "note records");
   const verifyIds = options.verifyIds ?? options.hashObject !== undefined;
   if (verifyIds && options.hashObject === undefined) {
     throw new Error("Semantic ID verification requires the repository hashObject function");
   }
-  for (const record of records) validateRecord(record, verifyIds ? options.hashObject : undefined);
+  for (const record of records) validateRecord(record, verifyIds ? options.hashObject : undefined, limits);
   const summaries = records.filter((record): record is SessionSummary => record.type === "session-summary");
   const inits = records.filter((record): record is ReveriesInit => record.type === "reveries-init");
   if (summaries.length > 1) throw new Error("note contains more than one session summary");
@@ -390,8 +544,13 @@ export function validateNote(
   if (inits.length > 0 && (summaries.length !== 1 || records.length !== 2)) throw new Error("initialization note must contain exactly one summary and one init record");
   if (summaries.length === 0 && inits.length === 0 && records.some((record) => record.type !== "reverie")) throw new Error("blob note contains a non-reverie record");
   const byId = new Map<ReverieId, string>();
+  let graphVisits = 0;
   for (const record of records) {
     if (record.type !== "reverie") continue;
+    graphVisits += 1 + record.supersedes.length;
+    if (graphVisits > limits.maxGraphVisits) {
+      throw new LimitExceededError("maxGraphVisits", graphVisits, limits.maxGraphVisits, "supersession graph");
+    }
     const semantic = semanticPayload(record);
     const previous = byId.get(record.id);
     if (previous !== undefined && previous !== semantic) throw new Error(`conflicting duplicate reverie ID: ${record.id}`);
@@ -407,30 +566,51 @@ export function parseNote(
 ): ParsedNote {
   const records: NoteRecord[] = [];
   const diagnostics: Diagnostic[] = [];
-  if (text.length === 0) return { records, diagnostics };
+  const limits = resolveLimits(options.limits);
+  assertNoteSize(utf8Length(text), limits);
+  let truncated = false;
+  const pushDiagnostic = (diagnostic: Diagnostic): void => {
+    if (diagnostics.length < limits.maxDiagnostics) diagnostics.push(diagnostic);
+    else truncated = true;
+  };
+  if (text.length === 0) return { records, diagnostics, truncated };
   if (!text.endsWith("\n")) {
     const diagnostic = { message: "note must end with one LF" };
     if (mode === "strict") throw new Error(diagnostic.message);
-    diagnostics.push(diagnostic);
+    pushDiagnostic(diagnostic);
   }
   const lines = text.split("\n");
   const limit = text.endsWith("\n") ? lines.length - 1 : lines.length;
   for (let index = 0; index < limit; index += 1) {
     const line = lines[index] ?? "";
+    const lineBytes = utf8Length(line) + 1;
+    if (lineBytes > limits.maxRecordBytes) {
+      const field = `record on line ${index + 1}`;
+      if (mode === "strict") throw new LimitExceededError("maxRecordBytes", lineBytes, limits.maxRecordBytes, field);
+      pushDiagnostic({ line: index + 1, message: `${field} exceeds maxRecordBytes: ${lineBytes} > ${limits.maxRecordBytes}` });
+      continue;
+    }
+    if (records.length >= limits.maxRecordsPerNote) {
+      const field = "note records";
+      if (mode === "strict") throw new LimitExceededError("maxRecordsPerNote", records.length + 1, limits.maxRecordsPerNote, field);
+      pushDiagnostic({ message: `${field} exceed maxRecordsPerNote: more than ${limits.maxRecordsPerNote} records` });
+      truncated = true;
+      break;
+    }
     try {
       if (!line || line.includes("\r")) throw new Error("invalid JSONL line");
       const parsed = asRecord(JSON.parse(line));
-      validateRecord(parsed, options.hashObject);
+      validateRecord(parsed, options.hashObject, limits);
       if (mode === "strict" && canonicalRecord(parsed) !== `${line}\n`) throw new Error("record is not canonical JSON");
       records.push(parsed);
     } catch (error) {
       const diagnostic = { line: index + 1, message: error instanceof Error ? error.message : String(error) };
       if (mode === "strict") throw new Error(`line ${diagnostic.line}: ${diagnostic.message}`);
-      diagnostics.push(diagnostic);
+      pushDiagnostic(diagnostic);
     }
   }
   if (mode === "strict") validateNote(records, { ...options, verifyIds: options.hashObject !== undefined });
-  return { records, diagnostics };
+  return { records, diagnostics, truncated };
 }
 
 export type ActiveProjection = import("./projection.ts").ActiveProjection;
