@@ -156,6 +156,8 @@ export interface InitializationResult {
   };
   readonly hookSnippets: readonly string[];
   readonly nextCommands: readonly string[];
+  /** Git-only contributor steps; empty when a working helper is configured. */
+  readonly noHelperGuidance: readonly string[];
 }
 
 export interface RemovalOptions {
@@ -277,6 +279,24 @@ function shellQuote(value: string): string {
 
 export function hookInvocation(helper: HelperInvocation, hook: "pre-push" | "post-commit"): string {
   return [helper.command, ...helper.args, hook].map(shellQuote).join(" ") + ' "$@"';
+}
+
+/**
+ * Git-only contributor steps for clones without a working helper. The steps
+ * orchestrate the direct-Git recipes into a flow that reaches a passing
+ * receive check; same-repo and fork variants live in CONTRIBUTING.md.
+ */
+export function noHelperContributorGuidance(): readonly string[] {
+  return [
+    "No working helper is configured: follow CONTRIBUTING.md for the Git-only same-repo and fork flows.",
+    "Fetch approved evidence before changing code: git fetch <remote> '+refs/notes/reveries*:refs/notes/reveries*' (use a publishing remote).",
+    "Inspect blob decisions with git notes --ref=refs/notes/reveries show \"$(git rev-parse 'HEAD:<path>')\"; continue, supersede, or retire every active decision using .agents/skills/using-reveries/references/direct-git.md.",
+    "Attach exactly one session summary per commit, then publish notes before code; the separate pushes are not atomic. Prefer `reveries push <remote>` when the helper is available.",
+  ];
+}
+
+async function resolveNoHelperGuidance(helper: HelperInvocation | undefined): Promise<readonly string[]> {
+  return await helperInvocationAvailable(helper) ? [] : noHelperContributorGuidance();
 }
 
 export async function helperInvocationAvailable(helper: HelperInvocation | undefined): Promise<boolean> {
@@ -1454,6 +1474,7 @@ async function initializeUnlocked(
     templatePaths,
     hookSnippets,
     nextCommands,
+    noHelperGuidance: await resolveNoHelperGuidance(options.helper),
   };
 }
 
@@ -1520,6 +1541,8 @@ export interface RepairResult {
   readonly hookSnippets: readonly string[];
   readonly diagnostics: readonly string[];
   readonly unsupportedManagers: readonly string[];
+  /** Git-only contributor steps; empty when a working helper is configured. */
+  readonly noHelperGuidance: readonly string[];
 }
 
 /**
@@ -1567,6 +1590,7 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
         hookSnippets: [],
         diagnostics,
         unsupportedManagers: [],
+        noHelperGuidance: await resolveNoHelperGuidance(options.helper),
       };
     }
 
@@ -1606,6 +1630,7 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
       hookSnippets: local.hookSnippets,
       diagnostics: allDiagnostics,
       unsupportedManagers: local.unsupportedManagers,
+      noHelperGuidance: await resolveNoHelperGuidance(options.helper),
     };
   });
 }

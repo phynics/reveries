@@ -807,3 +807,24 @@ test("manual setup blocks match every helper Skill and host template byte-for-by
     );
   }
 });
+
+test("initialization without a helper emits Git-only contributor guidance", async () => {
+  const directory = await createRepository();
+  const withoutHelper = await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+  });
+  assert.ok(withoutHelper.noHelperGuidance.length > 0);
+  assert.match(withoutHelper.noHelperGuidance.join("\n"), /CONTRIBUTING\.md/);
+
+  const withHelper = await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+  assert.deepEqual(withHelper.noHelperGuidance, []);
+});

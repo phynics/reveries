@@ -31,7 +31,37 @@ async function git(...args) {
   return result.stdout.trim();
 }
 
-export async function createReceiveProposal(event, git) {
+export function parseScriptArgs(argv) {
+  const options = { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--allow-pr-description-summary") {
+      options.allowPrDescriptionSummary = true;
+    } else if (token === "--fork-evidence-manifest") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error("--fork-evidence-manifest requires a value");
+      }
+      options.forkEvidenceManifestPath = value;
+      index += 1;
+    } else {
+      throw new Error(`unknown option ${token}`);
+    }
+  }
+  return options;
+}
+
+export async function readForkEvidenceManifest(path) {
+  const manifest = JSON.parse(await readFile(path, "utf8"));
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error(`The fork evidence manifest at ${path} must be a JSON object`);
+  }
+  return manifest;
+}
+
+export async function createReceiveProposal(event, git, options = {}) {
+  const allowPrDescriptionSummary = options.allowPrDescriptionSummary === true;
+  const forkEvidence = options.forkEvidence ?? null;
   const notesTip = await git("rev-parse", "refs/notes/reveries");
   let baseSha;
   let headSha;
@@ -52,26 +82,85 @@ export async function createReceiveProposal(event, git) {
   const transitionBaseSha = event.pull_request === undefined
     ? baseSha
     : await git("merge-base", baseSha, headSha);
-  return {
+  let notesOld = notesTip;
+  let notesNew = notesTip;
+  const evidence = [
+    { object: headSha, base_tree: baseTree },
+    { object: notesTip },
+  ];
+  if (forkEvidence !== null) {
+    // Fork evidence arrives as Git objects plus a JSON manifest; the fork's
+    // code is never checked out or executed. The manifest only selects which
+    // notes tip the proposal carries.
+    if (forkEvidence.state !== "imported") {
+      throw new Error("The fork evidence manifest reports no imported evidence; the fork must publish refs/notes/reveries");
+    }
+    const pullNumber = event.pull_request?.number;
+    if (forkEvidence.pull_request !== pullNumber) {
+      throw new Error("The fork evidence manifest targets a different pull request");
+    }
+    if (typeof forkEvidence.notes_tip !== "string" || forkEvidence.notes_tip.length === 0) {
+      throw new Error("The fork evidence manifest has no notes tip");
+    }
+    notesNew = forkEvidence.notes_tip;
+    evidence.push({ object: notesNew });
+  }
+  const proposal = {
     updates: [
       { ref, old: transitionBaseSha, new: headSha },
-      { ref: "refs/notes/reveries", old: notesTip, new: notesTip },
+      { ref: "refs/notes/reveries", old: notesOld, new: notesNew },
     ],
     base_tree: baseTree,
-    evidence: [
-      { object: headSha, base_tree: baseTree },
-      { object: notesTip },
-    ],
+    evidence,
+    allow_pr_description_summary: allowPrDescriptionSummary,
   };
+  if (allowPrDescriptionSummary) {
+    // Description text only: never checked out, never executed. The checker
+    // marks any coverage from this text as explicitly lower-grade.
+    const body = event.pull_request?.body;
+    if (typeof body === "string" && body.trim().length > 0) {
+      proposal.pr_description = body;
+    }
+  }
+  return proposal;
+}
+
+export function formatFinding(finding) {
+  const identity = [finding.ref, finding.commit].filter((part) => typeof part === "string" && part.length > 0).join(" ");
+  const header = `[${finding.code}]${finding.grade === "lower" ? " (lower-grade)" : ""}${identity.length === 0 ? "" : ` ${identity}`}`;
+  return [`${header}: ${finding.detail}`, "Remedy:", ...finding.remediation.split("\n").map((line) => `  ${line}`)].join("\n");
+}
+
+export function formatReport(output) {
+  const findings = Array.isArray(output?.result?.findings) ? output.result.findings : [];
+  if (findings.length === 0) return "";
+  const blocks = findings.map(formatFinding);
+  if (output?.ok === true) {
+    return ["WARNING: the receive check passed with lower-grade coverage.", ...blocks].join("\n\n");
+  }
+  return [`The receive check failed with ${findings.length} finding(s).`, ...blocks].join("\n\n");
 }
 
 async function main() {
+  const options = parseScriptArgs(process.argv.slice(2));
   const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, "utf8"));
-  const proposal = await createReceiveProposal(event, git);
+  const forkEvidence = options.forkEvidenceManifestPath === null
+    ? null
+    : await readForkEvidenceManifest(options.forkEvidenceManifestPath);
+  const proposal = await createReceiveProposal(event, git, {
+    allowPrDescriptionSummary: options.allowPrDescriptionSummary,
+    forkEvidence,
+  });
   const cli = join(workspace, "packages", "reveries", "dist", "src", "main.js");
   const result = await run(process.execPath, [cli, "receive-check", "--json"], `${JSON.stringify(proposal)}\n`);
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);
+  try {
+    const report = formatReport(JSON.parse(result.stdout));
+    if (report.length > 0) process.stderr.write(`${report}\n`);
+  } catch {
+    // Keep the checker's raw output authoritative when it is not JSON.
+  }
   process.exitCode = result.code;
 }
 

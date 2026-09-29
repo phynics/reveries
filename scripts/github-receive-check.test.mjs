@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { createReceiveProposal } from "./github-receive-check.mjs";
+import { createReceiveProposal, formatFinding, formatReport, parseScriptArgs } from "./github-receive-check.mjs";
 
 const workflow = await readFile(new URL("../.github/workflows/reveries-receive-check.yml", import.meta.url), "utf8");
 
@@ -81,6 +81,7 @@ test("pull request events map proposed code and evidence to the base-tree-bound 
       { object: headSha, base_tree: baseTree },
       { object: notesTip },
     ],
+    allow_pr_description_summary: false,
   });
   assert.deepEqual(calls, [
     ["rev-parse", "refs/notes/reveries"],
@@ -117,9 +118,190 @@ test("merge-group payloads remain supported by the script proposal adapter", asy
       { object: headSha, base_tree: baseTree },
       { object: notesTip },
     ],
+    allow_pr_description_summary: false,
   });
   assert.deepEqual(calls, [
     ["rev-parse", "refs/notes/reveries"],
     ["rev-parse", `${baseSha}^{tree}`],
   ]);
+});
+
+test("script arguments default to a disabled PR-description fallback", () => {
+  assert.deepEqual(parseScriptArgs([]), { allowPrDescriptionSummary: false, forkEvidenceManifestPath: null });
+  assert.deepEqual(parseScriptArgs(["--allow-pr-description-summary"]), {
+    allowPrDescriptionSummary: true,
+    forkEvidenceManifestPath: null,
+  });
+  assert.deepEqual(parseScriptArgs(["--fork-evidence-manifest", "/tmp/evidence.json"]), {
+    allowPrDescriptionSummary: false,
+    forkEvidenceManifestPath: "/tmp/evidence.json",
+  });
+  assert.throws(() => parseScriptArgs(["--unknown-flag"]), /unknown option/);
+  assert.throws(() => parseScriptArgs(["--fork-evidence-manifest"]), /requires a value/);
+});
+
+test("the PR-description fallback stays off unless explicitly allowed", async () => {
+  const { git } = gitFor(new Map([
+    [JSON.stringify(["rev-parse", "refs/notes/reveries"]), "notes-tip"],
+    [JSON.stringify(["rev-parse", "base-commit^{tree}"]), "base-tree"],
+    [JSON.stringify(["merge-base", "base-commit", "proposed-commit"]), "transition-base"],
+  ]));
+  const event = {
+    pull_request: {
+      number: 27,
+      body: "A description that must not be used by default.",
+      base: { sha: "base-commit" },
+      head: { sha: "proposed-commit" },
+    },
+  };
+  const proposal = await createReceiveProposal(event, git);
+  assert.equal(proposal.allow_pr_description_summary, false);
+  assert.ok(!("pr_description" in proposal));
+});
+
+test("an explicitly allowed fallback forwards description text only", async () => {
+  const { git } = gitFor(new Map([
+    [JSON.stringify(["rev-parse", "refs/notes/reveries"]), "notes-tip"],
+    [JSON.stringify(["rev-parse", "base-commit^{tree}"]), "base-tree"],
+    [JSON.stringify(["merge-base", "base-commit", "proposed-commit"]), "transition-base"],
+  ]));
+  const body = "Describe the transition for reviewers.";
+  const proposal = await createReceiveProposal({
+    pull_request: {
+      number: 27,
+      body,
+      base: { sha: "base-commit" },
+      head: { sha: "proposed-commit" },
+    },
+  }, git, { allowPrDescriptionSummary: true });
+  assert.equal(proposal.allow_pr_description_summary, true);
+  assert.equal(proposal.pr_description, body);
+
+  const { git: emptyGit } = gitFor(new Map([
+    [JSON.stringify(["rev-parse", "refs/notes/reveries"]), "notes-tip"],
+    [JSON.stringify(["rev-parse", "base-commit^{tree}"]), "base-tree"],
+    [JSON.stringify(["merge-base", "base-commit", "proposed-commit"]), "transition-base"],
+  ]));
+  const withoutBody = await createReceiveProposal({
+    pull_request: {
+      number: 27,
+      body: "   ",
+      base: { sha: "base-commit" },
+      head: { sha: "proposed-commit" },
+    },
+  }, emptyGit, { allowPrDescriptionSummary: true });
+  assert.equal(withoutBody.allow_pr_description_summary, true);
+  assert.ok(!("pr_description" in withoutBody));
+});
+
+test("imported fork evidence proposes the manifest tip without executing fork code", async () => {
+  const { git } = gitFor(new Map([
+    [JSON.stringify(["rev-parse", "refs/notes/reveries"]), "base-notes-tip"],
+    [JSON.stringify(["rev-parse", "base-commit^{tree}"]), "base-tree"],
+    [JSON.stringify(["merge-base", "base-commit", "proposed-commit"]), "transition-base"],
+  ]));
+  const proposal = await createReceiveProposal({
+    pull_request: {
+      number: 27,
+      base: { sha: "base-commit" },
+      head: { sha: "proposed-commit" },
+    },
+  }, git, {
+    forkEvidence: {
+      v: 1,
+      state: "imported",
+      pull_request: 27,
+      source_repository: "fork/reveries",
+      notes_tip: "fork-notes-tip",
+      evidence_objects: ["fork-notes-tip"],
+    },
+  });
+  assert.deepEqual(proposal.updates, [
+    { ref: "refs/pull/27/head", old: "transition-base", new: "proposed-commit" },
+    { ref: "refs/notes/reveries", old: "base-notes-tip", new: "fork-notes-tip" },
+  ]);
+  assert.ok(proposal.evidence.some((item) => item.object === "fork-notes-tip"));
+});
+
+test("fork evidence for another pull request or without evidence fails closed", async () => {
+  const { git } = gitFor(new Map([
+    [JSON.stringify(["rev-parse", "refs/notes/reveries"]), "base-notes-tip"],
+    [JSON.stringify(["rev-parse", "base-commit^{tree}"]), "base-tree"],
+    [JSON.stringify(["merge-base", "base-commit", "proposed-commit"]), "transition-base"],
+  ]));
+  const event = {
+    pull_request: {
+      number: 27,
+      base: { sha: "base-commit" },
+      head: { sha: "proposed-commit" },
+    },
+  };
+  await assert.rejects(
+    createReceiveProposal(event, git, {
+      forkEvidence: { v: 1, state: "imported", pull_request: 28, notes_tip: "fork-notes-tip" },
+    }),
+    /different pull request/,
+  );
+  await assert.rejects(
+    createReceiveProposal(event, git, { forkEvidence: { v: 1, state: "absent", pull_request: 27 } }),
+    /no imported evidence/,
+  );
+});
+
+test("findings render as stable blocks with copy-paste remediation", () => {
+  const block = formatFinding({
+    code: "missing-session-summary",
+    grade: "strict",
+    ref: "refs/pull/27/head",
+    commit: "a".repeat(40),
+    detail: "missing summary detail",
+    remediation: "run this command",
+  });
+  assert.match(block, /\[missing-session-summary\]/);
+  assert.match(block, /refs\/pull\/27\/head/);
+  assert.match(block, new RegExp("a".repeat(40)));
+  assert.match(block, /missing summary detail/);
+  assert.match(block, /run this command/);
+  assert.doesNotMatch(block, /lower-grade/);
+
+  const lower = formatFinding({
+    code: "summary-from-pr-description",
+    grade: "lower",
+    detail: "covered detail",
+    remediation: "attach a real summary",
+  });
+  assert.match(lower, /\[summary-from-pr-description\] \(lower-grade\)/);
+});
+
+test("reports render failures, lower-grade warnings, and silent passes", () => {
+  const failed = formatReport({
+    ok: false,
+    result: {
+      findings: [{
+        code: "missing-notes-publication",
+        grade: "strict",
+        detail: "missing notes",
+        remediation: "push notes first",
+      }],
+    },
+  });
+  assert.match(failed, /\[missing-notes-publication\]/);
+  assert.match(failed, /push notes first/);
+
+  const lowerGradePass = formatReport({
+    ok: true,
+    result: {
+      findings: [{
+        code: "summary-from-pr-description",
+        grade: "lower",
+        detail: "covered",
+        remediation: "attach a real summary",
+      }],
+    },
+  });
+  assert.match(lowerGradePass, /lower-grade/);
+
+  assert.equal(formatReport({ ok: true, result: { findings: [] } }), "");
+  assert.equal(formatReport({ ok: true, result: {} }), "");
+  assert.equal(formatReport(null), "");
 });

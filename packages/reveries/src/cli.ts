@@ -348,10 +348,20 @@ async function parseReceiveInput(input: string): Promise<ReceiveCheckInput> {
     const baseTree = proposal.base_tree === undefined
       ? undefined
       : parseReceiveObject(proposal.base_tree, "receive proposal.base_tree");
+    const prDescription = proposal.pr_description === undefined
+      ? undefined
+      : expectString(proposal.pr_description, "receive proposal.pr_description");
+    const allowPrDescriptionSummary = proposal.allow_pr_description_summary === undefined
+      ? undefined
+      : typeof proposal.allow_pr_description_summary === "boolean"
+        ? proposal.allow_pr_description_summary
+        : (() => { throw new UsageError("receive proposal.allow_pr_description_summary must be a boolean"); })();
     return {
       updates: proposal.updates.map(parseReceiveUpdate),
       evidence,
       ...(baseTree === undefined || baseTree === null ? {} : { baseTree }),
+      ...(prDescription === undefined ? {} : { prDescription }),
+      ...(allowPrDescriptionSummary === undefined ? {} : { allowPrDescriptionSummary }),
     };
   }
   const updates: ReceiveRefUpdate[] = [];
@@ -1183,6 +1193,10 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
         updates,
         evidence,
         ...(baseTree === undefined || baseTree === null ? {} : { baseTree }),
+        ...(input.prDescription === undefined ? {} : { prDescription: input.prDescription }),
+        ...(input.allowPrDescriptionSummary === undefined
+          ? {}
+          : { allowPrDescriptionSummary: input.allowPrDescriptionSummary }),
       });
       emit(io, json, command, receive, receive.diagnostics);
       return receive.ok ? 0 : 1;
