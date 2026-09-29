@@ -3,14 +3,23 @@ import {
   blobId,
   canonicalRecord,
   commitId,
+  correctionPayload,
   createAttestation,
+  createCorrection,
+  createRedaction,
+  createResolution,
   createReverie,
   createTransition,
   createEvidenceSnapshot,
+  factGraphDiagnostics,
   NOTES_REF,
   objectId,
   parseNote,
   projectActiveReveries,
+  projectFactGraph,
+  redactionPayload,
+  recordFactId,
+  resolutionPayload,
   resolveLimits,
   semanticPayload,
   transitionId,
@@ -19,11 +28,22 @@ import {
   type ActiveProjection,
   type BlobId,
   type CommitId,
+  type CorrectionId,
+  type CorrectionInput,
+  type CorrectionRecord,
   type Diagnostic,
   type EvidenceSnapshot,
+  type FactGraphProjection,
+  type FactTargetId,
   type NoteRecord,
   type ObjectId,
   type PublicationAttestation,
+  type RedactionId,
+  type RedactionInput,
+  type RedactionRecord,
+  type ResolutionId,
+  type ResolutionInput,
+  type ResolutionRecord,
   type ResourceLimits,
   type ReverieId,
   type ReverieInput,
@@ -74,6 +94,11 @@ export interface RecordResult {
 export interface ShowInput {
   readonly target: string;
   readonly revision?: "HEAD" | "index" | string;
+  /**
+   * Include soft-redacted facts in normal display. Default false: redacted
+   * facts stay in history and snapshot bytes but leave records/active.
+   */
+  readonly includeRedacted?: boolean;
 }
 
 export interface ShowResult {
@@ -85,6 +110,8 @@ export interface ShowResult {
   readonly diagnostics: readonly string[];
   readonly paths: readonly string[];
   readonly completeness: CompletenessInfo;
+  /** Structural fact projection over the note, including redacted facts. */
+  readonly factGraph: FactGraphProjection;
 }
 
 export interface CheckResult {
@@ -193,6 +220,11 @@ export interface SearchInput {
    * fetch either way; only explicit sync/fetch commands touch the network.
    */
   readonly allowIncomplete?: boolean;
+  /**
+   * Include soft-redacted facts in search hits. Default false: redacted
+   * facts stay in history and snapshot bytes but leave search results.
+   */
+  readonly includeRedacted?: boolean;
 }
 
 export interface SearchHit {
@@ -351,7 +383,7 @@ function syncConflictType(message: string): SyncConflictType {
     return "multiple-initialization-boundaries";
   }
   if (/source|referenced reverie|path source/i.test(message)) return "invalid-source";
-  if (/supersession|conflicting duplicate reverie/i.test(message)) return "invalid-projection";
+  if (/supersession|conflicting duplicate/i.test(message)) return "invalid-projection";
   if (/attached|protocol records cannot be attached/i.test(message)) return "invalid-object-attachment";
   return "invalid-record";
 }
@@ -362,6 +394,9 @@ function zeroObject(value: string): boolean {
 
 function allSources(record: NoteRecord): readonly Source[] {
   if (record.type === "reverie") {
+    return record.sources;
+  }
+  if (record.type === "correction" || record.type === "resolution") {
     return record.sources;
   }
   if (record.type === "transition-summary") {
@@ -405,6 +440,8 @@ export interface SnapshotNoteEntry {
   readonly object: ObjectId;
   readonly records: readonly NoteRecord[];
   readonly projection: ActiveProjection;
+  /** Fact-graph projection over the note's reverie, correction, and resolution records. */
+  readonly factGraph: FactGraphProjection;
   readonly objectType: string;
   /** Null when the note parses, validates, and projects cleanly; otherwise the first failure. */
   readonly error: string | null;
@@ -426,6 +463,12 @@ export interface EvidenceSnapshotView {
   readonly transitions: ReadonlyMap<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>;
   readonly attestations: ReadonlyMap<CommitId, readonly PublicationAttestation[]>;
   readonly backlinks: ReadonlyMap<ReverieId, readonly ObjectId[]>;
+  /** Structural fact projection across every entry: forks stay visible until resolved. */
+  readonly factGraph: FactGraphProjection;
+  /** Soft-redacted fact IDs, sorted: hidden from show/search, retained in bytes. */
+  readonly redacted: readonly string[];
+  /** First annotated object carrying each fact ID, for failure attribution. */
+  readonly factLocations: ReadonlyMap<string, ObjectId>;
   readonly init: { readonly commit: CommitId; readonly record: ReveriesInit } | null;
   readonly initError: string | null;
   readonly diagnostics: readonly Diagnostic[];
@@ -453,6 +496,9 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     transitions: new Map(),
     attestations: new Map(),
     backlinks: new Map(),
+    factGraph: projectFactGraph([]),
+    redacted: [],
+    factLocations: new Map(),
     init: null,
     initError: null,
     diagnostics: [],
@@ -703,6 +749,7 @@ export class Reveries {
         diagnostics,
         paths: target.paths,
         completeness,
+        factGraph: projectFactGraph([]),
       };
     }
     const parsed = parseNote(note, "tolerant", { verifyIds: false });
@@ -716,21 +763,57 @@ export class Reveries {
           continue;
         }
       }
+      if (record.type === "correction") {
+        const expected = `cr:${await this.repository.hashObject(`${correctionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          diagnostics.push(`correction ID mismatch for ${record.id}`);
+          continue;
+        }
+      }
+      if (record.type === "resolution") {
+        const expected = `rs:${await this.repository.hashObject(`${resolutionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          diagnostics.push(`resolution ID mismatch for ${record.id}`);
+          continue;
+        }
+      }
+      if (record.type === "redaction") {
+        const expected = `rd:${await this.repository.hashObject(`${redactionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          diagnostics.push(`redaction ID mismatch for ${record.id}`);
+          continue;
+        }
+      }
       validRecords.push(record);
     }
+    const factGraph = projectFactGraph(validRecords);
+    const includeRedacted = input.includeRedacted === true;
+    const redacted = new Set(factGraph.redacted);
+    const visibleRecords = includeRedacted
+      ? validRecords
+      : validRecords.filter((record) => {
+        const id = recordFactId(record);
+        return id === null || !redacted.has(id);
+      });
+    const suppressed = validRecords.length - visibleRecords.length;
+    if (suppressed > 0) {
+      diagnostics.push(`${suppressed} redacted record(s) suppressed from display; history retains them`);
+    }
     const projection = projectActiveReveries(
-      validRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
+      visibleRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
     );
     diagnostics.push(...this.projectionDiagnostics(projection));
+    diagnostics.push(...factGraphDiagnostics(factGraph));
     const completeness = await this.assessCompleteness({});
     return {
       ...target,
-      records: validRecords,
+      records: visibleRecords,
       active: projection.active,
       historical: projection.historical,
       diagnostics,
       paths: target.paths,
       completeness,
+      factGraph,
     };
   }
 
@@ -863,6 +946,81 @@ export class Reveries {
     );
     await this.mutateNotes(async (notes) => {
       await notes.append(commit, canonicalRecord(record));
+    });
+    return { record };
+  }
+
+  /**
+   * Append a correction fact to an existing object. Never rewrites an old
+   * canonical line: a correction that overlaps another correction's heads
+   * forms a visible fork until a resolution names every head.
+   */
+  async recordCorrection(input: {
+    readonly object: ObjectId;
+    readonly correction: CorrectionInput;
+    readonly metadata: ReverieMetadata;
+  }): Promise<{ readonly record: CorrectionRecord }> {
+    if (await this.repository.objectType(input.object) === null) {
+      throw new Error(`Cannot attach a correction to missing object ${input.object}`);
+    }
+    const format = await this.repository.objectFormat();
+    const record = createCorrection(
+      input.correction,
+      input.metadata,
+      (bytes) => hashBlobContent(bytes, format),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(input.object, canonicalRecord(record));
+    });
+    return { record };
+  }
+
+  /**
+   * Append a resolution fact that names conflicting heads. The fork
+   * converges only when `resolves` covers every terminal head; partial
+   * coverage stays visible as a fork.
+   */
+  async recordResolution(input: {
+    readonly object: ObjectId;
+    readonly resolution: ResolutionInput;
+    readonly metadata: ReverieMetadata;
+  }): Promise<{ readonly record: ResolutionRecord }> {
+    if (await this.repository.objectType(input.object) === null) {
+      throw new Error(`Cannot attach a resolution to missing object ${input.object}`);
+    }
+    const format = await this.repository.objectFormat();
+    const record = createResolution(
+      input.resolution,
+      input.metadata,
+      (bytes) => hashBlobContent(bytes, format),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(input.object, canonicalRecord(record));
+    });
+    return { record };
+  }
+
+  /**
+   * Append a soft-redaction fact. Normal display and search skip the target
+   * afterwards; history and snapshot bytes keep the immutable record.
+   */
+  async recordRedaction(input: {
+    readonly object: ObjectId;
+    readonly target: FactTargetId;
+    readonly reason: string;
+    readonly metadata: ReverieMetadata;
+  }): Promise<{ readonly record: RedactionRecord }> {
+    if (await this.repository.objectType(input.object) === null) {
+      throw new Error(`Cannot attach a redaction to missing object ${input.object}`);
+    }
+    const format = await this.repository.objectFormat();
+    const record = createRedaction(
+      { v: 1, target: input.target, reason: input.reason },
+      input.metadata,
+      (bytes) => hashBlobContent(bytes, format),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(input.object, canonicalRecord(record));
     });
     return { record };
   }
@@ -1485,6 +1643,27 @@ export class Reveries {
             }
             continue;
           }
+          if (record.type === "correction") {
+            const expected = `cr:${hashBlobContent(`${correctionPayload(record)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Correction ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
+          if (record.type === "resolution") {
+            const expected = `rs:${hashBlobContent(`${resolutionPayload(record)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Resolution ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
+          if (record.type === "redaction") {
+            const expected = `rd:${hashBlobContent(`${redactionPayload(record)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Redaction ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
           if (record.type !== "reverie") continue;
           const expected = `rv:${hashBlobContent(`${semanticPayload(record)}\n`, format)}`;
           if (expected !== record.id) {
@@ -1498,6 +1677,7 @@ export class Reveries {
           object: entry.object,
           records: [],
           projection: projectActiveReveries([]),
+          factGraph: projectFactGraph([]),
           objectType: await this.snapshotObjectType(details, entry.object),
           error: message,
           snapshot: createEvidenceSnapshot({ notesTip: tip, records: [], limits }),
@@ -1507,12 +1687,17 @@ export class Reveries {
       const projection = projectActiveReveries(
         records.filter((record): record is ReverieRecord => record.type === "reverie"),
       );
-      const projectionDiagnostics = this.projectionDiagnostics(projection);
+      const factGraph = projectFactGraph(records);
+      const projectionDiagnostics = [
+        ...this.projectionDiagnostics(projection),
+        ...factGraphDiagnostics(factGraph),
+      ];
       const objectType = await this.snapshotObjectType(details, entry.object);
       entries.push({
         object: entry.object,
         records,
         projection,
+        factGraph,
         objectType,
         error: projectionDiagnostics.length > 0 ? projectionDiagnostics.join("; ") : null,
         snapshot: createEvidenceSnapshot({ notesTip: tip, records, limits }),
@@ -1556,6 +1741,16 @@ export class Reveries {
       }
     }
     const attestations = new Map<CommitId, readonly PublicationAttestation[]>(attestationLists);
+    const globalRecords = entries.flatMap((entry) => entry.records);
+    const factGraph = projectFactGraph(globalRecords);
+    const redacted = [...factGraph.redacted];
+    const factLocations = new Map<string, ObjectId>();
+    for (const entry of entries) {
+      for (const record of entry.records) {
+        const id = recordFactId(record);
+        if (id !== null && !factLocations.has(id)) factLocations.set(id, entry.object);
+      }
+    }
     let init: EvidenceSnapshotView["init"] = null;
     let initError: string | null = null;
     for (const entry of entries) {
@@ -1580,6 +1775,9 @@ export class Reveries {
       transitions,
       attestations,
       backlinks,
+      factGraph,
+      redacted,
+      factLocations,
       init,
       initError,
       diagnostics,
@@ -1637,10 +1835,17 @@ export class Reveries {
           }
           initialization = entry.object;
         }
-        if (entry.objectType === "blob" && entry.records.some((record) => record.type !== "reverie")) {
+        if (entry.objectType === "blob" && entry.records.some((record) =>
+          record.type !== "reverie"
+          && record.type !== "correction"
+          && record.type !== "resolution"
+          && record.type !== "redaction")) {
           throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
         }
-        if (entry.objectType === "commit" && entry.records.some((record) => record.type === "reverie")) {
+        if (entry.objectType === "commit" && entry.records.some((record) =>
+          record.type === "reverie"
+          || record.type === "correction"
+          || record.type === "resolution")) {
           throw new Error(`Commit ${entry.object} has a file reverie record`);
         }
         if (entry.objectType === "commit"
@@ -1648,7 +1853,8 @@ export class Reveries {
           throw new Error(`Commit ${entry.object} has a tree transition record`);
         }
         if (entry.objectType === "tree"
-          && entry.records.some((record) => record.type !== "transition-summary")) {
+          && entry.records.some((record) =>
+            record.type !== "transition-summary" && record.type !== "redaction")) {
           throw new Error(`Tree ${entry.object} has a non-transition protocol record`);
         }
         for (const record of entry.records) {
@@ -1664,6 +1870,32 @@ export class Reveries {
       } catch (error: unknown) {
         throw new NotesRefValidationError(entry.object, error);
       }
+    }
+    // Cross-note forks: corrections on different notes may supersede the same
+    // heads. Sync and mutation stay fail-closed on them; only a candidate
+    // whose resolution names every head passes validation. Session summaries
+    // attach per commit, so summary forks stay a per-note diagnostic and are
+    // excluded from the global check.
+    const globalDiagnostics = factGraphDiagnostics({ ...view.factGraph, summaryFork: false });
+    if (globalDiagnostics.length > 0) {
+      const involved = new Set<string>([
+        ...view.factGraph.forks.flat(),
+        ...view.factGraph.cycles.flat(),
+        ...(view.factGraph.conflicts ?? []),
+      ]);
+      let annotated: ObjectId | null = null;
+      for (const id of involved) {
+        const location = view.factLocations.get(id);
+        if (location !== undefined) {
+          annotated = location;
+          break;
+        }
+      }
+      const firstEntry = view.entries[0];
+      throw new NotesRefValidationError(
+        annotated ?? (firstEntry !== undefined ? firstEntry.object : view.tip as ObjectId),
+        new Error(globalDiagnostics.join("; ")),
+      );
     }
   }
 
@@ -1738,10 +1970,13 @@ export class Reveries {
     const allowed = input.all === true
       ? new Set(view.entries.map((entry) => entry.object as string))
       : new Set((await this.snapshotTargets(view, revision)).map((entry) => entry.object as string));
+    const redacted = input.includeRedacted === true ? new Set<string>() : new Set(view.redacted);
     const hits: SearchHit[] = [];
     for (const entry of view.entries) {
       if (!allowed.has(entry.object as string)) continue;
       for (const record of entry.records) {
+        const id = recordFactId(record);
+        if (id !== null && redacted.has(id)) continue;
         if (input.query !== undefined && !searchText(record).includes(input.query.toLocaleLowerCase())) continue;
         if (input.source !== undefined && !allSources(record).some((source) => source.ref === input.source)) continue;
         if (input.author !== undefined && recordAuthor(record) !== input.author) continue;
@@ -2388,6 +2623,27 @@ export class Reveries {
     const parsed = parseNote(note, "strict", { verifyIds: false });
     const records = validateNote(parsed, { verifyIds: false });
     for (const record of records) {
+      if (record.type === "correction") {
+        const expected = `cr:${await this.repository.hashObject(`${correctionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          throw new Error(`Correction ID mismatch for ${record.id}; expected ${expected}`);
+        }
+        continue;
+      }
+      if (record.type === "resolution") {
+        const expected = `rs:${await this.repository.hashObject(`${resolutionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          throw new Error(`Resolution ID mismatch for ${record.id}; expected ${expected}`);
+        }
+        continue;
+      }
+      if (record.type === "redaction") {
+        const expected = `rd:${await this.repository.hashObject(`${redactionPayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          throw new Error(`Redaction ID mismatch for ${record.id}; expected ${expected}`);
+        }
+        continue;
+      }
       if (record.type !== "reverie") continue;
       const expected = `rv:${await this.repository.hashObject(`${semanticPayload(record)}\n`)}`;
       if (expected !== record.id) {

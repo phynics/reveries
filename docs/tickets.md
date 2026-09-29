@@ -229,7 +229,7 @@ RVR-002 defines safe publication. RVR-004 later changes the causal record used b
 **Priority:** P1
 **Feasibility:** Core / V2
 **Stage:** 2
-**Tracker:** [GitHub issue #7](https://github.com/phynics/reveries/issues/7)
+**Tracker:** [GitHub issue #7](https://github.com/phynics/reveries/issues/7). Implemented on `feature/plan-open-reveries-w-7df`.
 
 ### Problem
 

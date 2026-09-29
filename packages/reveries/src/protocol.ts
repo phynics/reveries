@@ -6,6 +6,18 @@ export type BlobId = ObjectId & { readonly __blobBrand: "blob-id" };
 export type CommitId = ObjectId & { readonly __commitBrand: "commit-id" };
 export type ReverieId = Brand<`rv:${string}`, "reverie-id">;
 export type TransitionId = Brand<`tr:${string}`, "transition-id">;
+export type CorrectionId = Brand<`cr:${string}`, "correction-id">;
+export type ResolutionId = Brand<`rs:${string}`, "resolution-id">;
+export type RedactionId = Brand<`rd:${string}`, "redaction-id">;
+
+/**
+ * Heads a correction or resolution edge may name: reveries and the new
+ * immutable fact kinds. Transition facts keep their RVR-004 identity and
+ * fail-closed duplicate handling; they are never superseded, only redacted.
+ */
+export type FactHeadId = ReverieId | CorrectionId | ResolutionId;
+/** Every fact a soft redaction may suppress from normal display. */
+export type FactTargetId = FactHeadId | TransitionId;
 
 export type SourceRelation =
   | "caused-by"
@@ -141,7 +153,85 @@ export type ReveriesInit = {
   created_at: string;
 };
 
-export type NoteRecord = ReverieRecord | SessionSummary | ReveriesInit | TransitionSummary | PublicationAttestation;
+export type CorrectionSemantic = {
+  v: 1;
+  driving_event: string;
+  decision: string;
+  impact: string;
+  recurrence_control: string | null;
+  alternatives: string[];
+  sources: Source[];
+  /** Heads this correction claims to replace; nonempty so a bare new claim stays a reverie. */
+  supersedes: FactHeadId[];
+};
+
+/**
+ * An append-only correction to earlier facts. Unlike a session-summary
+ * replacement it never rewrites a canonical line: concurrent corrections
+ * naming the same heads form a visible fork until a resolution names them all.
+ */
+export type CorrectionRecord = CorrectionSemantic & ReverieMetadata & {
+  type: "correction";
+  id: CorrectionId;
+};
+
+export type CorrectionInput = CorrectionSemantic;
+
+export type ResolutionSemantic = {
+  v: 1;
+  driving_event: string;
+  decision: string;
+  impact: string;
+  recurrence_control: string | null;
+  alternatives: string[];
+  sources: Source[];
+  /**
+   * Every conflicting head this resolution converges. A resolution that
+   * names only some terminals leaves the fork visible; naming every head
+   * produces one active result.
+   */
+  resolves: FactHeadId[];
+};
+
+/**
+ * Explicit convergence for a visible fork. The fork collapses only when
+ * `resolves` covers every terminal head; partial coverage stays forked.
+ */
+export type ResolutionRecord = ResolutionSemantic & ReverieMetadata & {
+  type: "resolution";
+  id: ResolutionId;
+};
+
+export type ResolutionInput = ResolutionSemantic;
+
+export type RedactionSemantic = {
+  v: 1;
+  /** The fact to suppress from normal display and search. */
+  target: FactTargetId;
+  reason: string;
+};
+
+/**
+ * Soft redaction: normal display and search skip the target, while the
+ * underlying immutable record stays in the snapshot bytes and history.
+ * This never claims distributed erasure; hard redaction belongs to RVR-018.
+ */
+export type RedactionRecord = RedactionSemantic & ReverieMetadata & {
+  type: "redaction";
+  id: RedactionId;
+};
+
+export type RedactionInput = RedactionSemantic;
+
+export type NoteRecord =
+  | ReverieRecord
+  | SessionSummary
+  | ReveriesInit
+  | TransitionSummary
+  | PublicationAttestation
+  | CorrectionRecord
+  | ResolutionRecord
+  | RedactionRecord;
 
 export type Diagnostic = {
   line?: number;
@@ -169,6 +259,10 @@ export type ResourceLimits = {
   maxParents: number;
   maxGraphVisits: number;
   maxDiagnostics: number;
+  maxCorrections: number;
+  maxResolutions: number;
+  maxRedactions: number;
+  maxResolves: number;
 };
 
 export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
@@ -186,6 +280,10 @@ export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxParents: 64,
   maxGraphVisits: 131_072,
   maxDiagnostics: 32,
+  maxCorrections: 64,
+  maxResolutions: 64,
+  maxRedactions: 64,
+  maxResolves: 64,
 });
 
 export class LimitExceededError extends Error {
@@ -275,6 +373,9 @@ export type HashObject = (bytes: Uint8Array) => ObjectId;
 const HEX_OBJECT_ID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 const REVERIE_ID = /^rv:[0-9a-f]{40}$|^rv:[0-9a-f]{64}$/;
 const TRANSITION_ID = /^tr:[0-9a-f]{40}$|^tr:[0-9a-f]{64}$/;
+const CORRECTION_ID = /^cr:[0-9a-f]{40}$|^cr:[0-9a-f]{64}$/;
+const RESOLUTION_ID = /^rs:[0-9a-f]{40}$|^rs:[0-9a-f]{64}$/;
+const REDACTION_ID = /^rd:[0-9a-f]{40}$|^rd:[0-9a-f]{64}$/;
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
@@ -305,6 +406,49 @@ export function reverieId(value: string): ReverieId {
 export function transitionId(value: string): TransitionId {
   if (!TRANSITION_ID.test(value)) throw new Error(`Invalid transition ID: ${value}`);
   return value as TransitionId;
+}
+
+export function correctionId(value: string): CorrectionId {
+  if (!CORRECTION_ID.test(value)) throw new Error(`Invalid correction ID: ${value}`);
+  return value as CorrectionId;
+}
+
+export function resolutionId(value: string): ResolutionId {
+  if (!RESOLUTION_ID.test(value)) throw new Error(`Invalid resolution ID: ${value}`);
+  return value as ResolutionId;
+}
+
+export function redactionId(value: string): RedactionId {
+  if (!REDACTION_ID.test(value)) throw new Error(`Invalid redaction ID: ${value}`);
+  return value as RedactionId;
+}
+
+export function factHeadId(value: string): FactHeadId {
+  if (REVERIE_ID.test(value)) return value as ReverieId;
+  if (CORRECTION_ID.test(value)) return value as CorrectionId;
+  if (RESOLUTION_ID.test(value)) return value as ResolutionId;
+  throw new Error(`Invalid fact head ID: ${value}`);
+}
+
+export function factTargetId(value: string): FactTargetId {
+  if (TRANSITION_ID.test(value)) return value as TransitionId;
+  return factHeadId(value);
+}
+
+/**
+ * The content-hash identity of a fact record, or null for records without
+ * one (session summaries, initialization records, publication attestations).
+ * Redaction filtering and snapshot indexes key on this.
+ */
+export function recordFactId(record: NoteRecord): string | null {
+  if (record.type === "reverie"
+    || record.type === "transition-summary"
+    || record.type === "correction"
+    || record.type === "resolution"
+    || record.type === "redaction") {
+    return record.id;
+  }
+  return null;
 }
 
 function trimText(value: string, field: string): string {
@@ -508,6 +652,140 @@ export function createAttestation(
   return record;
 }
 
+function sortedUniqueFactHeads(values: readonly FactHeadId[]): FactHeadId[] {
+  return [...new Set(values.map((value) => factHeadId(value)))].sort(compareUtf8);
+}
+
+function normalizeCorrectionSemantic(input: CorrectionSemantic): CorrectionSemantic {
+  if (input.v !== 1) throw new Error("v must be exactly 1");
+  if (!Array.isArray(input.supersedes) || input.supersedes.length === 0) {
+    throw new Error("correction supersedes must be nonempty");
+  }
+  const recurrence = input.recurrence_control === null
+    ? null
+    : recurrenceText(input.recurrence_control, "recurrence_control");
+  return {
+    v: 1,
+    driving_event: trimText(input.driving_event, "driving_event"),
+    decision: trimText(input.decision, "decision"),
+    impact: trimText(input.impact, "impact"),
+    recurrence_control: recurrence,
+    alternatives: sortedUnique(input.alternatives),
+    sources: sortedUniqueSources(input.sources),
+    supersedes: sortedUniqueFactHeads(input.supersedes),
+  };
+}
+
+function normalizeResolutionSemantic(input: ResolutionSemantic): ResolutionSemantic {
+  if (input.v !== 1) throw new Error("v must be exactly 1");
+  if (!Array.isArray(input.resolves) || input.resolves.length === 0) {
+    throw new Error("resolution resolves must be nonempty");
+  }
+  const recurrence = input.recurrence_control === null
+    ? null
+    : recurrenceText(input.recurrence_control, "recurrence_control");
+  return {
+    v: 1,
+    driving_event: trimText(input.driving_event, "driving_event"),
+    decision: trimText(input.decision, "decision"),
+    impact: trimText(input.impact, "impact"),
+    recurrence_control: recurrence,
+    alternatives: sortedUnique(input.alternatives),
+    sources: sortedUniqueSources(input.sources),
+    resolves: sortedUniqueFactHeads(input.resolves),
+  };
+}
+
+function normalizeRedactionSemantic(input: RedactionSemantic): RedactionSemantic {
+  if (input.v !== 1) throw new Error("v must be exactly 1");
+  return {
+    v: 1,
+    target: factTargetId(input.target),
+    reason: trimText(input.reason, "redaction.reason"),
+  };
+}
+
+/** Exact bytes hashed for a correction identity: version plus normalized semantic content. */
+export function correctionPayload(record: CorrectionSemantic): string {
+  return JSON.stringify(normalizeCorrectionSemantic(record));
+}
+
+/** Exact bytes hashed for a resolution identity: version plus normalized content and head list. */
+export function resolutionPayload(record: ResolutionSemantic): string {
+  return JSON.stringify(normalizeResolutionSemantic(record));
+}
+
+/** Exact bytes hashed for a redaction identity: version, target, and reason. */
+export function redactionPayload(record: RedactionSemantic): string {
+  return JSON.stringify(normalizeRedactionSemantic(record));
+}
+
+export function createCorrection(
+  input: CorrectionInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): CorrectionRecord {
+  const resolved = resolveLimits(limits);
+  const semantic = normalizeCorrectionSemantic(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `cr:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as CorrectionId;
+  const record: CorrectionRecord = {
+    ...semantic,
+    type: "correction",
+    id,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+export function createResolution(
+  input: ResolutionInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): ResolutionRecord {
+  const resolved = resolveLimits(limits);
+  const semantic = normalizeResolutionSemantic(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `rs:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as ResolutionId;
+  const record: ResolutionRecord = {
+    ...semantic,
+    type: "resolution",
+    id,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+export function createRedaction(
+  input: RedactionInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): RedactionRecord {
+  const resolved = resolveLimits(limits);
+  const semantic = normalizeRedactionSemantic(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `rd:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as RedactionId;
+  const record: RedactionRecord = {
+    ...semantic,
+    type: "redaction",
+    id,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
 function canonicalRetirement(retirement: Retirement): Retirement {
   return {
     reverie: retirement.reverie,
@@ -588,6 +866,55 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
       publisher: trimText(record.publisher, "publisher"),
     };
   }
+  if (record.type === "correction") {
+    const semantic = normalizeCorrectionSemantic(record);
+    return {
+      v: 1,
+      type: "correction",
+      id: record.id,
+      driving_event: semantic.driving_event,
+      decision: semantic.decision,
+      impact: semantic.impact,
+      recurrence_control: semantic.recurrence_control,
+      alternatives: semantic.alternatives,
+      sources: semantic.sources,
+      supersedes: semantic.supersedes,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
+  if (record.type === "resolution") {
+    const semantic = normalizeResolutionSemantic(record);
+    return {
+      v: 1,
+      type: "resolution",
+      id: record.id,
+      driving_event: semantic.driving_event,
+      decision: semantic.decision,
+      impact: semantic.impact,
+      recurrence_control: semantic.recurrence_control,
+      alternatives: semantic.alternatives,
+      sources: semantic.sources,
+      resolves: semantic.resolves,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
+  if (record.type === "redaction") {
+    const semantic = normalizeRedactionSemantic(record);
+    return {
+      v: 1,
+      type: "redaction",
+      id: record.id,
+      target: semantic.target,
+      reason: semantic.reason,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
   return {
     v: 1,
     type: "reveries-init",
@@ -612,6 +939,9 @@ function asRecord(value: unknown): NoteRecord {
   if (record.type === "reveries-init") return record as unknown as ReveriesInit;
   if (record.type === "transition-summary") return record as unknown as TransitionSummary;
   if (record.type === "publication-attestation") return record as unknown as PublicationAttestation;
+  if (record.type === "correction") return record as unknown as CorrectionRecord;
+  if (record.type === "resolution") return record as unknown as ResolutionRecord;
+  if (record.type === "redaction") return record as unknown as RedactionRecord;
   throw new Error(`unknown record type: ${String(record.type)}`);
 }
 
@@ -689,6 +1019,82 @@ function validateAttestation(
   validateTimestamp(record.created_at, "created_at");
 }
 
+function validateFactNarrative(
+  record: CorrectionSemantic | ResolutionSemantic,
+  limits: Readonly<ResourceLimits>,
+): void {
+  if (!Array.isArray(record.alternatives) || !Array.isArray(record.sources)) {
+    throw new Error("fact arrays are required");
+  }
+  checkArrayLength(record.alternatives, limits.maxAlternatives, "maxAlternatives", "alternatives");
+  checkArrayLength(record.sources, limits.maxSources, "maxSources", "sources");
+  for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
+  for (const source of record.sources) validateSource(source, limits);
+  trimNarrative(record.driving_event, "driving_event", limits);
+  trimNarrative(record.decision, "decision", limits);
+  trimNarrative(record.impact, "impact", limits);
+  if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control", limits);
+}
+
+function validateCorrection(
+  record: CorrectionRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!CORRECTION_ID.test(record.id)) throw new Error("invalid correction ID");
+  if (!Array.isArray(record.supersedes) || record.supersedes.length === 0) {
+    throw new Error("correction supersedes must be nonempty");
+  }
+  checkArrayLength(record.supersedes, limits.maxSupersedes, "maxSupersedes", "supersedes");
+  for (const id of record.supersedes) factHeadId(id);
+  validateFactNarrative(record, limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `cr:${hashObject(Buffer.from(`${correctionPayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`correction ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
+function validateResolution(
+  record: ResolutionRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!RESOLUTION_ID.test(record.id)) throw new Error("invalid resolution ID");
+  if (!Array.isArray(record.resolves) || record.resolves.length === 0) {
+    throw new Error("resolution resolves must be nonempty");
+  }
+  checkArrayLength(record.resolves, limits.maxResolves, "maxResolves", "resolves");
+  for (const id of record.resolves) factHeadId(id);
+  validateFactNarrative(record, limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `rs:${hashObject(Buffer.from(`${resolutionPayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`resolution ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
+function validateRedaction(
+  record: RedactionRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!REDACTION_ID.test(record.id)) throw new Error("invalid redaction ID");
+  factTargetId(record.target);
+  trimNarrative(record.reason, "redaction.reason", limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `rd:${hashObject(Buffer.from(`${redactionPayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`redaction ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
 function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Readonly<ResourceLimits> = DEFAULT_LIMITS): void {
   if (record.v !== 1) throw new Error("v must be exactly 1");
   if (record.type === "reverie") {
@@ -749,6 +1155,18 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
     validateAttestation(record, limits);
     return;
   }
+  if (record.type === "correction") {
+    validateCorrection(record, hashObject, limits);
+    return;
+  }
+  if (record.type === "resolution") {
+    validateResolution(record, hashObject, limits);
+    return;
+  }
+  if (record.type === "redaction") {
+    validateRedaction(record, hashObject, limits);
+    return;
+  }
   if (record.protocol !== 1 || record.notes_ref !== NOTES_REF) throw new Error("invalid Reveries initialization record");
   if (!Array.isArray(record.publishing_remotes) || !Array.isArray(record.hosts)) throw new Error("initialization arrays are required");
   for (const remote of record.publishing_remotes) trimRef(remote, "publishing remote", limits);
@@ -760,12 +1178,41 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
   validateTimestamp(record.created_at, "created_at");
 }
 
+export type ForkPolicy = "reject" | "project";
+
 export type ValidateOptions = {
   hashObject?: HashObject;
   requireCanonical?: boolean;
   verifyIds?: boolean;
   limits?: Partial<ResourceLimits>;
+  /**
+   * How to treat unions that are structurally valid but forked: conflicting
+   * duplicate fact IDs or concurrent session summaries. `reject` (default)
+   * fails closed so sync and mutation paths keep quarantine behavior;
+   * `project` keeps every record so the projection can surface the fork.
+   * Malformed bytes and limit violations always throw.
+   */
+  forkPolicy?: ForkPolicy;
 };
+
+/**
+ * Monotonic evidence union: set-union over canonical lines. Associative,
+ * commutative, and idempotent by construction, so replica merge order never
+ * changes the fact set. Earlier canonical lines are preserved verbatim;
+ * no record is rewritten or discarded.
+ */
+export function unionFacts(...inputs: readonly (readonly NoteRecord[])[]): NoteRecord[] {
+  const lines = new Map<string, NoteRecord>();
+  for (const records of inputs) {
+    for (const record of records) {
+      const line = canonicalRecord(record);
+      if (!lines.has(line)) lines.set(line, record);
+    }
+  }
+  return [...lines.entries()]
+    .sort((left, right) => Buffer.from(left[0]).compare(Buffer.from(right[0])))
+    .map(([, record]) => record);
+}
 
 export function validateNote(
   input: ParsedNote | readonly NoteRecord[],
@@ -777,6 +1224,7 @@ export function validateNote(
   if (parsed !== undefined && parsed.diagnostics.length > 0) throw new Error("note contains malformed records");
   const limits = resolveLimits(options.limits);
   checkArrayLength(records, limits.maxRecordsPerNote, "maxRecordsPerNote", "note records");
+  const forkPolicy = options.forkPolicy ?? "reject";
   const verifyIds = options.verifyIds ?? options.hashObject !== undefined;
   if (verifyIds && options.hashObject === undefined) {
     throw new Error("Semantic ID verification requires the repository hashObject function");
@@ -784,41 +1232,95 @@ export function validateNote(
   for (const record of records) validateRecord(record, verifyIds ? options.hashObject : undefined, limits);
   const summaries = records.filter((record): record is SessionSummary => record.type === "session-summary");
   const inits = records.filter((record): record is ReveriesInit => record.type === "reveries-init");
-  if (summaries.length > 1) throw new Error("note contains more than one session summary");
+  if (summaries.length > 1 && forkPolicy === "reject") throw new Error("note contains more than one session summary");
   if (inits.length > 1) throw new Error("note contains more than one initialization record");
   if (inits.length > 0 && (summaries.length !== 1 || records.length !== 2)) throw new Error("initialization note must contain exactly one summary and one init record");
+  checkArrayLength(
+    records.filter((record) => record.type === "correction"),
+    limits.maxCorrections,
+    "maxCorrections",
+    "corrections",
+  );
+  checkArrayLength(
+    records.filter((record) => record.type === "resolution"),
+    limits.maxResolutions,
+    "maxResolutions",
+    "resolutions",
+  );
+  checkArrayLength(
+    records.filter((record) => record.type === "redaction"),
+    limits.maxRedactions,
+    "maxRedactions",
+    "redactions",
+  );
   // Tree notes carry transition summaries and commit notes may carry
   // publication attestations; object-type placement beyond this is enforced
   // by the snapshot validator, which knows each annotated object's type.
+  // Corrections, resolutions, and redactions are global facts that may ride
+  // on blob, tree, or commit notes within the snapshot placement rules.
   if (summaries.length === 0 && inits.length === 0
     && records.some((record) => record.type !== "reverie"
       && record.type !== "transition-summary"
-      && record.type !== "publication-attestation")) {
+      && record.type !== "publication-attestation"
+      && record.type !== "correction"
+      && record.type !== "resolution"
+      && record.type !== "redaction")) {
     throw new Error("blob note contains a non-reverie record");
   }
   const byId = new Map<ReverieId, string>();
   const transitionsById = new Map<TransitionId, string>();
+  const correctionsById = new Map<CorrectionId, string>();
+  const resolutionsById = new Map<ResolutionId, string>();
+  const redactionsById = new Map<RedactionId, string>();
+  const checkDuplicate = (previous: string | undefined, payload: string, message: string): void => {
+    if (previous !== undefined && previous !== payload && forkPolicy === "reject") throw new Error(message);
+  };
   let graphVisits = 0;
+  const chargeGraph = (visits: number, scope: string): void => {
+    graphVisits += visits;
+    if (graphVisits > limits.maxGraphVisits) {
+      throw new LimitExceededError("maxGraphVisits", graphVisits, limits.maxGraphVisits, scope);
+    }
+  };
   for (const record of records) {
     if (record.type === "transition-summary") {
-      graphVisits += 1;
-      if (graphVisits > limits.maxGraphVisits) {
-        throw new LimitExceededError("maxGraphVisits", graphVisits, limits.maxGraphVisits, "transition graph");
-      }
+      chargeGraph(1, "transition graph");
       const payload = transitionPayload(record);
       const previous = transitionsById.get(record.id);
-      if (previous !== undefined && previous !== payload) throw new Error(`conflicting duplicate transition ID: ${record.id}`);
+      checkDuplicate(previous, payload, `conflicting duplicate transition ID: ${record.id}`);
       transitionsById.set(record.id, payload);
       continue;
     }
-    if (record.type !== "reverie") continue;
-    graphVisits += 1 + record.supersedes.length;
-    if (graphVisits > limits.maxGraphVisits) {
-      throw new LimitExceededError("maxGraphVisits", graphVisits, limits.maxGraphVisits, "supersession graph");
+    if (record.type === "correction") {
+      chargeGraph(1 + record.supersedes.length, "correction graph");
+      const payload = correctionPayload(record);
+      const previous = correctionsById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate correction ID: ${record.id}`);
+      correctionsById.set(record.id, payload);
+      continue;
     }
+    if (record.type === "resolution") {
+      chargeGraph(1 + record.resolves.length, "resolution graph");
+      checkArrayLength(record.resolves, limits.maxResolves, "maxResolves", "resolves");
+      const payload = resolutionPayload(record);
+      const previous = resolutionsById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate resolution ID: ${record.id}`);
+      resolutionsById.set(record.id, payload);
+      continue;
+    }
+    if (record.type === "redaction") {
+      chargeGraph(1, "redaction graph");
+      const payload = redactionPayload(record);
+      const previous = redactionsById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate redaction ID: ${record.id}`);
+      redactionsById.set(record.id, payload);
+      continue;
+    }
+    if (record.type !== "reverie") continue;
+    chargeGraph(1 + record.supersedes.length, "supersession graph");
     const semantic = semanticPayload(record);
     const previous = byId.get(record.id);
-    if (previous !== undefined && previous !== semantic) throw new Error(`conflicting duplicate reverie ID: ${record.id}`);
+    checkDuplicate(previous, semantic, `conflicting duplicate reverie ID: ${record.id}`);
     byId.set(record.id, semantic);
   }
   return records;
@@ -880,6 +1382,8 @@ export function parseNote(
 
 export type ActiveProjection = import("./projection.ts").ActiveProjection;
 export { projectActiveReveries } from "./projection.ts";
+export type FactGraphProjection = import("./projection.ts").FactGraphProjection;
+export { factGraphDiagnostics, projectFactGraph } from "./projection.ts";
 export type TransitionAttestationProjection = import("./projection.ts").TransitionAttestationProjection;
 export { projectTransitionAttestation } from "./projection.ts";
 export type { ContinuityInput, ContinuityReport, ContinuityDisposition, ContinuityObligation } from "./continuity.ts";

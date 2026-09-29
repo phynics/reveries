@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reveries.dev/protocol/v1/schemas/redaction.schema.json",
+  "title": "Reveries V2 soft-redaction fact (RVR-007)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "id", "target", "reason", "author_email", "session", "created_at"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": { "const": "redaction" },
+    "id": { "$ref": "#/$defs/redactionId" },
+    "target": {
+      "$ref": "#/$defs/factTargetId",
+      "description": "The fact to suppress from normal display and search. The underlying record stays in notes history and clone bytes; this is soft redaction and makes no claim about erasing independent clones."
+    },
+    "reason": {
+      "$ref": "#/$defs/nonemptyString",
+      "description": "Non-sensitive justification that remains visible after the target is suppressed."
+    },
+    "author_email": { "type": "string", "format": "email", "minLength": 1 },
+    "session": { "type": ["string", "null"], "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "$defs": {
+    "nonemptyString": { "type": "string", "minLength": 1, "pattern": "^(?=.*\\S).*$" },
+    "objectId": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "transitionId": { "type": "string", "pattern": "^tr:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "reverieId": { "type": "string", "pattern": "^rv:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "correctionId": { "type": "string", "pattern": "^cr:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "resolutionId": { "type": "string", "pattern": "^rs:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "redactionId": { "type": "string", "pattern": "^rd:[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "factTargetId": {
+      "anyOf": [
+        { "$ref": "#/$defs/transitionId" },
+        { "$ref": "#/$defs/reverieId" },
+        { "$ref": "#/$defs/correctionId" },
+        { "$ref": "#/$defs/resolutionId" }
+      ]
+    }
+  }
+}
