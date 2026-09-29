@@ -19,7 +19,8 @@ CORE means Skills, project instructions, direct Git operations, and manual maint
 | GHES | `packages/reveries/adapters/ghes-pre-receive.sh` | Git pre-receive `old new ref` stream | Nonzero exit before ref movement |
 | GitHub.com | `.github/workflows/reveries-receive-check.yml` | `pull_request` and `merge_group` | Branch protection requires the App-owned check in `.github/reveries-required-check.json` |
 | Fork pull request | `.github/workflows/reveries-evidence-import.yml` | `pull_request_target` notes import | Fork code is not executed by the importer |
-| V1 merge bot | `.github/workflows/reveries-controlled-merge.yml` | App-owned check plus base-tree OID | Merge is refused when the base tree changes |
+| Post-merge summaries | `.github/workflows/reveries-post-merge.yml` | `push` to the default branch | Runs only the protected default-branch revision; pull request commits are fetched as Git data |
+| V1 merge bot | `.github/workflows/reveries-controlled-merge.yml` | App-owned check plus base-tree OID | Inoperative: the required `reveries` App is not installed. Proposed for retirement once the pre-merge check and post-merge summaries are verified |
 
 Hosted behavior remains a deployment contract: install the App, configure its numeric ID in
 `REVERIES_APP_ID`, and pin the exact check in branch protection.

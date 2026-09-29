@@ -22,6 +22,7 @@ import {
   type ReveriesInit,
   type SessionSummary,
   type Source,
+  type SummaryEntry,
 } from "./protocol.ts";
 import { GitRepository, type NoteListEntry, type NotesTransaction } from "./git.ts";
 import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
@@ -150,6 +151,46 @@ export interface HistoryEntry {
   readonly commit: CommitId;
   readonly blob: BlobId;
   readonly records: readonly NoteRecord[];
+}
+
+export interface HostedSummaryInput {
+  readonly commit: string;
+  readonly sourceCommits: readonly string[];
+}
+
+export type HostedSummaryPlanState = "ready" | "already-summarized" | "unsummarizable";
+
+export interface HostedSummaryPlan {
+  readonly commit: CommitId;
+  readonly state: HostedSummaryPlanState;
+  readonly entries: readonly SummaryEntry[];
+  readonly diagnostics: readonly string[];
+}
+
+export interface AttachHostedSummaryInput {
+  readonly commit: string;
+  readonly summary: SessionSummary;
+}
+
+export type AttachHostedSummaryState = "attached" | "already-summarized";
+
+export interface AttachHostedSummaryResult {
+  readonly commit: CommitId;
+  readonly state: AttachHostedSummaryState;
+  readonly summary: SessionSummary;
+  readonly diagnostics: readonly string[];
+}
+
+export interface PublishNotesInput {
+  readonly remote: string;
+  readonly attempts?: number;
+}
+
+export interface PublishNotesResult {
+  readonly ok: boolean;
+  readonly attempts: number;
+  readonly remoteTip: ObjectId | null;
+  readonly diagnostics: readonly string[];
 }
 
 interface DiffTransition {
@@ -397,6 +438,123 @@ export class Reveries {
     });
   }
 
+  async synthesizeHostedSummary(input: HostedSummaryInput): Promise<HostedSummaryPlan> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    if (await this.commitSessionSummary(commit) !== null) {
+      return {
+        commit,
+        state: "already-summarized",
+        entries: [],
+        diagnostics: [`Commit ${commit} already has a valid session summary`],
+      };
+    }
+    const diagnostics: string[] = [];
+    if (input.sourceCommits.length === 0) {
+      return { commit, state: "unsummarizable", entries: [], diagnostics: [`Commit ${commit} has no source commits`] };
+    }
+    const [firstParent] = await this.commitParents(commit);
+    const changedFrom = firstParent === undefined
+      ? new Set<BlobId>()
+      : new Set((await this.commitTransitions(firstParent, commit)).map((transition) => transition.from));
+    const entries: SummaryEntry[] = [];
+    for (const source of input.sourceCommits) {
+      const sourceCommit = await this.repository.resolveCommit(source);
+      const summary = await this.commitSessionSummary(sourceCommit);
+      if (summary === null) {
+        diagnostics.push(`Source commit ${sourceCommit} has no valid session summary`);
+        continue;
+      }
+      for (const entry of summary.entries) {
+        entries.push({
+          ...entry,
+          sources: [...entry.sources, { relation: "derived-from", kind: "commit", ref: sourceCommit }],
+          retirements: entry.retirements.filter((retirement) => changedFrom.has(retirement.from_blob)),
+        });
+      }
+    }
+    if (entries.length === 0) {
+      return { commit, state: "unsummarizable", entries: [], diagnostics };
+    }
+    return { commit, state: "ready", entries, diagnostics };
+  }
+
+  async attachHostedSummary(input: AttachHostedSummaryInput): Promise<AttachHostedSummaryResult> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    validateNote([input.summary], { verifyIds: false });
+    const check = await this.checkCommitAgainst(commit, input.summary);
+    if (!check.ok) {
+      throw new Error(
+        `Session summary for ${commit} fails strict validation: ${check.diagnostics.join("; ")}`,
+      );
+    }
+    return this.repository.withNotesWrite(async (notes) => {
+      const existing = await notes.read(commit);
+      const records = existing === null
+        ? []
+        : parseNote(existing, "strict", { verifyIds: false }).records;
+      const summary = records.find((record): record is SessionSummary => record.type === "session-summary");
+      if (summary !== undefined) {
+        return {
+          commit,
+          state: "already-summarized" as const,
+          summary,
+          diagnostics: [`Commit ${commit} already has a session summary`],
+        };
+      }
+      await notes.append(commit, canonicalRecord(input.summary));
+      return { commit, state: "attached" as const, summary: input.summary, diagnostics: [] };
+    }, (ref) => this.validateNotesRef(ref));
+  }
+
+  async publishNotes(input: PublishNotesInput): Promise<PublishNotesResult> {
+    const remote = input.remote;
+    const maximum = input.attempts ?? 3;
+    if (await this.repository.notesTip() === null) {
+      return {
+        ok: false,
+        attempts: 0,
+        remoteTip: null,
+        diagnostics: ["The local Reveries notes ref does not exist"],
+      };
+    }
+    const diagnostics: string[] = [];
+    for (let attempt = 1; attempt <= maximum; attempt += 1) {
+      const expected = await this.repository.remoteObject(remote, NOTES_REF);
+      const incorporated = await this.checkRemoteNotesIncorporated(remote, expected);
+      if (!incorporated.ok) {
+        const synced = await this.syncPull(remote);
+        if (!synced.ok) {
+          return {
+            ok: false,
+            attempts: attempt,
+            remoteTip: expected,
+            diagnostics: [...incorporated.diagnostics, ...synced.diagnostics],
+          };
+        }
+      }
+      const lease = expected ?? "0".repeat((await this.repository.objectFormat()) === "sha1" ? 40 : 64);
+      const push = await this.repository.run(
+        [
+          "push",
+          `--force-with-lease=${NOTES_REF}:${lease}`,
+          remote,
+          `${NOTES_REF}:${NOTES_REF}`,
+        ],
+        { allowExitCodes: [0, 1, 128] },
+      );
+      if (push.exitCode === 0) {
+        return { ok: true, attempts: attempt, remoteTip: await this.repository.notesTip(), diagnostics };
+      }
+      diagnostics.push(`Notes publication attempt ${attempt} was rejected: ${push.stderr.trim()}`);
+    }
+    return {
+      ok: false,
+      attempts: maximum,
+      remoteTip: await this.repository.remoteObject(remote, NOTES_REF),
+      diagnostics,
+    };
+  }
+
   async attachInitialization(input: { readonly commit: string; readonly record: ReveriesInit }): Promise<void> {
     const commit = await this.repository.resolveCommit(input.commit);
     await this.repository.withNotesWrite(async (notes) => {
@@ -448,8 +606,20 @@ export class Reveries {
   }
 
   async checkCommit(revision: string): Promise<CheckResult> {
-    const diagnostics: string[] = [];
     const commit = await this.repository.resolveCommit(revision);
+    const diagnostics: string[] = [];
+    let summary: SessionSummary | null = null;
+    try {
+      const note = await this.strictRead(commit);
+      summary = note.records.find((record): record is SessionSummary => record.type === "session-summary") ?? null;
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    const check = await this.checkCommitAgainst(commit, summary);
+    return { ok: check.ok, diagnostics: [...diagnostics, ...check.diagnostics] };
+  }
+
+  private async checkCommitAgainst(commit: CommitId, summary: SessionSummary | null): Promise<CheckResult> {
     const initialization = await this.findInitialization();
     if (initialization === null) {
       return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
@@ -461,25 +631,30 @@ export class Reveries {
     if (ancestor.exitCode !== 0) {
       return { ok: false, diagnostics: ["Commit is not a descendant of the Reveries initialization boundary"] };
     }
-    let summary: SessionSummary | null = null;
-    try {
-      const note = await this.strictRead(commit);
-      summary = note.records.find((record): record is SessionSummary => record.type === "session-summary") ?? null;
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
     if (summary === null) {
-      diagnostics.push(`Commit ${commit} requires exactly one valid session summary`);
-      return { ok: false, diagnostics };
+      return { ok: false, diagnostics: [`Commit ${commit} requires exactly one valid session summary`] };
     }
-    const parentsResult = await this.repository.run(["show", "-s", "--format=%P", commit]);
-    const parents = parentsResult.stdout.trim().split(" ").filter((parent) => parent.length > 0);
-    for (const parent of parents) {
+    const diagnostics: string[] = [];
+    for (const parent of await this.commitParents(commit)) {
       const transitions = await this.commitTransitions(parent, commit);
       const result = await this.checkTransitions(transitions, summary);
       diagnostics.push(...result.diagnostics.map((diagnostic) => `${parent}: ${diagnostic}`));
     }
     return { ok: diagnostics.length === 0, diagnostics };
+  }
+
+  private async commitParents(commit: CommitId): Promise<readonly CommitId[]> {
+    const result = await this.repository.run(["show", "-s", "--format=%P", commit]);
+    return result.stdout.trim().split(" ").filter((parent) => parent.length > 0).map(commitId);
+  }
+
+  private async commitSessionSummary(commit: CommitId): Promise<SessionSummary | null> {
+    try {
+      const note = await this.strictRead(commit);
+      return note.records.find((record): record is SessionSummary => record.type === "session-summary") ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async checkProposedRef(

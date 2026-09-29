@@ -41,6 +41,16 @@ const criteria = [
   { category: "protocol-git", criterion: "Arbitrary unstaged object write is refused", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "continuity refuses an arbitrary unstaged object")] },
   { category: "receive", criterion: "Receive fixture validates proposed ref updates", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "receive fixture validates proposed ref updates without moving refs")] },
   { category: "receive", criterion: "Base-tree changes invalidate earlier receive evidence", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "base tree changed")] },
+  { category: "protocol-git", criterion: "Host-created merge commits receive one summary per pull request commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a host-created merge commit receives one entry per pull request commit")] },
+  { category: "protocol-git", criterion: "Squash preserves recorded retirement evidence", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a squashed pull request keeps the retirement evidence recorded on its commits")] },
+  { category: "protocol-git", criterion: "A rebased pull request summarizes only the new tip commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a rebased pull request summarizes only the new tip commit"), evidence("scripts/reveries-post-merge.test.mjs", "a rebased pull request plans only the new tip commit and defers the intermediates")] },
+  { category: "protocol-git", criterion: "A synthesized summary that fails strict validation is never written", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a synthesized summary that fails strict validation is never written")] },
+  { category: "protocol-git", criterion: "A repeated post-merge run is a no-op", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a repeated run leaves the notes ref unchanged")] },
+  { category: "protocol-git", criterion: "A concurrent human summary wins over a synthesized summary", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a concurrently attached human summary wins over a synthesized summary")] },
+  { category: "receive", criterion: "Notes publication reconciles a concurrent writer before its compare-and-swap push", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication incorporates a concurrent writer before its compare-and-swap push")] },
+  { category: "receive", criterion: "An invalid concurrent notes union fails closed", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication fails closed on an invalid concurrent union and leaves the remote untouched")] },
+  { category: "host-adapters", criterion: "The post-merge workflow never executes pull request code", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "the post-merge workflow trusts the pushed default-branch revision and writes only notes")] },
+  { category: "host-adapters", criterion: "An ambiguous rebased commit is reported instead of guessed", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "an ambiguous rebase mapping is reported and never planned")] },
 
   { category: "initialization", criterion: "Repeated initialization is idempotent", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
   { category: "initialization", criterion: "Existing AGENTS prose is preserved", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
@@ -174,6 +184,8 @@ try {
   gates.push(await run("npm", ["run", "test:full"]));
   gates.push(await run("npm", ["run", "conformance"]));
   gates.push(await run("node", ["scripts/direct-git-acceptance.mjs"]));
+  gates.push(await run("node", ["scripts/post-merge-fixture.mjs"]));
+  gates.push(await run("npm", ["run", "test:scripts"]));
   gates.push(await run("npm", ["run", "acceptance:receive"]));
   gates.push(await run("node", ["scripts/native-skill-evidence.mjs"]));
   gates.push(await run("node", ["scripts/installer-acceptance.mjs"]));
