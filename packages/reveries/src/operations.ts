@@ -2,9 +2,11 @@ import {
   analyzeContinuity,
   blobId,
   canonicalRecord,
+  classifySignature,
   commitId,
   correctionPayload,
   createAttestation,
+  createSignature,
   createCorrection,
   createLedgerManifest,
   createRedaction,
@@ -26,6 +28,10 @@ import {
   resolutionPayload,
   resolveLimits,
   semanticPayload,
+  SIGNATURE_DOMAIN_MANIFEST,
+  SIGNATURE_DOMAIN_RECORD,
+  SIGNATURE_ROLES,
+  signingPayload,
   transitionId,
   transitionPayload,
   validateNote,
@@ -40,6 +46,7 @@ import {
   type FactGraphProjection,
   type FactTargetId,
   type LedgerManifest,
+  ledgerManifestPayload,
   type NoteRecord,
   type ObjectId,
   type PublicationAttestation,
@@ -56,13 +63,21 @@ import {
   type ReverieRecord,
   type ReveriesInit,
   type SessionSummary,
+  type SignatureId,
+  type SignatureRecord,
+  type SignatureRole,
+  type SignatureTrustReport,
+  type SigningPolicy,
   type Source,
   type SummaryEntry,
+  type TrustState,
   type TransitionCausal,
   type TransitionId,
   type TransitionInput,
   type TransitionMetadata,
   type TransitionSummary,
+  type TrustStore,
+  reverieId,
 } from "./protocol.ts";
 import { projectTransitionAttestation } from "./projection.ts";
 import {
@@ -71,6 +86,8 @@ import {
   hashBlobContent,
   LEDGER_MANIFEST_PATH,
   LEDGER_NOTES_PATH,
+  LEDGER_SIGNATURES_PATH,
+  LEDGER_SIGNATURE_TIMESTAMP,
   RETENTION_COMMITS_REF,
   RETENTION_OBJECTS_REF,
   SnapshotIndexCorruptError,
@@ -78,6 +95,8 @@ import {
   type NoteListEntry,
   type NotesTransaction,
   type RetentionSubject,
+  type SignatureSigner,
+  type SignatureVerifier,
   type WithNotesWriteOptions,
 } from "./git.ts";
 import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
@@ -188,6 +207,12 @@ export interface DoctorResult extends CheckResult {
    * and never damage; only `invalid` is a diagnostic.
    */
   readonly ledger: LedgerStatus;
+  /**
+   * Signing and trust state. Additive field: `cli.ts` human rendering is owned
+   * by a separate task, so these names are stable API, not display strings.
+   * Presence and unknown keys are notices, never damage.
+   */
+  readonly signatures: SignatureStatus;
 }
 
 /**
@@ -221,6 +246,63 @@ export interface LedgerCheckpointResult extends CheckResult {
 export interface LedgerMaterializeResult extends CheckResult {
   readonly state: "materialized" | "unchanged";
   readonly notesTip: ObjectId | null;
+}
+
+/**
+ * Signing material, all optional (RVR-009). A repository that never signs
+ * configures nothing and every signature operation reports `unavailable`
+ * rather than failing.
+ */
+export interface SigningOptions {
+  /** Signs canonical payloads. Absent means this repository cannot sign. */
+  readonly signer?: SignatureSigner;
+  /** Verifies signatures. Absent means no signature can be trusted here. */
+  readonly verifier?: SignatureVerifier;
+  /** Public key material and revocation. Absent means every key is unknown. */
+  readonly trust?: TrustStore;
+  /**
+   * Roles a policy requires, normally from `reveries.signingRoles`. Absent or
+   * empty means no signature can reach `policy-satisfying`; `trusted` is the
+   * honest ceiling.
+   */
+  readonly requiredRoles?: readonly SignatureRole[];
+}
+
+export type TrustStateCounts = Readonly<Record<TrustState, number>>;
+
+export interface SignatureTrustEntry {
+  readonly id: string;
+  readonly target: string;
+  readonly subject: string;
+  readonly signer: string;
+  readonly keyId: string;
+  readonly role: SignatureRole;
+  readonly state: TrustState;
+  readonly diagnostics: readonly string[];
+}
+
+export interface SignRecordResult extends CheckResult {
+  readonly state: "signed" | "unavailable";
+  readonly record: SignatureRecord | null;
+}
+
+/**
+ * How signing relates to local evidence (RVR-009). The states mirror
+ * `LedgerState`: `absent` and `unknown` are ordinary and never damage, and
+ * only `invalid` or `revoked` attestations are diagnostics. A repository that
+ * has not adopted signing must never be reported as broken.
+ */
+export interface SignatureStatus {
+  readonly state: "absent" | "unsigned" | "signed";
+  /** Count per trust state, so a reader sees all four required states. */
+  readonly counts: TrustStateCounts;
+  /** The ledger checkpoint tip, or null when no checkpoint exists. */
+  readonly checkpoint: ObjectId | null;
+  /** True when the checkpoint's manifest carries a verifying signature. */
+  readonly checkpointSigned: boolean;
+  /** Roles the current policy requires. */
+  readonly requiredRoles: readonly SignatureRole[];
+  readonly diagnostics: readonly string[];
 }
 
 export interface DoctorProtection {
@@ -584,6 +666,11 @@ function parseSnapshotIndexPayload(raw: string, tip: ObjectId): SnapshotIndexPay
 }
 
 export class Reveries {
+  /**
+   * Injected signing material (RVR-009). Both are optional: a repository that
+   * never signs needs neither, and the ports let a caller substitute a Git SSH
+   * backend for the default in-process ed25519 one without changing any caller.
+   */
   private constructor(
     /**
      * Evidence reads run through this suppressed handle: no read may lazily
@@ -599,11 +686,12 @@ export class Reveries {
      */
     private readonly liveRepository: GitRepository,
     private readonly proposedNotesTip?: ObjectId,
+    private readonly signing: SigningOptions = {},
   ) {}
 
-  static async open(cwd: string): Promise<Reveries> {
+  static async open(cwd: string, signing: SigningOptions = {}): Promise<Reveries> {
     const repository = await GitRepository.open(cwd);
-    return new Reveries(repository.withoutLazyFetch(), repository);
+    return new Reveries(repository.withoutLazyFetch(), repository, undefined, signing);
   }
 
   static async openBareForReceive(cwd: string, notesTip: ObjectId): Promise<Reveries> {
@@ -1891,11 +1979,16 @@ export class Reveries {
           }
           initialization = entry.object;
         }
+        // A signature is a global fact about an annotated subject, so it may
+        // ride on blob, tree, and commit notes alongside the records that live
+        // there. It is not evidence about the subject's content, so it never
+        // disqualifies the subject as a transition result or publication.
         if (entry.objectType === "blob" && entry.records.some((record) =>
           record.type !== "reverie"
           && record.type !== "correction"
           && record.type !== "resolution"
-          && record.type !== "redaction")) {
+          && record.type !== "redaction"
+          && record.type !== "signature")) {
           throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
         }
         if (entry.objectType === "commit" && entry.records.some((record) =>
@@ -1910,7 +2003,9 @@ export class Reveries {
         }
         if (entry.objectType === "tree"
           && entry.records.some((record) =>
-            record.type !== "transition-summary" && record.type !== "redaction")) {
+            record.type !== "transition-summary"
+            && record.type !== "redaction"
+            && record.type !== "signature")) {
           throw new Error(`Tree ${entry.object} has a non-transition protocol record`);
         }
         for (const record of entry.records) {
@@ -2354,10 +2449,12 @@ export class Reveries {
       return { ok: false, diagnostics: [`${checkpoint} is not a Reveries ledger checkpoint`] };
     }
 
-    // The envelope may carry only the manifest and the grafted notes subtree.
-    // `review/` belongs to RVR-019 and is rejected until that contract is agreed.
+    // The envelope may carry only the manifest, the grafted notes subtree, and
+    // the signature lines over the manifest. `review/` belongs to RVR-019 and is
+    // rejected until that contract is agreed. RVR-009 amended RVR-005's two-entry
+    // allow-list to exactly three; no existing check is dropped.
     const entries = await this.repository.ledgerTreeEntries(checkpoint);
-    const allowed = new Set([LEDGER_MANIFEST_PATH, LEDGER_NOTES_PATH]);
+    const allowed = new Set([LEDGER_MANIFEST_PATH, LEDGER_NOTES_PATH, LEDGER_SIGNATURES_PATH]);
     for (const entry of entries) {
       if (!allowed.has(entry.path)) diagnostics.push(`Ledger tree entry ${entry.path} is not part of the ledger envelope`);
     }
@@ -2435,6 +2532,28 @@ export class Reveries {
       }
     }
 
+    // The same append-only rule covers signature lines (RVR-009): a later
+    // checkpoint may add attestations, never drop or rewrite one. Without this a
+    // trusted signature could be silently retracted by the next checkpoint.
+    // The stronger guarantee is that once a chain is signed it stays signed, so
+    // dropping the signer cannot be used to shed accountability.
+    if (manifest.previous_ledger !== null) {
+      const previousSignatures = await this.repository.readLedgerSignaturesAt(manifest.previous_ledger);
+      const currentSignatures = await this.repository.readLedgerSignaturesAt(checkpoint);
+      if (previousSignatures !== null && currentSignatures === null) {
+        diagnostics.push("Ledger update drops the signatures entry of a signed checkpoint");
+      }
+      const nowLines = new Set(
+        (currentSignatures ?? "").split("\n").filter((line) => line.length > 0),
+      );
+      for (const line of (previousSignatures ?? "").split("\n")) {
+        if (line.length > 0 && !nowLines.has(line)) {
+          diagnostics.push(`Ledger update removes signature ${line}, which is not append-only`);
+          break;
+        }
+      }
+    }
+
     if (notesTree !== null) {
       const totals = Reveries.summarizeNoteLines(await this.repository.ledgerNotesLines(checkpoint));
       if (manifest.annotated_subjects !== totals.subjects) {
@@ -2445,6 +2564,37 @@ export class Reveries {
       }
       if (manifest.note_bytes !== totals.noteBytes) {
         diagnostics.push(`Ledger manifest note_bytes ${manifest.note_bytes} does not match ${totals.noteBytes}`);
+      }
+    }
+
+    // The manifest signature binds the exact notes, ledger, and retention tips
+    // because all three are inside the signed bytes. Structural verification does
+    // not depend on it: an unsigned or untrusted checkpoint is still a valid
+    // envelope, so trust is reported separately and never silently required.
+    //
+    // The entry is a growing log, so only the newest line can cover *this*
+    // manifest; earlier lines were checked against their own checkpoint when it
+    // was current. Every line must still be a manifest-domain signature, so a
+    // record-domain signature can never be smuggled into the envelope.
+    const signatures = await this.repository.readLedgerSignaturesAt(checkpoint);
+    if (signatures !== null) {
+      const records = this.parseSignatureLines(signatures);
+      if (records.length === 0) {
+        diagnostics.push("Ledger signatures entry carries no signature records");
+      }
+      for (const record of records) {
+        if (record.domain !== SIGNATURE_DOMAIN_MANIFEST) {
+          diagnostics.push(`Ledger signature ${record.id} is not a manifest-domain signature`);
+        }
+      }
+      const newest = records[records.length - 1];
+      if (newest !== undefined) {
+        const contentId = await this.signatureContentId(Buffer.from(ledgerManifestPayload(manifest), "utf8"));
+        if (newest.content_id !== contentId) {
+          diagnostics.push(
+            `Ledger signature ${newest.id} covers content ${newest.content_id}, not this manifest ${contentId}`,
+          );
+        }
       }
     }
 
@@ -2487,6 +2637,13 @@ export class Reveries {
     /** The ledger tip this update expects to follow; defaults to the current tip. */
     readonly expectedLedger?: ObjectId | null;
     readonly retentionCommit?: ObjectId | null;
+    /**
+     * Sign the manifest into a `signatures` tree entry. Defaults to true when a
+     * signer is configured. Passing false builds an unsigned RVR-005 checkpoint,
+     * which remains valid: an absent signature entry is a normal state.
+     */
+    readonly sign?: boolean;
+    readonly signingRole?: SignatureRole;
   }): Promise<LedgerCheckpointResult> {
     const expectedLedger = input.expectedLedger !== undefined ? input.expectedLedger : await this.repository.ledgerTip();
     const notesTip = await this.repository.notesTip();
@@ -2524,7 +2681,26 @@ export class Reveries {
       };
     }
 
-    const checkpoint = await this.repository.commitLedgerCheckpoint({ manifest });
+    // Sign before committing, so the signature and the envelope it covers are
+    // built together and a signing failure moves no ref at all.
+    let signatures: string | undefined;
+    if (input.sign !== false) {
+      const signed = await this.signLedgerManifest(manifest, input.signingRole ?? "publisher");
+      if (signed !== null) {
+        // The signature entry is an append-only log of manifest attestations.
+        // A signature covers one manifest, so every checkpoint necessarily has a
+        // different one; carrying the previous lines forward is what makes the
+        // entry grow-only and preserves the whole chain of attestations instead
+        // of replacing the previous checkpoint's.
+        const carried = expectedLedger === null
+          ? []
+          : (await this.repository.readLedgerSignaturesAt(expectedLedger) ?? "")
+            .split("\n")
+            .filter((line) => line.length > 0);
+        signatures = [...carried, signed.trimEnd()].join("\n").concat("\n");
+      }
+    }
+    const checkpoint = await this.repository.commitLedgerCheckpoint({ manifest, ...(signatures === undefined ? {} : { signatures }) });
     if (checkpoint === await this.repository.ledgerTip()) {
       return {
         ok: true,
@@ -2577,6 +2753,293 @@ export class Reveries {
    * expected-old-OID compare-and-swap, so it never overwrites a tip the caller
    * did not expect and never runs against an unverified envelope.
    */
+  // Signatures and signed checkpoints (RVR-009)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The canonical bytes a signature over a fact record commits to: the record's
+   * canonical line without its trailing LF. Signing the line rather than the
+   * parsed object is what makes the signature unforgeable by reordering keys.
+   */
+  private async signatureContentId(bytes: Uint8Array): Promise<ObjectId> {
+    return this.repository.hashObject(Buffer.from(bytes).toString("utf8"));
+  }
+
+  /**
+   * Sign a fact record and append the signature to the same annotated subject.
+   *
+   * A signature is a separate record referencing its target by ID, so rotating a
+   * key adds a second signature and leaves every semantic ID untouched. Returns
+   * `unavailable` rather than throwing when no signer is configured, so an
+   * unsigned repository is an ordinary state.
+   */
+  async signRecord(input: {
+    readonly target: NoteRecord;
+    readonly subject: ObjectId;
+    readonly role: SignatureRole;
+    readonly metadata: ReverieMetadata;
+  }): Promise<SignRecordResult> {
+    const signer = this.signing.signer;
+    if (signer === undefined) {
+      return { ok: true, diagnostics: [], state: "unavailable", record: null };
+    }
+    // Only ID-bearing facts can be attested. A session summary, an init record,
+    // and a publication attestation have no stable semantic ID to reference, so
+    // signing one would produce a signature that no reader could resolve.
+    const target = input.target;
+    const attested = target.type === "reverie"
+      || target.type === "transition-summary"
+      || target.type === "correction"
+      || target.type === "resolution"
+      || target.type === "redaction";
+    if (!attested) {
+      return {
+        ok: false,
+        diagnostics: [`A ${target.type} record has no identity to attest`],
+        state: "unavailable",
+        record: null,
+      };
+    }
+    // The canonical line without its trailing LF: the exact bytes the ID
+    // ecosystem already treats as a record's identity.
+    const content = canonicalRecord(target).replace(/\n$/, "");
+    const contentId = await this.signatureContentId(Buffer.from(content, "utf8"));
+    const draft = {
+      domain: SIGNATURE_DOMAIN_RECORD,
+      role: input.role,
+      target: target.id,
+      subject: input.subject,
+      signer: signer.signer,
+      key_id: signer.keyId,
+      algorithm: signer.algorithm,
+      signature: "",
+      content_id: contentId,
+    };
+    // The signature covers everything but the signature itself, so it is computed
+    // over the draft payload and then folded into the finished record.
+    const provisional = createSignature(
+      { ...draft, signature: "placeholder" },
+      input.metadata,
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    const signature = signer.sign(Buffer.from(signingPayload(provisional), "utf8"));
+    const record = createSignature(
+      { ...draft, signature: Buffer.from(signature).toString("base64") },
+      input.metadata,
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(input.subject, canonicalRecord(record));
+    });
+    return { ok: true, diagnostics: [], state: "signed", record };
+  }
+
+  /** Verify one signature record and classify it. Never throws for bad bytes. */
+  verifySignatureRecord(record: SignatureRecord, policy: SigningPolicy = { requiredRoles: [] }): SignatureTrustReport {
+    const verifier = this.signing.verifier;
+    const payload = Buffer.from(signingPayload(record), "utf8");
+    const verified = verifier === undefined
+      ? false
+      : verifier.verify({
+        payload,
+        signature: Buffer.from(record.signature, "base64"),
+        keyId: record.key_id,
+      });
+    return classifySignature(record, {
+      verdict: { verified },
+      trust: this.signing.trust ?? { keys: [] },
+      policy,
+    });
+  }
+
+  /**
+   * The effective role policy: explicit `SigningOptions.requiredRoles` when the
+   * caller stated one, otherwise `reveries.signingRoles`. This is where the Q4
+   * decision lives — without this read the `policy-satisfying` trust state would
+   * be unreachable and the decision would be hollow.
+   *
+   * An explicit option wins outright, including an explicit empty list, so a
+   * caller's intent is never silently overridden by repository configuration.
+   */
+  async signingPolicy(): Promise<SigningPolicy> {
+    if (this.signing.requiredRoles !== undefined) {
+      return { requiredRoles: this.signing.requiredRoles };
+    }
+    return { requiredRoles: await this.readSigningRoles() };
+  }
+
+  /**
+   * Read the configured role requirements. A comma-separated list of roles, in
+   * the order written. An absent or empty key requires no role. An unknown role
+   * is refused with a diagnostic naming the offending value and the valid set,
+   * because silently ignoring a typo would leave a repository believing it has a
+   * policy it does not have.
+   */
+  private async readSigningRoles(): Promise<readonly SignatureRole[]> {
+    const result = await this.repository.run(["config", "--get", "reveries.signingRoles"], {
+      allowExitCodes: [0, 1],
+    });
+    const value = result.stdout.trim();
+    if (value === "") return [];
+    const names = value
+      .split(",")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    for (const name of names) {
+      if (!(SIGNATURE_ROLES as readonly string[]).includes(name)) {
+        throw new Error(
+          `reveries.signingRoles must name roles from ${SIGNATURE_ROLES.join(", ")}; found ${name}`,
+        );
+      }
+    }
+    return names as readonly SignatureRole[];
+  }
+
+  /**
+   * Signatures over fact records in the current notes snapshot, keyed by the
+   * record they attest. Multiple signatures per target are expected: that is
+   * what a key rotation and a multi-role review both produce.
+   */
+  async signatureReports(): Promise<Map<string, SignatureTrustReport[]>> {
+    const reports = new Map<string, SignatureTrustReport[]>();
+    // Resolve the policy once: reading configuration per record would be both
+    // wasteful and, for a bad value, repeated failure.
+    const policy = await this.signingPolicy();
+    const notesTip = await this.repository.notesTip();
+    if (notesTip === null) return reports;
+    for (const entry of await this.repository.listNotes()) {
+      const body = await this.repository.readNoteAt(notesTip, entry.object);
+      if (body === null) continue;
+      for (const record of this.parseSignatureLines(body)) {
+        const report = this.verifySignatureRecord(record, policy);
+        reports.set(record.target, [...(reports.get(record.target) ?? []), report]);
+      }
+    }
+    return reports;
+  }
+
+  private parseSignatureLines(body: string): SignatureRecord[] {
+    const records: SignatureRecord[] = [];
+    for (const line of body.split("\n")) {
+      if (!line) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        // A malformed line is a note-level diagnostic handled by the snapshot
+        // validator; the signature pass only reads what it can understand.
+        continue;
+      }
+      if (value && typeof value === "object" && (value as { type?: unknown }).type === "signature") {
+        records.push(value as SignatureRecord);
+      }
+    }
+    return records;
+  }
+
+  /**
+   * Sign the ledger manifest and return the canonical signature lines, or null
+   * when this repository has no signer. The signed bytes are exactly
+   * `ledgerManifestPayload`, which already contains the notes, ledger, and
+   * retention tips, so the checkpoint is bound without new manifest fields.
+   */
+  async signLedgerManifest(manifest: LedgerManifest, role: SignatureRole = "publisher"): Promise<string | null> {
+    const signer = this.signing.signer;
+    if (signer === undefined) return null;
+    const content = ledgerManifestPayload(manifest);
+    const contentId = await this.signatureContentId(Buffer.from(content, "utf8"));
+    // The subject is the commit the signature travels with. A genesis checkpoint
+    // with no notes, previous ledger, or retention commit has no such commit yet,
+    // so it falls back to the manifest's own hash, which is still a stable and
+    // verifiable object ID for the exact bytes being signed.
+    const subject = manifest.notes_commit
+      ?? manifest.previous_ledger
+      ?? manifest.retention_commit
+      ?? await this.signatureContentId(Buffer.from(content, "utf8"));
+    const draft = {
+      domain: SIGNATURE_DOMAIN_MANIFEST,
+      role,
+      target: "ledger-manifest",
+      subject,
+      signer: signer.signer,
+      key_id: signer.keyId,
+      algorithm: signer.algorithm,
+      signature: "",
+      content_id: contentId,
+    };
+    const provisional = createSignature(
+      { ...draft, signature: "placeholder" },
+      { author_email: signer.signer, session: null, created_at: LEDGER_SIGNATURE_TIMESTAMP },
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    const signature = signer.sign(Buffer.from(signingPayload(provisional), "utf8"));
+    const record = createSignature(
+      { ...draft, signature: Buffer.from(signature).toString("base64") },
+      { author_email: signer.signer, session: null, created_at: LEDGER_SIGNATURE_TIMESTAMP },
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    return canonicalRecord(record);
+  }
+
+  /**
+   * Report how signing relates to local evidence. Mirrors the RVR-005 ledger
+   * rule that only genuinely broken evidence is damage: an absent signer, an
+   * unknown key, and an unsigned-but-valid checkpoint are all ordinary.
+   */
+  async signatureStatus(): Promise<SignatureStatus> {
+    const counts: Record<TrustState, number> = {
+      unknown: 0,
+      valid: 0,
+      trusted: 0,
+      "policy-satisfying": 0,
+      invalid: 0,
+      revoked: 0,
+    };
+    const diagnostics: string[] = [];
+    const policy = await this.signingPolicy();
+    const requiredRoles = policy.requiredRoles;
+    const reports = await this.signatureReports();
+    for (const entries of reports.values()) {
+      for (const report of entries) {
+        counts[report.state] += 1;
+        if (report.state === "invalid" || report.state === "revoked") {
+          diagnostics.push(
+            `Signature ${report.id} over ${report.target} by ${report.signer} is ${report.state}`,
+          );
+        }
+      }
+    }
+    const checkpoint = await this.repository.ledgerTip();
+    if (checkpoint === null) {
+      return { state: "absent", counts, checkpoint: null, checkpointSigned: false, requiredRoles, diagnostics };
+    }
+    const stored = await this.repository.readLedgerSignaturesAt(checkpoint);
+    if (stored === null) {
+      return { state: "unsigned", counts, checkpoint, checkpointSigned: false, requiredRoles, diagnostics };
+    }
+    // The checkpoint's own attestations are counted with the record signatures so
+    // a reader sees one trust picture rather than two partial ones.
+    let checkpointSigned = false;
+    for (const record of this.parseSignatureLines(stored)) {
+      const report = this.verifySignatureRecord(record, policy);
+      counts[report.state] += 1;
+      if (report.state === "policy-satisfying" || report.state === "trusted") {
+        checkpointSigned = true;
+      }
+      if (report.state === "invalid" || report.state === "revoked") {
+        diagnostics.push(`Checkpoint signature ${report.id} is ${report.state}`);
+      }
+    }
+    return {
+      state: "signed",
+      counts,
+      checkpoint,
+      checkpointSigned,
+      requiredRoles,
+      diagnostics,
+    };
+  }
+
   async materializeNotesFromLedger(input: {
     /** The local notes tip this call expects to replace; null when absent. */
     readonly expectedNotes: ObjectId | null;
@@ -2877,6 +3340,38 @@ export class Reveries {
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
+    let signatures: SignatureStatus = {
+      state: "absent",
+      counts: {
+        unknown: 0,
+        valid: 0,
+        trusted: 0,
+        "policy-satisfying": 0,
+        invalid: 0,
+        revoked: 0,
+      },
+      checkpoint: null,
+      checkpointSigned: false,
+      requiredRoles: this.signing.requiredRoles ?? [],
+      diagnostics: [],
+    };
+    try {
+      signatures = await this.signatureStatus();
+      // Only a broken attestation is damage. An unsigned repository, an unknown
+      // key, and an untrusted-but-valid signature are all ordinary states, which
+      // is the same rule the ledger envelope follows for `absent` and `stale`.
+      diagnostics.push(...signatures.diagnostics);
+    } catch (error: unknown) {
+      diagnostics.push(error instanceof Error ? error.message : String(error));
+    }
+    notices.push(
+      `Signatures: ${signatures.state}; checkpoint ${signatures.checkpoint ?? "none"}; `
+      + `signed ${signatures.checkpointSigned ? "yes" : "no"}; `
+      + `${signatures.counts["policy-satisfying"]} policy-satisfying, `
+      + `${signatures.counts.unknown} unknown, ${signatures.counts.valid} valid, `
+      + `${signatures.counts.trusted} trusted, ${signatures.counts.invalid} invalid, `
+      + `${signatures.counts.revoked} revoked.`,
+    );
     notices.push(
       `Protection: helper ${protection.helper}; local ${protection.local}; receive-side ${protection.receiveSide}. `
       + "Local hooks are not a security boundary and may be bypassed with --no-verify.",
@@ -2896,6 +3391,7 @@ export class Reveries {
       protection,
       retention,
       ledger,
+      signatures,
       state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
     };
   }

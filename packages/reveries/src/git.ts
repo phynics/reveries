@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomUUID,
+  sign,
+  verify,
+} from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -23,6 +31,23 @@ export const LEDGER_MESSAGE = "Reveries ledger checkpoint\n";
 /** The only tree entries a ledger checkpoint envelope may carry. */
 export const LEDGER_MANIFEST_PATH = "manifest.json";
 export const LEDGER_NOTES_PATH = "notes";
+/**
+ * The signature lines a checkpoint carries (RVR-009). RVR-005 allowed exactly two
+ * tree entries; the manifest signature extends that allow-list to exactly three
+ * and no further.
+ */
+export const LEDGER_SIGNATURES_PATH = "signatures";
+
+/**
+ * The fixed timestamp a ledger manifest signature carries (RVR-009).
+ *
+ * A checkpoint must stay byte-reproducible from the same evidence and signer, so
+ * its signature cannot embed a wall-clock time: ed25519 over fixed bytes means
+ * the same manifest and key always reproduce the same signature and therefore
+ * the same checkpoint object ID. This is the signature counterpart of the fixed
+ * `LEDGER_IDENTITY` epoch the commit itself already uses.
+ */
+export const LEDGER_SIGNATURE_TIMESTAMP = "1970-01-01T00:00:00Z";
 export const RETENTION_OBJECTS_REF = "refs/reveries/retention/objects";
 export const RETENTION_COMMITS_REF = "refs/reveries/retention/commits";
 export const RETENTION_BUNDLE_REFS = [
@@ -104,6 +129,147 @@ interface RunOptions {
   readonly input?: string;
   readonly allowExitCodes?: readonly number[];
   readonly environment?: Readonly<Record<string, string | undefined>>;
+}
+
+/**
+ * Produces a signature over canonical payload bytes (RVR-009).
+ *
+ * This is a port, not an implementation: the trust-state vocabulary in
+ * `protocol.ts` is the contract and the backend is swappable. The default
+ * implementation is the in-process ed25519 one below, chosen so the test suite is
+ * hermetic and needs no `ssh-keygen` or agent. Git SSH `allowed_signers` support
+ * is a second implementation behind this same port.
+ */
+export interface SignatureSigner {
+  readonly algorithm: string;
+  /** The key material identity; this is the field that rotates. */
+  readonly keyId: string;
+  /** The stable attesting identity that trust policy matches on. */
+  readonly signer: string;
+  sign(payload: Uint8Array): Uint8Array;
+}
+
+/**
+ * Checks a signature over canonical payload bytes. Implementations must not throw
+ * for a bad signature: a malformed signature is a reported `invalid` state, not
+ * an exception, so one corrupt line can never abort a whole verification pass.
+ */
+export interface SignatureVerifier {
+  readonly algorithm: string;
+  verify(input: { payload: Uint8Array; signature: Uint8Array; keyId: string }): boolean;
+}
+
+export interface Ed25519KeyPair {
+  /** PKCS#8 PEM private key. Never written to a repository or a note. */
+  readonly privateKey: string;
+  /** SPKI PEM public key. */
+  readonly publicKey: string;
+  /** `SHA256:` plus the hex SHA-256 of the DER public key. */
+  readonly keyId: string;
+}
+
+/** The `SHA256:<hex>` key identity both the signer and the trust store use. */
+export function ed25519KeyId(publicKey: string): string {
+  const der = createPublicKey(publicKey).export({ type: "spki", format: "der" });
+  return `SHA256:${createHash("sha256").update(der).digest("hex")}`;
+}
+
+export function generateEd25519KeyPair(): Ed25519KeyPair {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  return {
+    publicKey: publicPem,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    keyId: ed25519KeyId(publicPem),
+  };
+}
+
+/** The default in-process signer. Private key material is supplied by the caller. */
+export function createLocalEd25519Signer(input: {
+  readonly signer: string;
+  readonly keyId: string;
+  readonly privateKey: string;
+}): SignatureSigner {
+  const key = createPrivateKey(input.privateKey);
+  return {
+    algorithm: "ed25519",
+    keyId: input.keyId,
+    signer: input.signer,
+    sign(payload: Uint8Array): Uint8Array {
+      return new Uint8Array(sign(null, Buffer.from(payload), key));
+    },
+  };
+}
+
+/** The default in-process verifier, keyed by `keyId`. */
+export function createLocalEd25519Verifier(keys: Readonly<Record<string, string>>): SignatureVerifier {
+  return {
+    algorithm: "ed25519",
+    verify(input): boolean {
+      const pem = keys[input.keyId];
+      if (pem === undefined) return false;
+      try {
+        return verify(null, Buffer.from(input.payload), createPublicKey(pem), Buffer.from(input.signature));
+      } catch {
+        // Malformed key or signature material is a failed verification, never a
+        // thrown error, so one bad line cannot abort a verification pass.
+        return false;
+      }
+    },
+  };
+}
+
+/** One trust-store entry: public key material plus its authorization and revocation. */
+export interface TrustStoreKey {
+  readonly key_id: string;
+  readonly signer: string;
+  readonly revoked: boolean;
+  /** SPKI PEM public key. */
+  readonly public_key: string;
+}
+
+export interface TrustStoreFile {
+  readonly keys: readonly TrustStoreKey[];
+}
+
+const TRUST_STORE_KEYS = new Set(["key_id", "signer", "revoked", "public_key"]);
+
+/**
+ * Read a local trust store. Public key material and revocation live in this file
+ * rather than in the ledger manifest, which is what lets the manifest stay
+ * byte-reproducible and need no signing-policy field of its own (RVR-009).
+ */
+export async function readTrustStore(value: unknown): Promise<TrustStoreFile> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("trust store must be a JSON object");
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.keys)) throw new Error("trust store keys must be an array");
+  const keys: TrustStoreKey[] = record.keys.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`trust store key ${index} must be an object`);
+    }
+    const key = entry as Record<string, unknown>;
+    for (const field of Object.keys(key)) {
+      if (!TRUST_STORE_KEYS.has(field)) throw new Error(`unknown trust store field: ${field}`);
+    }
+    for (const field of TRUST_STORE_KEYS) {
+      if (!(field in key)) throw new Error(`trust store key ${index} is missing ${field}`);
+    }
+    if (typeof key.key_id !== "string" || !key.key_id.trim()) throw new Error("trust store key_id must be nonempty");
+    if (typeof key.signer !== "string" || !key.signer.trim()) throw new Error("trust store signer must be nonempty");
+    if (typeof key.revoked !== "boolean") throw new Error("trust store revoked must be a boolean");
+    if (typeof key.public_key !== "string" || !key.public_key.trim()) {
+      throw new Error(`trust store key ${index} is missing public_key material`);
+    }
+    return {
+      key_id: key.key_id,
+      signer: key.signer,
+      revoked: key.revoked,
+      public_key: key.public_key,
+    };
+  });
+  return { keys };
 }
 
 export class GitCommandError extends Error {
@@ -336,6 +502,12 @@ export class GitRepository {
     private readonly commonDir: string,
     private readonly commandCwd = root,
     private readonly noLazyFetch = false,
+    /**
+     * The object format resolved at open time. Cached so `hashObjectSync` can
+     * hand a bound `HashObject` to the pure protocol constructors without a
+     * second Git round trip.
+     */
+    public readonly cachedObjectFormat: "sha1" | "sha256" | undefined = undefined,
   ) {}
 
   static async open(cwd: string): Promise<GitRepository> {
@@ -344,7 +516,10 @@ export class GitRepository {
     const commonResult = await runGit(root, ["rev-parse", "--git-common-dir"]);
     const commonOutput = commonResult.stdout.trim();
     const commonDir = isAbsolute(commonOutput) ? commonOutput : resolve(root, commonOutput);
-    return new GitRepository(root, commonDir);
+    const repository = new GitRepository(root, commonDir);
+    // Resolve the object format once so synchronous hashing can hand a bound
+    // `HashObject` to the pure protocol constructors.
+    return new GitRepository(root, commonDir, undefined, undefined, await repository.objectFormat());
   }
 
   /** Open a repository from a receive hook without assuming a worktree exists. */
@@ -376,6 +551,7 @@ export class GitRepository {
   }
 
   async objectFormat(): Promise<"sha1" | "sha256"> {
+    if (this.cachedObjectFormat !== undefined) return this.cachedObjectFormat;
     const result = await this.run(["rev-parse", "--show-object-format"]);
     const format = result.stdout.trim();
     if (format !== "sha1" && format !== "sha256") {
@@ -387,6 +563,17 @@ export class GitRepository {
   async hashObject(input: string): Promise<ObjectId> {
     const result = await this.run(["hash-object", "--stdin"], { input });
     return parseObjectId(result.stdout, "git hash-object");
+  }
+
+  /**
+   * The `HashObject` the protocol constructors take, bound to this repository's
+   * object format. Protocol code derives every ID through this, so SHA-1 and
+   * SHA-256 repositories are both supported with no format branching.
+   */
+  hashObjectSync(input: Uint8Array): ObjectId {
+    // The object format is resolved at open time and cached on the instance, so
+    // this stays synchronous and safe to hand to a pure protocol constructor.
+    return hashBlobContent(Buffer.from(input), this.cachedObjectFormat ?? "sha1");
   }
 
   /** Hash text into a blob and store it, so a tree can reference it. */
@@ -677,7 +864,10 @@ export class GitRepository {
    */
   withoutLazyFetch(): GitRepository {
     if (this.noLazyFetch) return this;
-    return new GitRepository(this.root, this.commonDir, this.commandCwd, true);
+    // Carry the cached object format across: the suppressed handle is the one
+    // callers actually use, and dropping it would make synchronous hashing fall
+    // back to SHA-1 inside a SHA-256 repository.
+    return new GitRepository(this.root, this.commonDir, this.commandCwd, true, this.cachedObjectFormat);
   }
 
   private suppressLazyFetch(options: RunOptions): RunOptions {
@@ -1134,8 +1324,14 @@ export class GitRepository {
   // Ledger envelope (RVR-005)
   // ---------------------------------------------------------------------------
 
-  async ledgerTip(): Promise<ObjectId | null> {
-    return this.notesTip(LEDGER_REF);
+  /**
+   * The ledger tip. `ref` defaults to the canonical branch, but a fresh clone
+   * only has the envelope on its remote-tracking ref, which is where an ordinary
+   * branch fetch leaves it, so callers verifying a transported envelope pass
+   * that ref explicitly.
+   */
+  async ledgerTip(ref: string = LEDGER_REF): Promise<ObjectId | null> {
+    return this.notesTip(ref);
   }
 
   /** The OID of a path inside a tree, or null when the path is absent. */
@@ -1179,6 +1375,17 @@ export class GitRepository {
     return manifest === null ? null : this.readBlobAt(manifest);
   }
 
+  /**
+   * The canonical signature lines a checkpoint carries, or null when the
+   * checkpoint predates signing. RVR-005 checkpoints have no `signatures`
+   * entry, so absence is a normal unsigned state and not damage.
+   */
+  async readLedgerSignaturesAt(checkpoint: ObjectId): Promise<string | null> {
+    const tree = await this.treeForCommit(checkpoint);
+    const signatures = await this.treeEntryAt(tree, LEDGER_SIGNATURES_PATH);
+    return signatures === null ? null : this.readBlobAt(signatures);
+  }
+
   async readBlobAt(object: ObjectId): Promise<string> {
     return (await this.runBinary(["cat-file", "blob", object])).toString("utf8");
   }
@@ -1209,6 +1416,12 @@ export class GitRepository {
     readonly previousLedger?: ObjectId | null;
     readonly notesCommit?: ObjectId | null;
     readonly retentionCommit?: ObjectId | null;
+    /**
+     * Canonical signature lines over `ledgerManifestPayload(manifest)`. When
+     * present the checkpoint gains a `signatures` tree entry; RVR-005 unsigned
+     * checkpoints keep the two-entry envelope.
+     */
+    readonly signatures?: string;
   }): Promise<ObjectId> {
     const manifest = input.manifest;
     const previousLedger = input.previousLedger !== undefined ? input.previousLedger : manifest.previous_ledger;
@@ -1238,14 +1451,19 @@ export class GitRepository {
     }
     // Grafting the existing notes tree by OID keeps the envelope free of copied
     // note blobs and makes the tree entry comparable to the manifest field.
+    // The signature entry is written last so the tree stays byte-reproducible
+    // for a given manifest and signature set.
+    const entries = [
+      `100644 blob ${manifestBlob}\t${LEDGER_MANIFEST_PATH}`,
+      `040000 tree ${notesTree}\t${LEDGER_NOTES_PATH}`,
+    ];
+    if (input.signatures !== undefined && input.signatures.length > 0) {
+      entries.push(`100644 blob ${await this.writeBlob(input.signatures)}\t${LEDGER_SIGNATURES_PATH}`);
+    }
     const tree = parseObjectId((await this.run([
       "mktree",
     ], {
-      input: [
-        `100644 blob ${manifestBlob}\t${LEDGER_MANIFEST_PATH}`,
-        `040000 tree ${notesTree}\t${LEDGER_NOTES_PATH}`,
-        "",
-      ].join("\n"),
+      input: [...entries, ""].join("\n"),
     })).stdout, "git mktree");
 
     const argumentsList = ["commit-tree", tree];

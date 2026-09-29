@@ -1929,7 +1929,147 @@ guard. It never runs against an unverified envelope.
 the outgoing checker excludes it from session-summary and transition coverage while still
 verifying its envelope.
 
-### 27.3.2 Retention policy and vault
+### 27.3.2 Signatures and signed checkpoints
+
+A semantic record claims who typed an email address. A signature claims who holds a key.
+The two are separate facts, and keeping them separate is what makes key rotation harmless.
+
+#### The `signature` record
+
+A signature is an immutable, ID-bearing `signature` record on the annotated subject's note:
+
+```jsonc
+{
+  "v": 1,
+  "type": "signature",
+  "id": "sg:<object-id>",           // this record's own content, never the target's
+  "domain": "reveries/v1/record",    // or reveries/v1/ledger-manifest
+  "role": "author",                  // author | reviewer | publisher
+  "target": "rv:<object-id>",        // or tr:, cr:, rs:, rd:, or ledger-manifest
+  "subject": "<object-id>",          // the annotated object
+  "signer": "alice@example.test",    // stable identity; survives rotation
+  "key_id": "SHA256:<fingerprint>",  // key material identity; this is what rotates
+  "algorithm": "ed25519",
+  "signature": "<base64>",
+  "content_id": "<object-id>",       // the target's exact canonical bytes
+  "author_email": "...", "session": null, "created_at": "..."
+}
+```
+
+Every ID-bearing fact is a valid `target`, including a redaction: redactions are never
+supersession heads, but a reviewer may still attest that one was deliberate. A record with
+no stable identity — a session summary, an init record, a publication attestation — cannot
+be attested, because a signature over it would name a target no reader could resolve.
+
+#### What a signature commits to
+
+The signed payload is canonical JSON over exactly eight fields:
+
+```text
+v, domain, role, target, subject, signer, algorithm, content_id
+```
+
+It omits the signature itself, the record ID, and all author metadata. That omission is
+deliberate: a signature must stay verifiable across a metadata-only rewrite while remaining
+bound to the exact content it attests.
+
+`content_id` is the repository object ID of the target's **canonical bytes** — the record's
+canonical line without its trailing LF, or `ledgerManifestPayload` for a checkpoint — taken
+through the repository's own object algorithm, so SHA-1 and SHA-256 repositories both work
+with no format branching. Binding a hash rather than the bytes keeps a signature line inside
+the per-record size budget, and it also means a signature covers the full canonical line,
+`author_email` included, which `id` alone does not.
+
+`domain` is inside the signed payload, so a signature produced for a fact record can never
+be replayed as a checkpoint signature. `ledger-manifest` is reachable only under the manifest
+domain, so a record-domain signature cannot claim to have attested a checkpoint.
+
+Author metadata is outside the signed payload. Editing a signature record's `created_at`
+changes its `sg:` ID, and the ID-integrity check catches that by the same mechanism every
+other record relies on; adding it to the signed payload would widen the contract without
+adding cryptographic strength, because IDs are unkeyed content hashes either way.
+
+#### Why `sg:` and not a field on the record it signs
+
+`rv:`, `tr:`, `cr:`, `rs:`, and `rd:` are content hashes of causal fields only. A signature
+must therefore never enter one of those payloads: if `signer` were a field of
+`ReverieSemantic`, rotating a key would change the decision ID. A signature instead carries
+its own `sg:` identity, derived from its own content, and references its target by ID. So
+key rotation is a pure append: the same record gains a second `signature` and every semantic
+ID is byte-identical. `signer` is the stable identity and `key_id` is the rotating one, which
+is what lets a trust store move a signer from one key to another without touching evidence.
+
+Signatures are ordinary monotonic facts. N distinct signatures may share one `target`, which
+is what a rotation and a multi-role review both produce, and only two records claiming the
+**same** `sg:` ID with different content are a fork.
+
+#### Trust state
+
+Trust is a strict refinement, so each state is a strictly stronger claim and no signature
+satisfies two of them:
+
+| State | Means |
+| --- | --- |
+| `unknown` | The key is not in the trust store. Nothing is claimed. |
+| `valid` | The bytes verify, but no trust store entry binds this key to this signer. Cryptographic validity is not identity. |
+| `trusted` | The bytes verify and the trust store binds this key to this signer. |
+| `policy-satisfying` | `trusted`, and the signed role is one the policy requires. |
+| `invalid` | A known key whose bytes do not verify. |
+| `revoked` | A key the trust store has explicitly revoked. |
+
+Trust is resolved before the cryptographic verdict: an unknown key is `unknown` even when its
+bytes do not verify, because unverifiable material about a key we know nothing about is not a
+claim of forgery. `invalid` and `revoked` are states, not deletions — the record stays in the
+note bytes and stays reported, so a reader can always see that an attestation once existed
+and why it no longer counts.
+
+#### `reveries.signingRoles`
+
+```bash
+git config reveries.signingRoles author,reviewer
+```
+
+A comma-separated role list, in the order written. An absent or empty key requires no role,
+and then `trusted` is the honest ceiling: no signature can reach `policy-satisfying`. An
+unknown role is refused with a diagnostic naming the offending value and the valid set,
+because silently ignoring a typo would leave a repository believing it has a policy it does
+not have. An explicit `requiredRoles` option overrides the key outright, including an
+explicit empty list, so a caller's stated intent is never silently overridden by
+configuration.
+
+#### The growing append-only signature log
+
+A checkpoint's `signatures` tree entry is an **append-only log of manifest attestations**,
+not a set of current signatures. A signature covers one manifest, so every checkpoint
+necessarily has a different one; a new checkpoint therefore carries the previous
+checkpoint's lines forward and appends its own. Verification enforces three rules: once a
+chain is signed it stays signed, no line is ever dropped or rewritten, and the newest line's
+`content_id` must equal the hash of this checkpoint's manifest. A fourth tree entry is still
+refused, so RVR-009 extended RVR-005's two-entry allow-list to exactly three and no further.
+
+The manifest signature binds the notes, ledger, and retention tips because all three are
+inside `ledgerManifestPayload`, which RVR-005 made byte-reproducible and which RVR-009
+therefore signs unchanged. No manifest field was added, so the manifest's reproducibility
+guarantee and its schema-drift test both stand. A signed checkpoint is still reproducible:
+the signature carries a fixed epoch timestamp, the counterpart of the fixed
+`Reveries Ledger <ledger@reveries.local>` identity the commit already uses, and ed25519 over
+fixed bytes is deterministic.
+
+A signed annotated tag was rejected for the same checkpoint signature: tags live outside
+`refs/heads/reveries-ledger`, are not fetched by a normal clone, and are not covered by the
+append-only check, so a checkpoint's trust would depend on a ref the envelope does not
+transport.
+
+#### Verifier backends
+
+Verification runs through an injectable port; the trust vocabulary above is the contract and
+the backend is swappable. The default is an in-process ed25519 implementation with a local
+trust store, so the test suite is hermetic and needs no `ssh-keygen` and no agent. Git SSH
+`allowed_signers` support is a second implementation behind the same port and is not
+implemented yet. Private key material is never written to a repository or a note: a record
+stores only `signer`, `key_id`, and the signature bytes.
+
+### 27.3.3 Retention policy and vault
 
 `git config reveries.retention <none|active|all|archive>` selects which annotated
 subjects the vault keeps. An unset key means `active`.

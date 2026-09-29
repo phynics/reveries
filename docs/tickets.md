@@ -157,7 +157,7 @@ RVR-006 provides the local plumbing path. RVR-007 generalizes immutable facts. R
 **Priority:** P0
 **Feasibility:** Core / V2 plus Adapter
 **Stage:** 3
-**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5). The envelope, manifest contract, and mismatch validation are implemented. Signed checkpoints (RVR-009) and authority acceptance (RVR-017) are still open, so this ticket is not yet complete.
+**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5). The envelope, manifest contract, mismatch validation, and signed checkpoints are implemented; authority acceptance (RVR-017) and the review projection (RVR-019) are still open, so this ticket is not yet complete.
 
 ### Problem
 
@@ -191,13 +191,13 @@ RVR-008 supplies retention. RVR-009 supplies signed checkpoints. RVR-017 defines
 
 ### Remaining
 
-- Signed ledger checkpoints over the manifest (RVR-009).
 - Authority role semantics for the reserved `manifest.authority` field (RVR-017).
 - A generated `review/` projection subtree (RVR-019).
-- Receive-side classification of `refs/heads/reveries-ledger` as evidence rather than a
-  code ref. The outgoing checker already excludes it; `receive.ts` `isCodeRef` does not.
-- CLI surfaces: a `reveries ledger` command, a human-readable doctor ledger line, and
-  `sync --pull` wiring for envelope materialization.
+
+Signed ledger checkpoints over the manifest, receive-side classification of
+`refs/heads/reveries-ledger` as evidence, and the `reveries ledger` command, the
+human-readable doctor ledger line, and `sync --pull` wiring for envelope
+materialization have all landed.
 - Publishing the ledger branch alongside the code and notes refs in one atomic push.
 
 ## RVR-006: Add atomic local commit-and-summary creation
@@ -312,7 +312,7 @@ RVR-012 provides efficient evidence loading. RVR-005 carries the vault checkpoin
 **Priority:** P1
 **Feasibility:** Core / V2 records and checkpoints; Boundary identity enforcement
 **Stage:** 3
-**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9)
+**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9). The `signature` record family, the four-state trust vocabulary, key rotation that preserves decision IDs, the `reveries.signingRoles` policy read, and signed ledger checkpoints over the manifest bytes are implemented. The signing and trust CLI, the `install.ts` trust-store setup, and the Git SSH verifier remain, so this ticket is not yet complete.
 
 ### Problem
 
@@ -341,6 +341,15 @@ RVR-004 defines transition IDs. RVR-005 defines the checkpoint envelope. RVR-017
 - A checkpoint binds exact notes, ledger, and retention tips.
 - Key rotation does not change decision IDs.
 - Trust state distinguishes unknown, valid, trusted, and policy-satisfying signatures.
+
+### Remaining
+
+- The signing and trust CLI, and the `install.ts` trust-store bootstrap.
+- A Git SSH `allowed_signers` verifier behind the existing port; the in-process
+  ed25519 verifier is the only backend today.
+- Boundary acceptance of a signature. Verification and classification are
+  implemented, but nothing yet refuses a commit or a receive based on them;
+  authority acceptance belongs to RVR-017.
 
 ## RVR-010: Add protocol resource limits and bounded validation
 

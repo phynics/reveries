@@ -84,10 +84,25 @@ Tickets: [RVR-003](https://github.com/phynics/reveries/issues/3),
 The protected `reveries-ledger` envelope branch exists. It carries a canonical manifest
 and the exact notes tree grafted at its own object ID, records the notes commit as a
 typed parent, and is validated for manifest, tree, parent, and notes-tip mismatches.
-Updates are fast-forward and append-only by construction. The envelope is **not**
-complete: RVR-009 still has to add signed checkpoints over the manifest, and RVR-017 still
-has to give the reserved `authority` field its role semantics. Nothing here is a
-signed-checkpoint or authority acceptance claim.
+Updates are fast-forward and append-only by construction. A checkpoint may now also
+carry a `signatures` entry holding signatures over the canonical manifest bytes, which
+bind the exact notes, ledger, and retention tips without any new manifest field. The
+envelope is **not** complete: RVR-017 still has to give the reserved `authority` field
+its role semantics, and signature acceptance and role policy are a boundary
+enforcement question RVR-017 and the receive surface still have to settle. Nothing here
+is an authority-acceptance claim.
+
+Signatures exist as a separate, immutable, ID-bearing `signature` record family in
+`refs/notes/reveries`, with a `signatures` entry in the ledger tree for the manifest
+attestation. A signature commits to the target's canonical bytes by repository object
+ID, so `rv:`, `tr:`, `cr:`, `rs:`, and `rd:` identities are unchanged by key rotation:
+rotating a key adds a signature, it never edits one. Trust state distinguishes
+`unknown`, `valid`, `trusted`, and `policy-satisfying`, and `invalid` and `revoked`
+signatures stay visible and reported rather than being removed. Verification runs
+through an injectable port with a hermetic in-process ed25519 default and a local
+trust store; Git SSH `allowed_signers` is a second implementation behind the same port
+and is not implemented yet. There is no CLI surface for signing or trust, and
+`install.ts` does not yet create a trust store.
 
 ### Stage 4: Define governance boundaries
 
@@ -104,11 +119,11 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 | RVR-002 | P0 | [Eliminate unsafe non-atomic publication paths](https://github.com/phynics/reveries/issues/2) | Core / V1 + Boundary |
 | RVR-003 | P0 | [Add receive-side and hosted-merge enforcement](https://github.com/phynics/reveries/issues/3) | Core + Adapter + Boundary |
 | RVR-004 | P0 | [Introduce tree-transition summaries](https://github.com/phynics/reveries/issues/4) | Core / V2 |
-| RVR-005 | P0 | [Introduce a protected ledger envelope branch](https://github.com/phynics/reveries/issues/5) — envelope, manifest, and mismatch validation landed; signed checkpoints and authority acceptance remain in RVR-009 and RVR-017 | Core / V2 + Adapter |
+| RVR-005 | P0 | [Introduce a protected ledger envelope branch](https://github.com/phynics/reveries/issues/5) — envelope, manifest, and mismatch validation landed, and RVR-009 has since added the `signatures` tree entry; authority acceptance remains in RVR-017 | Core / V2 + Adapter |
 | RVR-006 | P0 | [Add atomic local commit-and-summary creation](https://github.com/phynics/reveries/issues/6) | Core / V1 |
 | RVR-007 | P1 | [Generalize all evidence into a monotonic immutable fact graph](https://github.com/phynics/reveries/issues/7) | Core / V2 |
 | RVR-008 | P0 | [Preserve annotated objects against garbage collection](https://github.com/phynics/reveries/issues/8) | Core / V1 |
-| RVR-009 | P1 | [Add cryptographic attestations and signed checkpoints](https://github.com/phynics/reveries/issues/9) | Core / V2 + Boundary |
+| RVR-009 | P1 | [Add cryptographic attestations and signed checkpoints](https://github.com/phynics/reveries/issues/9) — the `signature` record family, the four-state trust vocabulary, key rotation that preserves decision IDs, and signed ledger checkpoints over the manifest bytes landed; the CLI surface, `install.ts` trust-store setup, and the Git SSH verifier remain | Core / V2 + Boundary |
 | RVR-010 | P0 | [Add protocol resource limits and bounded validation](https://github.com/phynics/reveries/issues/10) | Core / V1 hardening |
 | RVR-011 | P0 | [Detect unstaged worktree edits correctly](https://github.com/phynics/reveries/issues/11) | Core / V1 |
 | RVR-012 | P1 | [Replace repeated scans with a snapshot loader and disposable index](https://github.com/phynics/reveries/issues/12) | Core / V1 |

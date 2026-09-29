@@ -10,6 +10,7 @@ export type TransitionId = Brand<`tr:${string}`, "transition-id">;
 export type CorrectionId = Brand<`cr:${string}`, "correction-id">;
 export type ResolutionId = Brand<`rs:${string}`, "resolution-id">;
 export type RedactionId = Brand<`rd:${string}`, "redaction-id">;
+export type SignatureId = Brand<`sg:${string}`, "signature-id">;
 
 /**
  * Heads a correction or resolution edge may name: reveries and the new
@@ -268,6 +269,71 @@ export type RedactionRecord = RedactionSemantic & ReverieMetadata & {
 
 export type RedactionInput = RedactionSemantic;
 
+/**
+ * Signed payload domains (RVR-009). The domain is inside the signed payload, so
+ * a signature produced for a fact record can never be replayed as a checkpoint
+ * signature or vice versa. Both are fixed strings: a caller may not invent a
+ * domain, because a self-chosen domain would let a signer assert a scope this
+ * protocol never agreed to.
+ */
+export const SIGNATURE_DOMAIN_RECORD = "reveries/v1/record";
+export const SIGNATURE_DOMAIN_MANIFEST = "reveries/v1/ledger-manifest";
+
+/** Who is attesting. The role is inside the signed payload, so it cannot be swapped. */
+export type SignatureRole = "author" | "reviewer" | "publisher";
+
+export const SIGNATURE_ROLES: readonly SignatureRole[] = ["author", "reviewer", "publisher"];
+
+/**
+ * A signature over a fact record or a ledger manifest (RVR-009).
+ *
+ * This is a separate record type on purpose. The semantic IDs of `rv:`, `tr:`,
+ * `cr:`, `rs:`, and `rd:` are content hashes of causal fields only, so a
+ * signature must never enter one of those payloads: rotating a key would then
+ * change a decision ID. A signature therefore carries its own `sg:` identity
+ * derived from its own content and references its target by ID, which is what
+ * makes key rotation a no-op for semantic identity.
+ *
+ * `signer` is the stable identity and `key_id` is the rotating one. Rotating a
+ * key adds a second signature over the same target; it never edits the first.
+ */
+export type SignatureRecord = ReverieMetadata & {
+  v: 1;
+  type: "signature";
+  id: SignatureId;
+  /** The domain separator; one of the two exported `SIGNATURE_DOMAIN_*` values. */
+  domain: string;
+  role: SignatureRole;
+  /** The signed record ID, or `ledger-manifest` for a checkpoint signature. */
+  target: string;
+  /** The annotated object the signature is attached to. */
+  subject: ObjectId;
+  signer: string;
+  key_id: string;
+  algorithm: string;
+  /** The signature over `signingPayload(record)`, base64. */
+  signature: string;
+  /**
+   * Repository object ID of the target's exact canonical bytes: the record's
+   * canonical line without its trailing LF, or `ledgerManifestPayload`. Binding
+   * a hash rather than the bytes keeps the payload O(1) and works for both
+   * SHA-1 and SHA-256 repositories through the injected `HashObject`.
+   */
+  content_id: ObjectId;
+};
+
+export type SignatureInput = {
+  readonly domain: string;
+  readonly role: SignatureRole;
+  readonly target: string;
+  readonly subject: string;
+  readonly signer: string;
+  readonly key_id: string;
+  readonly algorithm: string;
+  readonly signature: string;
+  readonly content_id: string;
+};
+
 export type NoteRecord =
   | ReverieRecord
   | SessionSummary
@@ -276,7 +342,8 @@ export type NoteRecord =
   | PublicationAttestation
   | CorrectionRecord
   | ResolutionRecord
-  | RedactionRecord;
+  | RedactionRecord
+  | SignatureRecord;
 
 export type Diagnostic = {
   line?: number;
@@ -308,6 +375,8 @@ export type ResourceLimits = {
   maxResolutions: number;
   maxRedactions: number;
   maxResolves: number;
+  maxSignatures: number;
+  maxSignaturesPerTarget: number;
 };
 
 export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
@@ -329,6 +398,8 @@ export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxResolutions: 64,
   maxRedactions: 64,
   maxResolves: 64,
+  maxSignatures: 64,
+  maxSignaturesPerTarget: 16,
 });
 
 export class LimitExceededError extends Error {
@@ -421,6 +492,9 @@ const TRANSITION_ID = /^tr:[0-9a-f]{40}$|^tr:[0-9a-f]{64}$/;
 const CORRECTION_ID = /^cr:[0-9a-f]{40}$|^cr:[0-9a-f]{64}$/;
 const RESOLUTION_ID = /^rs:[0-9a-f]{40}$|^rs:[0-9a-f]{64}$/;
 const REDACTION_ID = /^rd:[0-9a-f]{40}$|^rd:[0-9a-f]{64}$/;
+const SIGNATURE_ID = /^sg:[0-9a-f]{40}$|^sg:[0-9a-f]{64}$/;
+/** Every ID-bearing fact a signature may attest, in both repository formats. */
+const SIGNATURE_TARGET = /^(?:rv|tr|cr|rs|rd):[0-9a-f]{40}$|^(?:rv|tr|cr|rs|rd):[0-9a-f]{64}$/;
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
@@ -482,6 +556,11 @@ export function resolutionId(value: string): ResolutionId {
 export function redactionId(value: string): RedactionId {
   if (!REDACTION_ID.test(value)) throw new Error(`Invalid redaction ID: ${value}`);
   return value as RedactionId;
+}
+
+export function signatureId(value: string): SignatureId {
+  if (!SIGNATURE_ID.test(value)) throw new Error(`Invalid signature ID: ${value}`);
+  return value as SignatureId;
 }
 
 export function factHeadId(value: string): FactHeadId {
@@ -778,10 +857,10 @@ function identifiedField(
   value: unknown,
   field: string,
   narrow: (candidate: string) => unknown,
-): void {
+): string {
   const candidate = typeof value === "string" ? value : String(value);
   try {
-    narrow(candidate);
+    return narrow(candidate) as string;
   } catch (error: unknown) {
     throw new Error(`${field}: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -808,8 +887,8 @@ export function validateLedgerManifest(
   if (value.ledger_ref !== LEDGER_REF) throw new Error(`ledger_ref must be ${LEDGER_REF}`);
   if (value.notes_ref !== NOTES_REF) throw new Error(`notes_ref must be ${NOTES_REF}`);
 
-  const commit = (field: string): void => identifiedField(value[field], field, commitId);
-  const anyObject = (field: string): void => identifiedField(value[field], field, objectId);
+  const commit = (field: string): void => void identifiedField(value[field], field, commitId);
+  const anyObject = (field: string): void => void identifiedField(value[field], field, objectId);
   if (value.notes_commit !== null) commit("notes_commit");
   if (value.notes_tree !== null) anyObject("notes_tree");
   // A notes commit names the exact notes tree that travels with it, so the two
@@ -1061,6 +1140,270 @@ function canonicalRetirement(retirement: Retirement): Retirement {
   };
 }
 
+/**
+ * The exact bytes hashed for a signature identity: the whole attestation
+ * except its own ID. Including the signature bytes is deliberate, so two
+ * different signers over the same target are two distinct records rather than
+ * one record with ambiguous content.
+ */
+export function signatureIdentityPayload(record: SignatureInput): string {
+  const domain = signatureDomain(record.domain);
+  const role = signatureRoleValue(record.role);
+  const target = signatureTarget(record.domain, record.target);
+  return JSON.stringify({
+    v: 1,
+    domain,
+    role,
+    target,
+    // Wrap the object-ID constructors so a bad field is reported by name instead
+    // of a bare "Invalid Git object ID", which is indistinguishable across fields.
+    subject: identifiedField(record.subject, "subject", objectId),
+    signer: trimText(record.signer, "signer"),
+    key_id: trimText(record.key_id, "key_id"),
+    algorithm: trimText(record.algorithm, "algorithm"),
+    signature: trimText(record.signature, "signature"),
+    content_id: identifiedField(record.content_id, "content_id", objectId),
+  });
+}
+
+function signatureDomain(value: string): string {
+  if (value !== SIGNATURE_DOMAIN_RECORD && value !== SIGNATURE_DOMAIN_MANIFEST) {
+    throw new Error(`domain must be ${SIGNATURE_DOMAIN_RECORD} or ${SIGNATURE_DOMAIN_MANIFEST}`);
+  }
+  return value;
+}
+
+function signatureRoleValue(value: string): SignatureRole {
+  if (value !== "author" && value !== "reviewer" && value !== "publisher") {
+    throw new Error(`role must be one of ${SIGNATURE_ROLES.join(", ")}`);
+  }
+  return value;
+}
+
+/**
+ * A target must be a real fact ID, except that the reserved `ledger-manifest`
+ * target is reachable only under the manifest domain. A record-domain signature
+ * naming `ledger-manifest` would let a signer claim to have attested a
+ * checkpoint without ever producing a checkpoint payload.
+ *
+ * Every ID-bearing fact is a valid target, including `rd:`. Redactions are never
+ * supersession heads, so they are absent from `FactTargetId`, but a reviewer may
+ * still want to attest that a redaction was deliberate.
+ */
+function signatureTarget(domain: string, value: string): string {
+  const target = trimText(value, "target");
+  if (target === "ledger-manifest") {
+    if (domain !== SIGNATURE_DOMAIN_MANIFEST) {
+      throw new Error("target ledger-manifest requires the manifest signature domain");
+    }
+    return target;
+  }
+  if (!SIGNATURE_TARGET.test(target)) {
+    throw new Error(`Invalid signature target: ${target}`);
+  }
+  return target;
+}
+
+export function createSignature(
+  input: SignatureInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): SignatureRecord {
+  const resolved = resolveLimits(limits);
+  const identity = signatureIdentityPayload(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `sg:${hashObject(Buffer.from(`${identity}\n`, "utf8"))}` as SignatureId;
+  const record: SignatureRecord = {
+    v: 1,
+    type: "signature",
+    id,
+    domain: input.domain,
+    role: input.role,
+    target: input.target,
+    subject: input.subject as ObjectId,
+    signer: trimRef(input.signer, "signer", resolved),
+    key_id: trimRef(input.key_id, "key_id", resolved),
+    algorithm: trimRef(input.algorithm, "algorithm", resolved),
+    signature: trimRef(input.signature, "signature", resolved),
+    content_id: input.content_id as ObjectId,
+    // `author_email` records who ran the helper; `signer` is the attesting
+    // identity trust policy matches on. They are separate on purpose, so a
+    // shared runner does not masquerade as the signer.
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+/**
+ * The exact canonical bytes a signature signs. This is the contract's core: it
+ * binds the protocol domain, the target ID, the annotated subject, the signer,
+ * the algorithm, and the target's content hash. It deliberately omits the
+ * signature itself, the record ID, and all author metadata, so a signature stays
+ * verifiable across a metadata-only rewrite while remaining bound to the exact
+ * content it attests.
+ */
+export function signingPayload(record: SignatureRecord): string {
+  const domain = signatureDomain(record.domain);
+  const target = signatureTarget(domain, record.target);
+  return JSON.stringify({
+    v: 1,
+    domain,
+    role: signatureRoleValue(record.role),
+    target,
+    subject: identifiedField(record.subject, "subject", objectId),
+    signer: trimText(record.signer, "signer"),
+    algorithm: trimText(record.algorithm, "algorithm"),
+    content_id: identifiedField(record.content_id, "content_id", objectId),
+  });
+}
+
+/**
+ * How far a signature's trust has been established. The order is a strict
+ * refinement, so each state is a strictly stronger claim than the one before it
+ * and no signature can satisfy two of them at once:
+ *
+ * - `unknown`: nothing is claimed. The key is not in the trust store.
+ * - `valid`: the bytes verify, but no trust store entry binds this key to this
+ *   signer. Cryptographic validity is not identity.
+ * - `trusted`: the bytes verify and the trust store binds this key to this
+ *   signer. Identity is established.
+ * - `policy-satisfying`: `trusted` and the signed role is one the policy
+ *   requires. A repository with no configured roles can never reach this.
+ *
+ * `invalid` and `revoked` are deliberately states rather than deletions: the
+ * record stays in the note bytes and stays reported, so a reader can always see
+ * that an attestation once existed and why it no longer counts.
+ */
+export type TrustState =
+  | "unknown"
+  | "valid"
+  | "trusted"
+  | "policy-satisfying"
+  | "invalid"
+  | "revoked";
+
+/** One authorized (or explicitly revoked) key in a local trust store. */
+export type TrustStoreEntry = {
+  readonly key_id: string;
+  /** The signer identity this key is authorized to speak for. */
+  readonly signer: string;
+  readonly revoked: boolean;
+};
+
+/**
+ * The local trust store (RVR-009). Public key material and revocation live here
+ * rather than in the ledger manifest, so the manifest keeps the byte-reproducibility
+ * RVR-005 guarantees and needs no signing-policy field of its own.
+ */
+export type TrustStore = {
+  readonly keys: readonly TrustStoreEntry[];
+};
+
+/** Role requirements, from `reveries.signingRoles` and the trust-store policy. */
+export type SigningPolicy = {
+  readonly requiredRoles: readonly SignatureRole[];
+};
+
+/** The cryptographic verdict, injected so this module never verifies anything. */
+export type SignatureVerdict = {
+  readonly verified: boolean;
+  readonly diagnostic?: string;
+};
+
+export type SignatureTrustReport = {
+  readonly id: SignatureId;
+  readonly target: string;
+  readonly subject: ObjectId;
+  readonly signer: string;
+  readonly key_id: string;
+  readonly role: SignatureRole;
+  readonly state: TrustState;
+  readonly diagnostics: readonly string[];
+};
+
+/**
+ * Classify one signature against an injected verdict, trust store, and policy.
+ *
+ * This is pure and performs no cryptography, which is what keeps the trust
+ * vocabulary the actual contract and the verifier backend swappable. Trust is
+ * resolved before the cryptographic verdict: an unknown key is `unknown` even
+ * when its bytes do not verify, because unverifiable material about a key we
+ * know nothing about is not a claim of forgery.
+ */
+export function classifySignature(
+  record: SignatureRecord,
+  input: {
+    readonly verdict: SignatureVerdict;
+    readonly trust: TrustStore;
+    readonly policy: SigningPolicy;
+  },
+): SignatureTrustReport {
+  const diagnostics: string[] = [];
+  if (input.verdict.diagnostic !== undefined) diagnostics.push(input.verdict.diagnostic);
+  const report = (state: TrustState): SignatureTrustReport => ({
+    id: record.id,
+    target: record.target,
+    subject: record.subject,
+    signer: record.signer,
+    key_id: record.key_id,
+    role: record.role,
+    state,
+    diagnostics,
+  });
+
+  const entry = trustStoreEntry(input.trust, record.key_id);
+  if (entry === null) return report("unknown");
+  if (entry.revoked) return report("revoked");
+  if (!input.verdict.verified) return report("invalid");
+  if (entry.signer !== record.signer) return report("valid");
+  if (input.policy.requiredRoles.includes(record.role)) return report("policy-satisfying");
+  return report("trusted");
+}
+
+function trustStoreEntry(store: TrustStore, keyId: string): TrustStoreEntry | null {
+  const matches: TrustStoreEntry[] = [];
+  for (const entry of store.keys) {
+    if (trimText(entry.key_id, "key_id") === keyId) matches.push(entry);
+  }
+  for (const entry of matches) trimText(entry.signer, "signer");
+  // Two entries for one key would let the same key claim two identities, so the
+  // store is rejected rather than resolved by ordering.
+  if (matches.length > 1) {
+    throw new Error(`Trust store has ${matches.length} entries for key ${keyId}`);
+  }
+  return matches[0] ?? null;
+}
+
+function validateSignature(
+  record: SignatureRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!SIGNATURE_ID.test(record.id)) throw new Error("invalid signature ID");
+  const domain = signatureDomain(record.domain);
+  signatureRoleValue(record.role);
+  signatureTarget(domain, record.target);
+  identifiedField(record.subject, "subject", objectId);
+  identifiedField(record.content_id, "content_id", objectId);
+  trimRef(record.signer, "signer", limits);
+  trimRef(record.key_id, "key_id", limits);
+  trimRef(record.algorithm, "algorithm", limits);
+  // A base64 signature is opaque bytes, so only the size budget applies here.
+  checkChars(record.signature, limits.maxRecordBytes, "maxRecordBytes", "signature");
+  if (!record.signature.trim()) throw new Error("signature must be a nonempty string");
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `sg:${hashObject(Buffer.from(`${signatureIdentityPayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`signature ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
 function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
   if (record.type === "reverie") {
     const semantic = normalizeSemantic(record);
@@ -1182,6 +1525,25 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
       created_at: record.created_at,
     };
   }
+  if (record.type === "signature") {
+    return {
+      v: 1,
+      type: "signature",
+      id: record.id,
+      domain: record.domain,
+      role: record.role,
+      target: record.target,
+      subject: record.subject,
+      signer: trimText(record.signer, "signer"),
+      key_id: trimText(record.key_id, "key_id"),
+      algorithm: trimText(record.algorithm, "algorithm"),
+      signature: trimText(record.signature, "signature"),
+      content_id: record.content_id,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
   return {
     v: 1,
     type: "reveries-init",
@@ -1209,6 +1571,7 @@ function asRecord(value: unknown): NoteRecord {
   if (record.type === "correction") return record as unknown as CorrectionRecord;
   if (record.type === "resolution") return record as unknown as ResolutionRecord;
   if (record.type === "redaction") return record as unknown as RedactionRecord;
+  if (record.type === "signature") return record as unknown as SignatureRecord;
   throw new Error(`unknown record type: ${String(record.type)}`);
 }
 
@@ -1434,6 +1797,10 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
     validateRedaction(record, hashObject, limits);
     return;
   }
+  if (record.type === "signature") {
+    validateSignature(record, hashObject, limits);
+    return;
+  }
   if (record.protocol !== 1 || record.notes_ref !== NOTES_REF) throw new Error("invalid Reveries initialization record");
   if (!Array.isArray(record.publishing_remotes) || !Array.isArray(record.hosts)) throw new Error("initialization arrays are required");
   for (const remote of record.publishing_remotes) trimRef(remote, "publishing remote", limits);
@@ -1520,18 +1887,44 @@ export function validateNote(
     "maxRedactions",
     "redactions",
   );
+  checkArrayLength(
+    records.filter((record) => record.type === "signature"),
+    limits.maxSignatures,
+    "maxSignatures",
+    "signatures",
+  );
+  // A target may be attested by several roles and several keys, so the per-target
+  // budget is a fan-out bound rather than a duplicate check: it stops one record
+  // from accumulating unbounded attestations.
+  const signaturesByTarget = new Map<string, number>();
+  for (const record of records) {
+    if (record.type !== "signature") continue;
+    const count = (signaturesByTarget.get(record.target) ?? 0) + 1;
+    signaturesByTarget.set(record.target, count);
+    if (count > limits.maxSignaturesPerTarget) {
+      throw new LimitExceededError(
+        "maxSignaturesPerTarget",
+        count,
+        limits.maxSignaturesPerTarget,
+        `signatures over ${record.target}`,
+      );
+    }
+  }
   // Tree notes carry transition summaries and commit notes may carry
   // publication attestations; object-type placement beyond this is enforced
   // by the snapshot validator, which knows each annotated object's type.
   // Corrections, resolutions, and redactions are global facts that may ride
   // on blob, tree, or commit notes within the snapshot placement rules.
+  // A signature is a global fact about an annotated subject, so it may ride on
+  // any note that also carries a record, just like a correction or redaction.
   if (summaries.length === 0 && inits.length === 0
     && records.some((record) => record.type !== "reverie"
       && record.type !== "transition-summary"
       && record.type !== "publication-attestation"
       && record.type !== "correction"
       && record.type !== "resolution"
-      && record.type !== "redaction")) {
+      && record.type !== "redaction"
+      && record.type !== "signature")) {
     throw new Error("blob note contains a non-reverie record");
   }
   const byId = new Map<ReverieId, string>();
@@ -1539,6 +1932,7 @@ export function validateNote(
   const correctionsById = new Map<CorrectionId, string>();
   const resolutionsById = new Map<ResolutionId, string>();
   const redactionsById = new Map<RedactionId, string>();
+  const signaturesById = new Map<SignatureId, string>();
   const checkDuplicate = (previous: string | undefined, payload: string, message: string): void => {
     if (previous !== undefined && previous !== payload && forkPolicy === "reject") throw new Error(message);
   };
@@ -1581,6 +1975,16 @@ export function validateNote(
       const previous = redactionsById.get(record.id);
       checkDuplicate(previous, payload, `conflicting duplicate redaction ID: ${record.id}`);
       redactionsById.set(record.id, payload);
+      continue;
+    }
+    if (record.type === "signature") {
+      // Signatures are monotonic facts with no edges, but they still cost a
+      // visit so a note full of attestations is budgeted like any other fact.
+      chargeGraph(1, "signature graph");
+      const payload = signatureIdentityPayload(record);
+      const previous = signaturesById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate signature ID: ${record.id}`);
+      signaturesById.set(record.id, payload);
       continue;
     }
     if (record.type !== "reverie") continue;
