@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { commitAdoption, initializeRepository, removeIntegration } from "../src/install.ts";
+import { GitRepository } from "../src/git.ts";
+import { commitAdoption, initializeRepository, readLocalTrustStore, removeIntegration } from "../src/install.ts";
 import { Reveries } from "../src/operations.ts";
 
 const execFileAsync = promisify(execFile);
@@ -34,8 +35,8 @@ async function configValues(cwd: string, key: string): Promise<readonly string[]
   }
 }
 
-async function createRepository(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "reveries-init-"));
+async function createRepository(prefix = "reveries-init-"): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
   temporaryRepositories.push(directory);
   await git(directory, "init", "-b", "main");
   await git(directory, "config", "user.name", "Reveries Test");
@@ -895,3 +896,228 @@ test("the ledger refspec stays idempotent across repeated convergence", async ()
 
   assert.deepEqual(second, first, "re-running setup duplicated a refspec");
 });
+
+const REMOVAL_INIT = {
+  hosts: ["codex"] as const,
+  publishingRemotes: ["origin"],
+  directiveEmail: "user@example.com",
+  skillSetup: { kind: "reminder" } as const,
+  helper,
+};
+
+async function defaultStoreOf(directory: string): Promise<string> {
+  return (await readLocalTrustStore((await GitRepository.open(directory)))).path;
+}
+
+async function remove(directory: string) {
+  return removeIntegration(directory, { publishingRemotes: ["origin"] });
+}
+
+function storeBody(signer: string): string {
+  return `${JSON.stringify({ keys: [{ key_id: "SHA256:aa", signer, revoked: false, public_key: "pem" }] }, null, 2)}\n`;
+}
+
+/** `git config --get` whose answer may legitimately be "not set". */
+async function configOf(directory: string, key: string): Promise<string> {
+  try {
+    return await git(directory, "config", "--get", key);
+  } catch {
+    return "";
+  }
+}
+
+async function storeExists(path: string): Promise<boolean> {
+  try {
+    await readFile(path, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fresh(prefix: string, options: { readonly trustStore?: string } = {}): Promise<string> {
+  const directory = await createRepository(prefix);
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
+  // Configuration is set before setup runs, because which file setup creates or
+  // adopts is exactly what these tests are about.
+  if (options.trustStore !== undefined) await git(directory, "config", "reveries.trustStore", options.trustStore);
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+  return directory;
+}
+
+test("removal clears owned configuration and preserves the trust store it created", async () => {
+  const directory = await fresh("removal-preserves-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+  await git(directory, "config", "reveries.remoteRole.origin", "primary");
+  await git(directory, "config", "reveries.signingRoles", "author");
+  await git(directory, "config", "reveries.signingKey", "/tmp/does-not-matter.pem");
+  await git(directory, "notes", "--ref=refs/notes/reveries", "add", "-m", "evidence", "HEAD");
+  const notesTip = await git(directory, "rev-parse", "refs/notes/reveries");
+
+  const result = await remove(directory);
+
+  assert.deepEqual([...result.removedTrustConfig].sort(), [
+    "reveries.remoteRole.origin",
+    "reveries.signingKey",
+    "reveries.signingRoles",
+  ]);
+  assert.deepEqual(result.trustStore.preserved, [store]);
+  assert.match(result.trustStore.reason, /never deletes trust material/);
+  // A store setup created is still a store an operator may depend on. Removal
+  // clears configuration; deleting trust material is a separate, deliberate act.
+  assert.equal(await storeExists(store), true, "removal must not delete a trust store it created");
+  for (const key of result.removedTrustConfig) {
+    assert.equal(await configOf(directory, key), "", `${key} is still set after removal`);
+  }
+  assert.equal(await git(directory, "rev-parse", "refs/notes/reveries"), notesTip);
+});
+
+test("removal clears a legacy marker key without chasing it to a deletion", async () => {
+  // Older setup recorded the store it created. The key is local configuration and
+  // is cleared; the path in it is never followed to remove anything.
+  const directory = await fresh("removal-marker-");
+  const storePath = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(storePath, storeBody("alice@example.test"), "utf8");
+  await git(directory, "config", "reveries.managedTrustStore", storePath);
+
+  const result = await remove(directory);
+
+  assert.equal(await configOf(directory, "reveries.managedTrustStore"), "", "the marker key is cleared");
+  assert.equal(await storeExists(storePath), true, "the marker must never be chased to a deletion");
+});
+
+test("removal preserves a configured custom store and reports the path it resolved", async () => {
+  const custom = join(await mkdtemp(join(tmpdir(), "reveries-custom-store-")), "team-trust.json");
+  await writeFile(custom, storeBody("team@example.test"), "utf8");
+  const directory = await fresh("removal-custom-preserve-", { trustStore: custom });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [custom]);
+  assert.equal(result.trustStore.path, custom, "the reported path is the configured one, resolved before the config was cleared");
+  assert.equal(await readFile(custom, "utf8"), storeBody("team@example.test"));
+});
+
+test("removal preserves an external store that replaced the one setup created", async () => {
+  // The store setup created is repointed away from and a shared file takes its
+  // place. Neither is deleted: the first is ours to leave behind, the second was
+  // never ours at all.
+  const directory = await fresh("removal-replaced-");
+  const created = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(created, storeBody("alice@example.test"), "utf8");
+  const external = join(await mkdtemp(join(tmpdir(), "reveries-external-")), "trust.json");
+  await writeFile(external, storeBody("team@example.test"), "utf8");
+  await git(directory, "config", "reveries.trustStore", external);
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [external]);
+  assert.equal(await readFile(external, "utf8"), storeBody("team@example.test"), "the replacement survives byte for byte");
+  assert.equal(await storeExists(created), true, "the superseded store is left for the operator to remove knowingly");
+});
+
+test("removal preserves a store reached through a symlinked parent directory", async () => {
+  // A symlinked parent is the case a path comparison alone would get wrong: the
+  // configured path and the real path differ, and deleting either one is a guess.
+  const outside = await mkdtemp(join(tmpdir(), "reveries-symlink-store-"));
+  const real = join(outside, "real");
+  await mkdir(real, { recursive: true });
+  const linkPath = join(outside, "link");
+  await symlink(real, linkPath);
+  const viaLink = join(linkPath, "trust.json");
+  await writeFile(viaLink, storeBody("team@example.test"), "utf8");
+  const directory = await fresh("removal-symlink-", { trustStore: viaLink });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [viaLink]);
+  assert.equal(
+    await readFile(viaLink, "utf8"),
+    storeBody("team@example.test"),
+    "a store under a symlinked parent is still a store, and removal still keeps it",
+  );
+});
+
+test("removal with no trust store reports that honestly", async () => {
+  const directory = await fresh("removal-no-store-");
+  const store = await defaultStoreOf(directory);
+  await rm(store, { force: true });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, []);
+  assert.match(result.trustStore.reason, /No trust store exists/);
+  assert.equal(result.removed, true);
+});
+
+test("a second removal preserves again and reports no configuration as cleared", async () => {
+  const directory = await fresh("removal-rerun-preserve-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+
+  await remove(directory);
+  const second = await remove(directory);
+
+  assert.deepEqual(second.removedTrustConfig, []);
+  assert.deepEqual(second.trustStore.preserved, [store]);
+  assert.equal(await storeExists(store), true, "a re-run must not delete anything either");
+});
+
+test("setup never clobbers a store that appears between its check and its write", async () => {
+  // The read-then-write window is a real race between two setup processes, and the
+  // loser's rename would destroy the winner's trust decisions. The create is
+  // exclusive, so the second writer adopts instead of replacing.
+  const directory = await fresh("race-create-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+
+  // A second setup runs against the same repository, which is the loser's position.
+  const again = await initializeRepository(directory, { ...REMOVAL_INIT });
+
+  assert.equal(again.trustStoreCreated, false, "an existing store is adopted, never replaced");
+  assert.equal(
+    await readFile(store, "utf8"),
+    storeBody("alice@example.test"),
+    "the concurrent writer's content survives intact",
+  );
+});
+
+test("setup creates a complete store a concurrent reader can never see half-written", async () => {
+  const directory = await createRepository("race-partial-");
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
+  const store = (await trustStorePathFor(directory));
+
+  // Sample the store while setup writes it. Every observation must be either
+  // absent or a complete, parseable document; a partial write would break that.
+  const observations: (string | null)[] = [];
+  const sampling = (async () => {
+    for (let attempt = 0; attempt < 200 && observations.length < 200; attempt += 1) {
+      try {
+        observations.push(await readFile(store, "utf8"));
+      } catch {
+        observations.push(null);
+      }
+    }
+  })();
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+  await sampling;
+
+  for (const observation of observations) {
+    if (observation === null) continue;
+    assert.doesNotThrow(
+      () => JSON.parse(observation) as unknown,
+      "a reader observed a partially written trust store",
+    );
+  }
+  assert.deepEqual(JSON.parse(await readFile(store, "utf8")) as unknown, { keys: [] });
+});
+
+async function trustStorePathFor(directory: string): Promise<string> {
+  return (await readLocalTrustStore((await GitRepository.open(directory)))).path;
+}

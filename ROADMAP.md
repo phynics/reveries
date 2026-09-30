@@ -109,13 +109,44 @@ must declare the same authority, must not transport a notes commit the primary d
 contain, and must sign its own manifest when the primary's checkpoint is signed. The
 check is network-free and reads only local remote-tracking refs.
 
-Two boundaries remain open and nothing here is a claim about them. `cli.ts` still passes
-an explicit `authority: null` to `ledger build`, so the CLI does not yet stamp a resolved
-primary, and it has no human-output arm for a quarantined sync. `install.ts` has no writer
-for `reveries.remoteRole.*`, so roles are settable only by hand. `receive.ts` verifies the
-envelope but cannot enforce "only the primary may publish", because it has no notion of
-which remote is pushing. Because no trust store is written anywhere, a mirror check can
-report `valid` or `unknown` but cannot distinguish a *trusted* mirror.
+The boundary layer is wired. `reveries role` writes and resolves `reveries.remoteRole.*`,
+`reveries policy` writes `reveries.signingRoles`, `reveries trust` creates and manages a
+local trust store at `<git-common-dir>/reveries/trust.json` (or `reveries.trustStore`),
+and `reveries sign` and `reveries verify` read and write attestations through it. `ledger
+build` stamps the resolved primary instead of passing `authority: null`, and a sync reports
+a quarantined union as held valid evidence with a notice rather than as a failure. Setup
+creates the store atomically and exclusively, so a concurrent setup adopts what is already
+there instead of clobbering it and a reader never observes a partial document.
+
+Removal preserves every trust store and deletes no trust material: created, adopted, external,
+repointed, or reached through a symlinked parent. It clears only the owned configuration that
+is actually set, resolves the store path before clearing it so the report names the store this
+repository actually used, and reports the paths it considered. An earlier marker-based deletion
+was withdrawn — a path marker is not proof of ownership once a store is repointed, replaced,
+re-parented, or adopted from somewhere shared, and a hash to prove the file unchanged would add
+lifecycle bookkeeping to a few hundred bytes of public local state. There is no deletion path
+and no override flag to request one.
+
+A quarantined remote's ledger envelope is fetched and verified but **not** materialized —
+including when an operator names it explicitly, since `ledger materialize` resolves the
+remote from the ref it was given and applies the same role rule. The envelope and the notes
+ref carry the same evidence, so running the envelope route after the notes route withheld
+promotion would hand the decision to whichever transport ran second, and an explicit
+materialize would otherwise route straight around the decision the sync made. An invalid
+role value fails closed with exit 2 without reaching that route at all.
+
+A contradictory authority configuration now fails `build`, `sync --pull`, and `materialize`
+closed, before any checkpoint is written, anything is fetched, or any note moves. `trust
+init` rolls back a newly created key when the store write fails, so the retry succeeds and
+an existing key is never removed. `trust add` accepts only a PEM public key, normalises it
+to SPKI before touching the store, and names the formats it refuses rather than surfacing a
+decoder error.
+
+Two boundaries remain open and nothing here is a claim about them. `receive.ts` verifies
+the envelope but cannot enforce "only the primary may publish", because it has no notion of
+which remote is pushing; and nothing yet refuses a commit or a receive based on signature
+trust. The structural form of the envelope guard — `syncPull` owning both routes rather
+than the CLI orchestrating them — is core work assigned to the next task.
 
 Federation is **off unless configured**. This change ships the origin-stream ref grammar
 (`refs/heads/reveries-origin/<authority-id>`, with a validated single-segment authority
@@ -133,8 +164,24 @@ rotating a key adds a signature, it never edits one. Trust state distinguishes
 signatures stay visible and reported rather than being removed. Verification runs
 through an injectable port with a hermetic in-process ed25519 default and a local
 trust store; Git SSH `allowed_signers` is a second implementation behind the same port
-and is not implemented yet. There is no CLI surface for signing or trust, and
-`install.ts` does not yet create a trust store.
+and is not implemented yet.
+
+The signing and trust CLI now exists, and a real repository reaches `trusted` and
+`policy-satisfying` with the in-process ed25519 backend alone: the SSH backend is an
+independent second implementation, not a prerequisite for either state. `trust init` is
+the only key-generation path, is exclusive and `0600`, refuses a destination inside the
+worktree or either Git directory after resolving the real path, and never reports key
+material. Identity is derived from the loaded key's fingerprint rather than typed, so a
+key with no trust-store entry is refused. The trust store lives in the Git common
+directory, so no clone receives it.
+
+What a signature does **not** cover is now stated rather than implied. Author metadata is
+outside both the signed payload and the `sg:` ID, so rewriting a signature record's
+`created_at`, `author_email`, or `session` changes neither and leaves the state unchanged.
+Those fields are unclaimed provenance, and no CLI output presents them as attested. `key_id`
+is likewise outside the payload: a verifier resolves the key by `key_id` while the payload
+binds `signer` and `content_id`, and tampering with `content_id` is what the
+cryptographic verdict catches.
 
 ### Stage 4: Define governance boundaries
 
@@ -155,7 +202,7 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 | RVR-006 | P0 | [Add atomic local commit-and-summary creation](https://github.com/phynics/reveries/issues/6) | Core / V1 |
 | RVR-007 | P1 | [Generalize all evidence into a monotonic immutable fact graph](https://github.com/phynics/reveries/issues/7) | Core / V2 |
 | RVR-008 | P0 | [Preserve annotated objects against garbage collection](https://github.com/phynics/reveries/issues/8) | Core / V1 |
-| RVR-009 | P1 | [Add cryptographic attestations and signed checkpoints](https://github.com/phynics/reveries/issues/9) — the `signature` record family, the four-state trust vocabulary, key rotation that preserves decision IDs, and signed ledger checkpoints over the manifest bytes landed; the CLI surface, `install.ts` trust-store setup, and the Git SSH verifier remain. Because no trust store is ever written, the `trusted` and `policy-satisfying` states are currently unreachable in a real repository | Core / V2 + Boundary |
+| RVR-009 | P1 | [Add cryptographic attestations and signed checkpoints](https://github.com/phynics/reveries/issues/9) — the `signature` record family, the trust vocabulary, key rotation that preserves decision IDs, signed ledger checkpoints, the signing/trust CLI, and the `install.ts` trust-store setup all landed, and a real repository now reaches `trusted` and `policy-satisfying` with the in-process ed25519 backend alone. The Git SSH `allowed_signers` verifier and boundary acceptance of a signature remain | Core / V2 + Boundary |
 | RVR-010 | P0 | [Add protocol resource limits and bounded validation](https://github.com/phynics/reveries/issues/10) | Core / V1 hardening |
 | RVR-011 | P0 | [Detect unstaged worktree edits correctly](https://github.com/phynics/reveries/issues/11) | Core / V1 |
 | RVR-012 | P1 | [Replace repeated scans with a snapshot loader and disposable index](https://github.com/phynics/reveries/issues/12) | Core / V1 |
@@ -163,7 +210,7 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 | RVR-014 | P1 | [Add occurrence-specific and N-to-M lineage evidence](https://github.com/phynics/reveries/issues/14) | Core / V2 |
 | RVR-015 | P1 | [Model shallow and partial-clone completeness explicitly](https://github.com/phynics/reveries/issues/15) | Core / V1 |
 | RVR-016 | P0 | [Remove the crash-prone lock as a correctness dependency](https://github.com/phynics/reveries/issues/16) | Core / V1 |
-| RVR-017 | P1 | [Define primary authority, mirrors, and optional federation](https://github.com/phynics/reveries/issues/17) — roles, exactly-one-primary resolution, import quarantine, and mirror verification against the primary checkpoint landed, with federation shipping as an off-by-default grammar and gate rather than a live merge path | Core / V1 and V2 |
+| RVR-017 | P1 | [Define primary authority, mirrors, and optional federation](https://github.com/phynics/reveries/issues/17) — roles, exactly-one-primary resolution, import quarantine, mirror verification, the `reveries role` writer, the `ledger build` authority stamp, and the envelope guard that keeps a quarantined remote out of canonical state all landed, with federation shipping as an off-by-default grammar and gate rather than a live merge path | Core / V1 and V2 |
 | RVR-018 | P1 | [Define redaction, secrets, and confidential-evidence policy](https://github.com/phynics/reveries/issues/18) | Partial / Boundary |
 | RVR-019 | P1 | [Add evidence-diff review surfaces for PRs and IDEs](https://github.com/phynics/reveries/issues/19) | Core + Adapter |
 | RVR-020 | P0 | [Add multi-user, failure, and scale conformance grades](https://github.com/phynics/reveries/issues/20) | Core + Adapter |

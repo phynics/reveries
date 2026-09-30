@@ -312,7 +312,7 @@ RVR-012 provides efficient evidence loading. RVR-005 carries the vault checkpoin
 **Priority:** P1
 **Feasibility:** Core / V2 records and checkpoints; Boundary identity enforcement
 **Stage:** 3
-**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9). The `signature` record family, the four-state trust vocabulary, key rotation that preserves decision IDs, the `reveries.signingRoles` policy read, and signed ledger checkpoints over the manifest bytes are implemented. The signing and trust CLI, the `install.ts` trust-store setup, and the Git SSH verifier remain, so this ticket is not yet complete.
+**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9). The `signature` record family, the trust vocabulary, key rotation that preserves decision IDs, the `reveries.signingRoles` policy read, signed ledger checkpoints over the manifest bytes, the signing and trust CLI, and the `install.ts` trust-store setup are implemented, and a real repository reaches `trusted` and `policy-satisfying` with the in-process ed25519 backend alone. The Git SSH verifier and boundary acceptance remain, so this ticket is not yet complete.
 
 ### Problem
 
@@ -344,12 +344,48 @@ RVR-004 defines transition IDs. RVR-005 defines the checkpoint envelope. RVR-017
 
 ### Remaining
 
-- The signing and trust CLI, and the `install.ts` trust-store bootstrap.
 - A Git SSH `allowed_signers` verifier behind the existing port; the in-process
-  ed25519 verifier is the only backend today.
+  ed25519 verifier is the only backend today, and it is sufficient on its own.
 - Boundary acceptance of a signature. Verification and classification are
-  implemented, but nothing yet refuses a commit or a receive based on them;
-  authority acceptance belongs to RVR-017.
+  implemented and readable through `reveries verify`, but nothing yet refuses a
+  commit or a receive based on them; authority acceptance belongs to RVR-017.
+
+### Proven
+
+- `reveries sign` attests a record already in the notes and appends an `sg:` record to
+  its subject; `reveries verify` reports every trust state and fails only for `invalid`
+  and `revoked`, while `--require-policy` fails for every state below
+  `policy-satisfying`.
+- `reveries trust init` is the only key-generation path: exclusive create, mode `0600`,
+  no overwrite, a destination refused inside the worktree or either Git directory after
+  resolving the real path, and no key material in any output.
+- Removal preserves every trust store and deletes no trust material: created, adopted,
+  external, repointed, or reached through a symlinked parent. It clears only the owned
+  configuration that is actually set, resolves the store path before clearing it, and reports
+  the paths it considered. There is no deletion path and no override flag.
+- Setup creates the store atomically and exclusively, so a concurrent setup adopts what is
+  there instead of clobbering it, and a reader never observes a partial document.
+- Identity is derived from the loaded key's fingerprint; a key with no trust-store entry
+  is refused rather than allowed to claim an identity.
+- `trust add` accepts a PEM public key only. A PKCS#8 private key is refused by content so
+  secret material never reaches a public store, an OpenSSH `ssh-ed25519` line is refused by
+  name with the accepted formats stated, and everything accepted is normalised to SPKI before
+  the store is touched so the stored `key_id` matches the stored bytes.
+- `trust init` rolls back the key it created when the store write fails, so the retry
+  succeeds and a pre-existing key is never removed.
+- `--require-policy` with `reveries.signingRoles` unset fails and names
+  `reveries policy set`; `trusted` is never treated as `policy-satisfying`.
+- An invalid authority configuration fails `ledger build`, `sync --pull`, and
+  `ledger materialize` closed, before any checkpoint, fetch, or note write.
+- `ledger build` reports the authority read back out of the built manifest, so
+  `result.authority` cannot disagree with `manifest.authority`; the resolved primary is
+  reported separately and a deliberate `--authority` divergence is rendered.
+- An explicit `ledger materialize` of a `mirror` or `import-only` remote's envelope is
+  refused, so the quarantine cannot be routed around by naming the ref directly.
+- Author metadata is outside both the signed payload and the `sg:` ID: rewriting
+  `created_at`, `author_email`, or `session` leaves the state unchanged, so those fields
+  are unclaimed provenance and no output presents them as attested. Tampering with
+  `content_id` is what the cryptographic verdict catches.
 
 ## RVR-010: Add protocol resource limits and bounded validation
 
@@ -630,6 +666,18 @@ RVR-005 defines checkpoints. RVR-009 defines signer trust. RVR-001 defines quara
 - Import-only evidence cannot enter canonical state silently.
 - Federation preserves each origin history.
 - Union and conflicts do not depend on processing order.
+
+### Proven
+
+- `reveries role set` writes `reveries.remoteRole.*`, refuses a second primary and a
+  role for a remote Git does not have, and reports the *resolved* authority.
+- `reveries ledger build` stamps the manifest with the resolved primary; `--authority`
+  and `--no-authority` are distinct overrides, and `--no-sign` bypasses a configured
+  signer rather than writing an attestation and ignoring it.
+- An `import-only` or `mirror` remote that also publishes a ledger envelope cannot reach
+  `refs/notes/reveries` through the envelope after the notes route quarantined it, in both
+  the absent and strict-ancestor cases. An archive refusal and a malformed role value both
+  fail closed without reaching the envelope route.
 
 ## RVR-018: Define redaction, secrets, and confidential-evidence policy
 

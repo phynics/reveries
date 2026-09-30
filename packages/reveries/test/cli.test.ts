@@ -885,3 +885,94 @@ test("doctor reads the ledger block as its own line", async () => {
     `the ledger line is still emitted as a generic notice:\n${doctor.stdout()}`,
   );
 });
+
+test("every command the help index lists has usage of its own", async () => {
+  const listed = captureIo("/tmp");
+  assert.equal(await runCli(["help"], listed.io), 0);
+  const commands = [...listed.stdout().matchAll(/^ {2}(\S+)\s{2,}\S/gm)].map((match) => match[1] ?? "");
+
+  // The index and the per-command help are one contract: a command that appears
+  // in `reveries help` with no `reveries help <command>` is a dead end an
+  // operator discovers only after guessing the name.
+  for (const command of commands) {
+    const topic = captureIo("/tmp");
+    assert.equal(await runCli(["help", command], topic.io), 0, `reveries help ${command}`);
+    assert.ok(topic.stdout().startsWith("Usage: reveries "), `reveries help ${command} has no usage line`);
+  }
+});
+
+test("the signing, trust, and authority commands are reachable and refuse unknown actions", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+
+  for (const command of ["sign", "verify", "trust", "role", "policy"]) {
+    const unknown = captureIo(directory);
+    assert.equal(await runCli([command, "not-an-action"], unknown.io), 3, `${command} accepted an unknown action`);
+    assert.match(unknown.stderr(), /Usage error/, command);
+  }
+  const trustAction = captureIo(directory);
+  assert.equal(await runCli(["trust", "invent"], trustAction.io), 3);
+  assert.match(trustAction.stderr(), /init, list, add, remove, revoke, restore/);
+  const noAction = captureIo(directory);
+  assert.equal(await runCli(["trust"], noAction.io), 3);
+  assert.match(noAction.stderr(), /trust requires an action/);
+});
+
+test("an unknown remote role and an unknown signing role are both usage errors naming the valid set", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  await git(directory, "remote", "add", "origin", directory);
+
+  const role = captureIo(directory);
+  assert.equal(await runCli(["role", "set", "origin", "sovereign"], role.io), 3);
+  assert.match(role.stderr(), /primary, mirror, archive, import-only/);
+
+  const policy = captureIo(directory);
+  assert.equal(await runCli(["policy", "set", "author,auditor"], policy.io), 3);
+  assert.match(policy.stderr(), /author, reviewer, publisher/);
+  assert.match(policy.stderr(), /found auditor/);
+});
+
+test("verify with no signatures reports the absent state rather than failing", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+
+  const plain = captureIo(directory);
+  assert.equal(await runCli(["verify"], plain.io), 0, plain.stderr());
+  assert.match(plain.stdout(), /^Signatures: absent; 0 shown; 0 unknown, 0 valid, 0 trusted, 0 policy-satisfying, 0 invalid, 0 revoked\.$/m);
+
+  const required = captureIo(directory);
+  assert.equal(await runCli(["verify", "--require-policy"], required.io), 1);
+  assert.match(required.stderr(), /No signature reaches policy-satisfying/);
+});
+
+test("the CLI reports that removal preserved the trust store", async () => {
+  const directory = await createRepository();
+  await adopt(directory);
+  // Removal clears configuration and never deletes trust material, so the fact
+  // worth reporting is that the file is still there and where.
+  const shared = join(await mkdtemp(join(tmpdir(), "reveries-cli-trust-")), "trust.json");
+  const body = `${JSON.stringify({ keys: [{ key_id: "SHA256:aa", signer: "team@example.test", revoked: false, public_key: "pem" }] }, null, 2)}\n`;
+  await writeFile(shared, body, "utf8");
+  await git(directory, "config", "reveries.trustStore", shared);
+
+  const json = captureIo(directory);
+  const code = await runCli(["remove", "--json"], json.io);
+
+  const parsed = JSON.parse(json.stdout()) as {
+    result: { trustStore: { preserved: readonly string[]; reason: string; path: string | null } };
+    notices?: readonly string[];
+  };
+  assert.equal(code, 0, json.stderr());
+  assert.deepEqual(parsed.result.trustStore.preserved, [shared]);
+  assert.equal(parsed.result.trustStore.path, shared);
+  assert.match(parsed.result.trustStore.reason, /never deletes trust material/);
+  assert.match((parsed.notices ?? []).join(" "), /never deletes trust material/);
+  assert.equal(await readFile(shared, "utf8"), body, "removal must leave trust material byte for byte");
+
+  // A second removal, with the configured key already cleared, reports the
+  // default location honestly rather than claiming something was preserved.
+  const human = captureIo(directory);
+  await runCli(["remove"], human.io);
+  assert.match(human.stdout(), /No trust store exists/);
+});

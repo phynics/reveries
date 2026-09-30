@@ -94,7 +94,8 @@ The [local evaluation guide](EVALUATION.md) explains the executable matrix, reco
 and the boundary of the automatic-delivery claim.
 
 The helper implements `init`, `adopt`, `doctor`, `show`, `record`, `summarize`, `check`,
-`receive-check`, `search`, `history`, `sync`, `push`, and the hook entrypoints. Inspection and
+`receive-check`, `search`, `history`, `sync`, `ledger`, `role`, `policy`, `sign`, `verify`,
+`trust`, `push`, and the hook entrypoints. Inspection and
 check commands accept `--json` for stable machine output. See
 [hosted enforcement](HOSTED_ENFORCEMENT.md) for the GHES hook, GitHub workflows, fork evidence
 import, and controlled merge bot.
@@ -154,6 +155,42 @@ reveries sync --pull
 reveries push
 reveries push origin
 ```
+
+## Signing, trust, and authority
+
+A signature says who holds a key; a record says who typed an email address. Keeping them
+separate is what makes key rotation harmless. The trust store binds a public key to the identity
+it may speak for, and it lives in the Git common directory by default, so no clone receives it
+and a trust decision stays local while the evidence it judges travels.
+
+```bash
+reveries trust init --signer me@example.com --key-file ~/.config/reveries/signing.pem
+reveries trust add  --signer me@example.com --from-file ~/.config/reveries/reveries.pub.pem
+reveries role set origin primary
+reveries policy set author,reviewer
+reveries sign rv:<reverie-id>
+reveries verify
+reveries ledger build
+```
+
+`trust add` takes a **PEM public** key. An OpenSSH `ssh-ed25519 AAAA...` line is refused by name
+rather than stored as something the verifier could never use.
+
+`trust init` is the only key-generation path and runs only when you ask for it. It writes the
+private key exclusively, with mode `0600`, never overwriting an existing file, and refuses a path
+inside the worktree or either Git directory — checked on the real path, so a relative path, a
+`..` segment, and a symlinked parent all resolve to the same answer. Only the location is ever
+reported; no key material reaches output, `--json`, or a diagnostic.
+
+`verify` reports every trust state at face value and fails only for `invalid` and `revoked`.
+`--require-policy` is the stricter question: it fails for every state below `policy-satisfying`,
+including a repository with no signatures. `--ledger` verifies the checkpoint envelope and reports
+its manifest attestation.
+
+A signature attests the protocol domain, role, target, subject, signer, algorithm, and the
+target's content hash. The signature record's own `author_email`, `session`, and `created_at` lie
+outside both that payload and its `sg:` ID, so they are unclaimed rather than attested and the
+CLI never presents them as though they were.
 
 For day-to-day changes, use `using-reveries`:
 

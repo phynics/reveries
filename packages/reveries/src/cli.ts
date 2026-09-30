@@ -2,43 +2,72 @@
 
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createPublicKey } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import {
   commitAdoption,
+  createPrivateKeyFile,
   initializeRepository,
+  readLocalTrustStore,
   removeIntegration,
   repairLocalIntegration,
+  resolvePrivateKeyPath,
+  trustStoreEntry,
+  upsertTrustKey,
+  writeLocalTrustStore,
   type HelperInvocation,
   type SkillSetup,
   type SupportedHost,
 } from "./install.ts";
-import { INTERNAL_ATOMIC_PUSH_ENV, LEDGER_REF, NOTES_REF } from "./git.ts";
+import {
+  INTERNAL_ATOMIC_PUSH_ENV,
+  LEDGER_REF,
+  NOTES_REF,
+  createLocalEd25519Signer,
+  createLocalEd25519Verifier,
+  ed25519KeyId,
+  generateEd25519KeyPair,
+  type TrustStoreFile,
+  type TrustStoreKey,
+} from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
-import { Reveries, type PushUpdate } from "./operations.ts";
+import { Reveries, type PushUpdate, type SigningOptions } from "./operations.ts";
 import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
 import {
+  REMOTE_ROLES,
+  SIGNATURE_ROLES,
+  canonicalRecord,
   blobId,
   commitId,
-  canonicalRecord,
+  factTargetId,
   objectId,
   parseNote,
   readLedgerManifest,
+  recordFactId,
+  remoteRole,
+  rolePromotion,
   reverieId,
   validateNote,
+  type FactTargetId,
+  type LedgerManifest,
   type NoteRecord,
   type ObjectId,
   type ReverieInput,
   type ReverieMetadata,
   type ReverieRecord,
   type ReveriesInit,
+  type RemoteRole,
   type Retirement,
   type SessionSummary,
+  type SignatureRole,
+  type SignatureRecord,
   type Source,
   type SourceKind,
   type SourceRelation,
+  type TrustState,
 } from "./protocol.ts";
 
 export type ExitCode = 0 | 1 | 2 | 3;
@@ -90,6 +119,11 @@ Commands:
   history    Trace a path or reverie through history
   sync       Inspect or pull a publishing remote's notes
   ledger     Inspect, advance, or materialize the protected ledger envelope
+  role       Show, set, or clear the role a publishing remote plays
+  policy     Show, set, or clear the signature roles this repository requires
+  sign       Attest one record with the configured signing key
+  verify     Report what is established about signatures and the checkpoint
+  trust      Inspect and manage the local trust store
   push       Atomically push HEAD and refs/notes/reveries
   hook       Handle one host-neutral adapter event from standard input
   receive-check Validate proposed refs and evidence without a worktree
@@ -215,10 +249,114 @@ typed parent, so a clone can recover its evidence from an ordinary branch fetch.
 materialize never overwrites local notes it cannot prove the envelope already
 contains. Pass <revision> to name a remote envelope, such as
 refs/remotes/origin/reveries-ledger in a fresh clone.
+
+  build advances the envelope over the current notes tip and stamps it with the
+       primary remote resolved from reveries.remoteRole.*. Options:
+       --authority <remote>, --no-authority to stamp none, --sign, --no-sign to
+       skip the manifest attestation, --signing-role <role>.
+       build is an append: each call is a new checkpoint whose manifest names the
+       previous one, so a repeated build is never a no-op.
+
+A sync materializes a remote's envelope only when that remote's notes were
+promoted. When the notes are quarantined or the remote is refused, the envelope is
+left alone: it carries the same evidence, so materializing it would hand the
+promotion decision to whichever route ran second.
 Examples:
   reveries ledger status
   reveries ledger build
+  reveries ledger build --no-sign --no-authority
   reveries ledger materialize refs/remotes/origin/reveries-ledger
+`,
+  role: `Usage: reveries role <show|set|clear> [<remote> [<role>]] [--json]
+
+Show, set, or clear the role a remote plays in authoritative publication.
+Roles are primary, mirror, archive, and import-only. They are declared as
+reveries.remoteRole.<remote> and resolved into at most one primary. A remote with
+no declared role keeps the pre-role behaviour, and a repository that never
+declares one is unaffected.
+Examples:
+  reveries role show
+  reveries role set origin primary
+  reveries role set backup mirror
+  reveries role clear backup
+`,
+  policy: `Usage: reveries policy <show|set|clear> [<role[,role]>] [--json]
+
+Show, set, or clear the signature roles this repository requires, stored as
+reveries.signingRoles. A signature is trusted when the trust store binds its key
+to its signer, and policy-satisfying when the signed role is also one this
+repository requires. An empty list means trusted is the strongest state
+reachable here.
+Examples:
+  reveries policy show
+  reveries policy set author,reviewer
+  reveries policy clear
+`,
+  sign: `Usage: reveries sign <rv:|tr:|cr:|rs:|rd: id> [--role <role>] [--key <path>] [--json]
+
+Attest one record with the configured signing key and append the signature to the
+annotated subject's note. The target must already be in the current notes, so a
+signature always covers bytes this repository actually holds.
+
+The signer identity is never typed: the key's own fingerprint is looked up in the
+trust store, and a key with no entry is refused. Precedence for the key is --key,
+then REVERIES_SIGNING_KEY, then reveries.signingKey. A repository with no key
+configured is unsigned, which is an ordinary state.
+
+The signature covers the protocol domain, role, target, subject, signer,
+algorithm, and the target's content hash. The signature record's own author_email,
+session, and created_at are outside that payload and are not attested.
+Examples:
+  reveries sign rv:<id>
+  reveries sign rv:<id> --role reviewer
+  reveries sign rv:<id> --key ~/.config/reveries/signing.pem
+`,
+  verify: `Usage: reveries verify [<target-id>] [--ledger] [--require-policy] [--json]
+
+Report what is established about this repository's signatures.
+
+Trust is reported at face value. unknown means the key is not in the trust store,
+valid means the bytes verify without an identity binding, trusted means the store
+binds the key to the signer, and policy-satisfying additionally means the role is
+required. Only invalid and revoked are failures.
+
+--require-policy asks a different question: whether this repository's own policy
+is satisfied. It fails for every state below policy-satisfying, including a
+repository with no signatures at all.
+
+--ledger verifies the checkpoint envelope and reports its manifest attestation.
+A structurally invalid envelope always fails, whatever the policy says.
+Examples:
+  reveries verify
+  reveries verify rv:<id> --json
+  reveries verify --require-policy
+  reveries verify --ledger
+`,
+  trust: `Usage: reveries trust <init|list|add|remove|revoke|restore> [options] [--json]
+
+Inspect and manage the local trust store, which binds a public key to the identity
+it is authorized to speak for. It lives in the Git common directory by default, so
+no clone receives it, and reveries.trustStore overrides the path.
+
+  init     Generate an ed25519 key pair. The private key is written only to the
+           --key-file you name, with mode 0600 and never overwriting an existing
+           file, and a path inside the repository or its Git directory is refused.
+           Only the public key is registered.
+  list     Show the store path and every entry with its revocation state.
+  add      Register an existing public key from a PEM public key file
+           (-----BEGIN PUBLIC KEY-----). An OpenSSH public key
+           (ssh-ed25519 AAAA...) and a private key are refused.
+  remove   Drop an entry. Existing signatures stay in the notes and report unknown.
+  revoke   Mark a key revoked. Its signatures stay visible and report revoked.
+  restore  Un-revoke a key.
+
+A signer identity must be email shaped, because a ledger manifest signature records
+it as the author email. Revoking never removes evidence.
+Examples:
+  reveries trust list
+  reveries trust init --signer me@example.com --key-file ~/.config/reveries/signing.pem
+  reveries trust add --signer me@example.com --from-file reveries.pub.pem
+  reveries trust revoke --key SHA256:...
 `,
   push: `Usage: reveries push [<remote>] [--json]
 
@@ -886,6 +1024,21 @@ function formatRecord(record: unknown, indent = "  "): string[] {
 }
 
 /**
+ * Doctor notices that already have a dedicated line.
+ *
+ * These are blocks an operator reads as their own question, so a generic
+ * `Notice:` copy of the same sentence is noise that trains the reader to skip the
+ * block. The prefixes are the exact strings core emits.
+ */
+const DEDICATED_DOCTOR_PREFIXES: readonly string[] = [
+  "Ledger:",
+  "Signatures:",
+  "Authority:",
+  "Mirror ",
+  "Retention:",
+];
+
+/**
  * One human-readable line for a ledger block, whether it came from `doctor`,
  * `sync`, or `ledger status`.
  *
@@ -935,7 +1088,28 @@ function humanOutput(
       "local-ahead": "The local notes ref was left unchanged; it carries records the envelope does not.",
       refused: `The ledger envelope was refused; the notes ref was left unchanged (${tip}).`,
     };
-    return `${sentences[state] ?? `Ledger ${state} (${tip}).`}\n`;
+    const base = sentences[state] ?? `Ledger ${state} (${tip}).`;
+    if (command !== "ledger build") return `${base}\n`;
+    // A build is an append, never an idempotent no-op: the manifest names the
+    // previous ledger, so each build is a new checkpoint over a new
+    // `previous_ledger`. Saying so is the difference between an operator who
+    // trusts the envelope and one who assumes a second build changed nothing.
+    //
+    // The authority rendered here is the one the checkpoint actually carries. When
+    // an explicit `--authority` named something other than the resolved primary,
+    // both are shown, because a reader who sees only the stamp would not know a
+    // divergence had been requested.
+    const authority = value?.authority === null || value?.authority === undefined
+      ? "none"
+      : String(value.authority);
+    const resolved = value?.authorityResolved === null || value?.authorityResolved === undefined
+      ? null
+      : String(value.authorityResolved);
+    const divergence = resolved !== null && resolved !== authority ? ` (resolved primary is ${resolved})` : "";
+    const attestation = value?.signed === true
+      ? `signed over the manifest (${stringField(value ?? {}, "reason")})`
+      : `unsigned (${stringField(value ?? {}, "reason")})`;
+    return `${base} Authority: ${authority}${divergence}; manifest ${attestation}.\n`;
   }
   if (command === "check" || command === "receive-check") {
     return `${value?.ok === true ? "Continuity check passed." : "Continuity check failed."}\n`;
@@ -950,6 +1124,44 @@ function humanOutput(
     }
     const ledgerLine = describeLedger(value?.ledger);
     if (ledgerLine !== null) lines.push(ledgerLine);
+    // Signature, authority, mirror, and trust each get their own line rather than
+    // a generic `Notice:`, because an operator reads them as four separate
+    // questions. The matching notices are filtered out below so no fact is
+    // printed twice.
+    const signatures = asRecord(value?.signatures);
+    if (signatures !== null) {
+      const counts = asRecord(signatures.counts) ?? {};
+      const tally = TRUST_STATES.map((state) => `${String(counts[state] ?? 0)} ${state}`).join(", ");
+      lines.push(
+        `Signatures: ${stringField(signatures, "state")}; checkpoint ${stringField(signatures, "checkpoint", "none")}; `
+        + `manifest ${signatures.checkpointSigned === true ? "signed" : "unsigned"}; ${tally}.`,
+      );
+    }
+    const authority = asRecord(value?.authority);
+    if (authority !== null) {
+      const roles = authority.roles !== null && typeof authority.roles === "object" ? authority.roles as Record<string, unknown> : {};
+      const count = (role: string): number => Object.values(roles).filter((entry) => entry === role).length;
+      lines.push(
+        `Authority: ${stringField(authority, "state")}; primary ${stringField(authority, "primary", "none")}; `
+        + `${count("mirror")} mirror(s), ${count("archive")} archive(s), ${count("import-only")} import-only.`,
+      );
+    }
+    for (const mirror of Array.isArray(value?.mirrors) ? value.mirrors : []) {
+      const entry = asRecord(mirror);
+      if (entry === null) continue;
+      lines.push(
+        `Mirror ${stringField(entry, "remote")}: ${stringField(entry, "state")}; `
+        + `checkpoint ${stringField(entry, "checkpoint", "none")}; `
+        + `signature ${entry.signature === null || entry.signature === undefined ? "none" : String(entry.signature)}.`,
+      );
+    }
+    const trust = asRecord(value?.trust);
+    if (trust !== null) {
+      lines.push(
+        `Trust store: ${stringField(trust, "path")}; ${String(trust.keys ?? 0)} key(s); `
+        + `${String(trust.revoked ?? 0)} revoked; signing key ${trust.keyLoaded === true ? "loaded" : "absent"}.`,
+      );
+    }
     const repair = asRecord(value?.repair);
     if (repair !== null) {
       lines.push(`Repair: ${stringField(repair, "state")}.`);
@@ -958,9 +1170,10 @@ function humanOutput(
       }
     }
     for (const notice of stringList(value?.notices)) {
-      // The envelope already has its own line; repeating it inside a generic
-      // notice would print "Notice: Ledger:" and read as two different things.
-      if (notice.startsWith("Ledger:")) continue;
+      // The blocks above already have their own lines. Repeating them inside a
+      // generic notice would print "Notice: Ledger:" and read as two different
+      // things, and it would train an operator to skip the block that matters.
+      if (DEDICATED_DOCTOR_PREFIXES.some((prefix) => notice.startsWith(prefix))) continue;
       lines.push(`Notice: ${notice}`);
     }
     return `${lines.join("\n")}\n`;
@@ -989,11 +1202,13 @@ function humanOutput(
     const ledger = asRecord(value?.ledger);
     const ledgerLine = ledger === null
       ? null
-      : `Ledger: ${stringField(ledger, "state")}${
-        ledger.notesCommit === null || ledger.notesCommit === undefined
-          ? "."
-          : `; notes tip ${String(ledger.notesTip ?? "none")}.`
-      }`;
+      : ledger.state === "skipped"
+        ? `Ledger: not materialized (${stringField(ledger, "reason", "the promotion decision withheld it")}).`
+        : `Ledger: ${stringField(ledger, "state")}${
+          ledger.notesCommit === null || ledger.notesCommit === undefined
+            ? "."
+            : `; notes tip ${String(ledger.notesTip ?? "none")}.`
+        }`;
     if (state === "equal" || state === "diverged" || state === "unknown") {
       return [
         `Notes status for ${context.remote ?? "the remote"}: ${state} (local ${String(value?.local ?? "none")}, remote ${String(value?.remote ?? "none")}).`,
@@ -1001,10 +1216,17 @@ function humanOutput(
         "",
       ].join("\n");
     }
+    // A held candidate is the outcome, not an aside: the operator has to be able
+    // to see that the evidence was validated, where it was parked, and that
+    // canonical state did not move.
+    const quarantineRef = value?.quarantineRef;
+    const held = typeof quarantineRef === "string" && quarantineRef.length > 0;
     return [
-      state === "remote-notes-absent"
-        ? `No Reveries notes are published on ${context.remote ?? "the remote"}.`
-        : `Fetched Reveries notes from ${context.remote ?? "the remote"}.`,
+      held
+        ? `Fetched Reveries notes from ${context.remote ?? "the remote"}; the validated union is quarantined at ${quarantineRef} and ${NOTES_REF} is unchanged.`
+        : state === "remote-notes-absent"
+          ? `No Reveries notes are published on ${context.remote ?? "the remote"}.`
+          : `Fetched Reveries notes from ${context.remote ?? "the remote"}.`,
       ...(ledgerLine === null ? [] : [ledgerLine]),
       "",
     ].join("\n");
@@ -1066,13 +1288,35 @@ function humanOutput(
     return `Adopted commit ${stringField(value ?? {}, "commit")}.\n`;
   }
   if (command === "remove") {
-    return value?.removed === true ? "Removed Reveries integration. Evidence was preserved.\n" : "No Reveries integration was removed.\n";
+    const cleared = stringList(value?.removedTrustConfig);
+    const store = asRecord(value?.trustStore);
+    const lines = [value?.removed === true
+      ? "Removed Reveries integration. Evidence was preserved."
+      : "No Reveries integration was removed."];
+    // Removal clears configuration and never deletes trust material, so the one
+    // thing worth stating about the trust store is that it was left alone and
+    // where it is. A reader who assumed otherwise would have to go looking for a
+    // file that was never touched.
+    if (cleared.length > 0) lines.push(`Cleared local configuration: ${cleared.join(", ")}.`);
+    if (store !== null) lines.push(stringField(store, "reason"));
+    return `${lines.join("\n")}\n`;
   }
   if (typeof result === "string") return `${result}\n`;
   if (result === undefined) return "";
   return `${JSON.stringify(result, null, 2)}\n`;
 }
 
+/**
+ * Emit one command result.
+ *
+ * `diagnostics` and `notices` are separate channels because they mean different
+ * things to a caller: a diagnostic is a failure or a refused operation, while a
+ * notice is something that happened and is worth knowing. Deriving `ok` from
+ * diagnostics alone is what lets a validated-but-held result report `ok: false`
+ * with a success exit code, which is self-contradictory. The JSON envelope gains
+ * an additive `notices` array; `ok`, `command`, `result`, and `diagnostics` keep
+ * their meaning and position.
+ */
 function emit(
   io: CliIo,
   json: boolean,
@@ -1080,13 +1324,25 @@ function emit(
   result: unknown,
   diagnostics: readonly string[] = [],
   context: HumanContext = {},
+  notices: readonly string[] = [],
 ): void {
   if (json) {
-    io.stdout(`${JSON.stringify({ ok: diagnostics.length === 0, command, result, diagnostics })}\n`);
+    // `notices` is added only when there is something to notice, so a command
+    // with no notices keeps a byte-identical envelope. Machine consumers of the
+    // existing four keys are unaffected, and the exact-envelope contract stays
+    // testable for every command that has no notice to report.
+    io.stdout(`${JSON.stringify({
+      ok: diagnostics.length === 0,
+      command,
+      result,
+      diagnostics,
+      ...(notices.length === 0 ? {} : { notices }),
+    })}\n`);
     return;
   }
   const output = humanOutput(command, result, context);
   if (output.length > 0) io.stdout(output);
+  for (const notice of notices) io.stdout(`Notice: ${notice}\n`);
   for (const diagnostic of diagnostics) io.stderr(`${diagnostic}\n`);
 }
 
@@ -1175,11 +1431,17 @@ interface LedgerReport {
     | "refused"
     | "materialized"
     | "up-to-date"
-    | "local-ahead";
+    | "local-ahead"
+    | "skipped";
   readonly checkpoint: ObjectId | null;
   readonly notesTip: ObjectId | null;
   readonly notesCommit: ObjectId | null;
-  /** Failures only. An `absent` or `local-ahead` envelope is not a failure. */
+  /**
+   * Why the envelope route did not run at all. Only ever set for `skipped`, and
+   * only ever a reason a reader can act on.
+   */
+  readonly reason?: string;
+  /** Failures only. An `absent`, `local-ahead`, or `skipped` envelope is not a failure. */
   readonly diagnostics: readonly string[];
 }
 
@@ -1200,10 +1462,69 @@ const LEDGER_ABSENT_REPORT: LedgerReport = {
  * severity of a refusal, because the same refusal is routine on a sync and a
  * failure on an explicit request.
  */
+/**
+ * The remote an explicitly named envelope revision came from.
+ *
+ * `refs/remotes/<remote>/reveries-ledger` is the shape an operator names by hand,
+ * and the remote in it is exactly whose evidence the envelope transports.
+ */
+function remoteOfRevision(revision: string | undefined): string | null {
+  if (revision === undefined) return null;
+  const match = /^refs\/remotes\/([^/]+)\//.exec(revision);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Whether this remote's evidence may become canonical state through an envelope.
+ *
+ * The notes route and the envelope route carry the *same* evidence, so a role that
+ * withholds promotion on one has to withhold it on the other. Without this, an
+ * explicit `reveries ledger materialize refs/remotes/<mirror>/reveries-ledger`
+ * would route straight around the quarantine decision the sync already made — the
+ * gate exists precisely so that withholding is a property of the evidence rather
+ * than of whichever command the operator happened to run.
+ *
+ * A remote with no declared role keeps its pre-role behaviour: it promotes.
+ * A contradictory configuration is not an undeclared remote, and nothing promotes
+ * while the repository cannot say which remote is authoritative.
+ */
+async function envelopePromotionGate(
+  reveries: Reveries,
+  revision: string | undefined,
+): Promise<{ readonly allowed: boolean; readonly diagnostic: string | null }> {
+  const authority = await reveries.authorityStatus();
+  if (authority.state === "invalid") {
+    return {
+      allowed: false,
+      diagnostic: `Authority configuration is invalid, so no envelope may become canonical state: ${authority.diagnostics.join("; ")}`,
+    };
+  }
+  const remote = remoteOfRevision(revision);
+  if (remote === null) return { allowed: true, diagnostic: null };
+  const role = authority.roles.get(remote) ?? null;
+  if (role === null) return { allowed: true, diagnostic: null };
+  if (rolePromotion(role) === "promote") return { allowed: true, diagnostic: null };
+  return {
+    allowed: false,
+    diagnostic: `${remote} is an ${role} remote, so its evidence is quarantined rather than promoted, and the ledger envelope transports the same notes; materialize was refused`,
+  };
+}
+
 async function materializeLedger(
   reveries: Reveries,
   revision: string | undefined,
 ): Promise<LedgerReport> {
+  const promotion = await envelopePromotionGate(reveries, revision);
+  if (!promotion.allowed) {
+    const reason = promotion.diagnostic ?? "The envelope was refused";
+    return {
+      ...LEDGER_ABSENT_REPORT,
+      ok: false,
+      state: "refused",
+      reason,
+      diagnostics: [reason],
+    };
+  }
   const notesTip = await reveries.repository.notesTip();
   const stored = await (async () => {
     const checkpoint = revision === undefined
@@ -1339,6 +1660,110 @@ async function syncLedger(reveries: Reveries, remote: string): Promise<LedgerRep
   return report;
 }
 
+/**
+ * The envelope route deliberately not taken during a sync.
+ *
+ * This is not a failure and not an absence: the remote's evidence is being held by
+ * the notes route, and materializing the same evidence through a second transport
+ * would hand the promotion decision to whichever route happened to run second.
+ */
+function skippedLedger(reason: string): LedgerReport {
+  return {
+    ok: true,
+    state: "skipped",
+    checkpoint: null,
+    notesTip: null,
+    notesCommit: null,
+    reason,
+    diagnostics: [],
+  };
+}
+
+/**
+ * A build reports more than a status: which remote the checkpoint is published on
+ * behalf of, and whether it carries an attestation. Those two facts are the whole
+ * point of the envelope, and a reader who cannot see them has to go looking.
+ */
+interface LedgerBuildReport extends LedgerReport {
+  readonly authority: string | null;
+  /** The primary the configuration resolves to, even when the stamp differs. */
+  readonly authorityResolved: string | null;
+  readonly authorityState: string;
+  readonly signed: boolean;
+  /** Why the attestation is present or absent, in one clause. */
+  readonly reason: string;
+}
+
+/**
+ * The authority the built checkpoint actually carries.
+ *
+ * Reading it back from the manifest rather than recomputing the argument is what
+ * keeps the report honest: the bytes are the authority, and a value derived from
+ * the flags could disagree with them.
+ */
+async function readStampedAuthority(reveries: Reveries, checkpoint: ObjectId): Promise<string | null> {
+  try {
+    const stored = await reveries.repository.readLedgerManifestAt(checkpoint);
+    return stored === null ? null : readLedgerManifest(stored)?.authority ?? null;
+  } catch {
+    // An unreadable manifest is already reported by the checkpoint's own
+    // verification; the report falls back to what was asked for rather than
+    // inventing a value.
+    return null;
+  }
+}
+
+function buildReason(
+  built: { readonly ok: boolean },
+  authority: string | null,
+  signChoice: boolean | undefined,
+  keyLoaded: boolean,
+): string {
+  if (!built.ok) return "the checkpoint was refused";
+  if (signChoice === false) return "signing was declined with --no-sign";
+  if (!keyLoaded) return "no signing key is configured, so the manifest is unsigned";
+  return "the configured key signed the manifest";
+}
+
+/**
+ * Read an override that has three states: absent, explicitly set, and explicitly
+ * declined.
+ *
+ * The distinction matters because an omitted value defers to a default while an
+ * explicit `null` or `false` overrides it. Collapsing the two would make
+ * `--no-authority` indistinguishable from saying nothing, which is the whole
+ * reason the flag exists. Declaring both is a usage error, because the two
+ * answers contradict each other.
+ */
+type OptionalChoice =
+  | { readonly kind: "absent" }
+  | { readonly kind: "value"; readonly value: string }
+  | { readonly kind: "declined" };
+
+function explicitOptional(parsed: ParsedArguments, valueName: string, flagName: string): OptionalChoice {
+  const hasValue = parsed.values.has(valueName);
+  const hasFlag = parsed.flags.has(flagName);
+  if (hasValue && hasFlag) throw new UsageError(`choose only one of ${valueName} or ${flagName}`);
+  if (hasValue) return { kind: "value", value: parsed.values.get(valueName)?.[0] ?? "" };
+  if (hasFlag) return { kind: "declined" };
+  return { kind: "absent" };
+}
+
+/** A tri-state string override: a name, an explicit `null`, or deferral. */
+function optionalString(parsed: ParsedArguments, valueName: string, flagName: string): string | null | undefined {
+  const choice = explicitOptional(parsed, valueName, flagName);
+  if (choice.kind === "absent") return undefined;
+  if (choice.kind === "declined") return null;
+  return choice.value.length === 0 ? null : choice.value;
+}
+
+/** A tri-state boolean override: true, false, or deferral. */
+function optionalBoolean(parsed: ParsedArguments, valueName: string, flagName: string): boolean | undefined {
+  const choice = explicitOptional(parsed, valueName, flagName);
+  if (choice.kind === "absent") return undefined;
+  return choice.kind === "value";
+}
+
 function parseSkillSetup(parsed: ParsedArguments): SkillSetup {
   const kind = one(parsed, "--skill-setup", true);
   const repository = one(parsed, "--skill-repository");
@@ -1376,6 +1801,815 @@ function explicitList(
   const hasEmpty = parsed.flags.has(emptyFlag);
   if (hasValues === hasEmpty) throw new UsageError(`choose exactly one of ${value} or ${emptyFlag}`);
   return hasEmpty ? [] : splitList(parsed.values.get(value) ?? []);
+}
+
+// Signing, trust, and authority surfaces (RVR-009, RVR-017)
+// -------------------------------------------------------------------------------
+
+/**
+ * Everything a command needs to know about local signing state.
+ *
+ * The trust store is loaded for every repository command, so a signature's trust
+ * state is a real answer rather than `unknown` everywhere. A private key is
+ * optional and its absence is ordinary: a repository that never signs has nothing
+ * to sign with, and a failure to load the key is reported only by the commands
+ * that were going to use it, so a stale `reveries.signingKey` cannot stop an
+ * operator reading, verifying, or recording evidence.
+ */
+interface OpenedRepository {
+  readonly reveries: Reveries;
+  readonly trust: Awaited<ReturnType<typeof readLocalTrustStore>>;
+  /** The loaded key's identity, or null when no key is configured or usable. */
+  readonly signingKey: { readonly keyId: string; readonly signer: string; readonly path: string } | null;
+  /** Why a configured key could not be used, for the commands that need one. */
+  readonly signingKeyError: string | null;
+  /** The store is readable but the loaded key has no entry, so signing is refused. */
+  readonly signingKeyUnauthorized: string | null;
+}
+
+/**
+ * The `key_id` of a PKCS#8 private key, derived from its public half.
+ *
+ * Identity is derived, never typed. A signature claims a signer, and the trust
+ * store is what binds a key to a signer; letting the caller pass an identity
+ * alongside the key would let any key speak for any signer, which is exactly the
+ * gap the `valid`-versus-`trusted` states exist to close.
+ */
+function privateKeyId(pem: string): string {
+  const publicPem = createPublicKey(pem).export({ type: "spki", format: "pem" }).toString();
+  return ed25519KeyId(publicPem);
+}
+
+/**
+ * The accepted public-key formats, and why the boundary is explicit.
+ *
+ * A trust store holds public material only. Two things can go wrong at this
+ * boundary, and both are silent without a check: a PKCS#8 *private* key parses
+ * just as successfully as a public one and would be written into a file the
+ * project documents as containing nothing secret, and an OpenSSH `ssh-ed25519`
+ * line is a legitimate key in a format the verifier cannot consume, which would
+ * produce a store entry that registers a key it can never verify.
+ *
+ * Everything is normalised to SPKI PEM, because that is the single form
+ * `createLocalEd25519Verifier` accepts and the form the derived `key_id` is
+ * computed over. Deriving the identity from the *normalised* bytes keeps the
+ * stored identity and the stored key describing the same key.
+ */
+function normalizePublicKey(raw: string, source: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === "") throw new UsageError(`${source} is empty`);
+  const describe = "expected a PEM public key (-----BEGIN PUBLIC KEY-----); "
+    + "an OpenSSH public key (ssh-ed25519 AAAA...) and a PKCS#8 private key are not accepted";
+  if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(trimmed)) {
+    // Refusing by content rather than by parse failure: a private key parses, so
+    // this is the only check that catches it.
+    throw new UsageError(
+      `${source} contains a private key. A trust store holds public key material only, `
+      + `and a private key here would be readable by everyone who can read the store. ${describe}.`,
+    );
+  }
+  if (trimmed.startsWith("ssh-") || trimmed.startsWith("ecdsa-") || trimmed.startsWith("sk-")) {
+    throw new UsageError(`${source} is an OpenSSH public key. ${describe}.`);
+  }
+  let key: ReturnType<typeof createPublicKey>;
+  try {
+    key = createPublicKey(trimmed);
+  } catch {
+    throw new UsageError(`${source} is not a readable public key. ${describe}.`);
+  }
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new UsageError(
+      `${source} is a ${String(key.asymmetricKeyType)} key; Reveries signs with ed25519, so only an ed25519 public key can be trusted.`,
+    );
+  }
+  // `createPublicKey` accepts a PKCS#8 private key and derives the public half,
+  // so the *output* is always a public key even when the input was not. The
+  // private-key case is rejected above for exactly this reason.
+  return key.export({ type: "spki", format: "pem" }).toString();
+}
+
+async function configuredSigningKeyPath(reveries: Reveries, io: CliIo, flag: string | undefined): Promise<string | null> {
+  if (flag !== undefined) return flag;
+  const environment = io.environment ?? process.env;
+  const fromEnvironment = environment.REVERIES_SIGNING_KEY;
+  if (fromEnvironment !== undefined && fromEnvironment.trim().length > 0) return fromEnvironment.trim();
+  const configured = await reveries.repository.run(["config", "--get", "reveries.signingKey"], {
+    allowExitCodes: [0, 1],
+  });
+  const value = configured.stdout.trim();
+  return value === "" ? null : value;
+}
+
+async function openWithTrust(cwd: string, io: CliIo, keyFlag?: string): Promise<OpenedRepository> {
+  const base = await Reveries.open(cwd);
+  const trust = await readLocalTrustStore(base.repository);
+  let signer: SigningOptions["signer"];
+  let signingKey: OpenedRepository["signingKey"] = null;
+  let signingKeyError: string | null = null;
+  let signingKeyUnauthorized: string | null = null;
+  const keyPath = await configuredSigningKeyPath(base, io, keyFlag);
+  if (keyPath !== null) {
+    let pem: string;
+    try {
+      pem = await readFile(resolve(io.cwd, keyPath), "utf8");
+    } catch (error: unknown) {
+      signingKeyError = `Signing key ${keyPath} is unreadable: ${errorText(error)}`;
+      pem = "";
+    }
+    if (pem !== "") {
+      let keyId: string;
+      try {
+        keyId = privateKeyId(pem);
+      } catch (error: unknown) {
+        signingKeyError = `Signing key ${keyPath} is not a readable private key: ${errorText(error)}`;
+        keyId = "";
+      }
+      if (keyId !== "") {
+        const entry = trustStoreEntry(trust.file, keyId);
+        if (entry === undefined) {
+          signingKeyUnauthorized = `The signing key ${keyId} has no entry in ${trust.path}; add it with reveries trust add before signing`;
+        } else if (entry.revoked) {
+          signingKeyUnauthorized = `The signing key ${keyId} is revoked in ${trust.path}; restore it with reveries trust restore before signing`;
+        } else {
+          signingKey = { keyId, signer: entry.signer, path: keyPath };
+          signer = createLocalEd25519Signer({ signer: entry.signer, keyId, privateKey: pem });
+        }
+      }
+    }
+  }
+  const reveries = await Reveries.open(cwd, {
+    verifier: createLocalEd25519Verifier(trust.verifierKeys),
+    trust: trust.store,
+    ...(signer === undefined ? {} : { signer }),
+  });
+  return { reveries, trust, signingKey, signingKeyError, signingKeyUnauthorized };
+}
+
+const TRUST_ACTIONS = new Set(["init", "list", "add", "remove", "revoke", "restore"]);
+
+/** One trust-store row, in the shape both the human and JSON output render. */
+interface TrustRow {
+  readonly key_id: string;
+  readonly signer: string;
+  readonly state: "trusted" | "revoked";
+}
+
+function trustRows(file: TrustStoreFile): readonly TrustRow[] {
+  return [...file.keys]
+    .sort((a, b) => (a.key_id < b.key_id ? -1 : a.key_id > b.key_id ? 1 : 0))
+    .map((entry) => ({ key_id: entry.key_id, signer: entry.signer, state: entry.revoked ? "revoked" : "trusted" }));
+}
+
+/**
+ * `reveries trust` — the local trust store.
+ *
+ * The store holds public keys and the identity each is authorized to speak for.
+ * Private key material is never written here, never printed, and never included
+ * in a diagnostic: generation happens only when an operator explicitly asks for it,
+ * and even then the key lands in a file they named, outside the repository.
+ */
+async function runTrustCommand(
+  action: string | undefined,
+  parsed: ParsedArguments,
+  json: boolean,
+  io: CliIo,
+  opened: OpenedRepository,
+): Promise<ExitCode> {
+  if (action === undefined) throw new UsageError("trust requires an action");
+  if (!TRUST_ACTIONS.has(action)) {
+    throw new UsageError(`trust action must be one of ${[...TRUST_ACTIONS].join(", ")}`);
+  }
+  const label = `trust ${action}`;
+  const { trust } = opened;
+  const repository = opened.reveries.repository;
+
+  if (action === "list") {
+    const rows = trustRows(trust.file);
+    const result = { path: trust.path, present: trust.present, keys: rows };
+    if (json) {
+      emit(io, true, label, result);
+      return 0;
+    }
+    io.stdout(`Trust store: ${trust.path}; ${rows.length} key(s)${trust.present ? "" : " (not created yet)"}.\n`);
+    for (const row of rows) io.stdout(`  ${row.state} ${row.key_id} for ${row.signer}\n`);
+    return 0;
+  }
+
+  const signer = one(parsed, "--signer");
+  if (signer !== undefined && signer.trim() === "") throw new UsageError("--signer must be a nonempty identity");
+  // A manifest signature reuses the signer identity as `author_email`, and the
+  // protocol validates that field as an email address. Requiring an email-shaped
+  // identity here is what keeps a signed checkpoint constructible at all; the
+  // coupling is documented rather than hidden.
+  if (signer !== undefined && !/^[^\s@]+@[^\s@]+$/.test(signer)) {
+    throw new UsageError(
+      `--signer must be an email-shaped identity because a ledger manifest signature records it as the author email; found ${signer}`,
+    );
+  }
+
+  if (action === "init") {
+    const keyFile = one(parsed, "--key-file", true) ?? "";
+    if (signer === undefined) throw new UsageError("trust init requires --signer");
+    const destination = await refuseAsUsage(() => resolvePrivateKeyPath(repository, keyFile));
+    const pair = generateEd25519KeyPair();
+    // Exclusive create with 0600, so an existing key is never replaced and the
+    // private key is never briefly world-readable.
+    await refuseAsUsage(() => createPrivateKeyFile(destination.resolved, pair.privateKey));
+    const entry: TrustStoreKey = {
+      key_id: pair.keyId,
+      signer,
+      revoked: false,
+      public_key: pair.publicKey,
+    };
+    // The key exists before the store does, so a store failure would otherwise
+    // leave a key behind whose only symptom on the next attempt is EEXIST. Rolling
+    // back the file this run created restores the state the command started from,
+    // and makes the retry work. `createPrivateKeyFile` refused to overwrite, so
+    // success here is proof this run created the file and owns the rollback.
+    let path: string;
+    try {
+      path = await writeLocalTrustStore(repository, upsertTrustKey(trust.file, entry));
+    } catch (error: unknown) {
+      await rm(destination.resolved, { force: true });
+      throw new Error(
+        `The private key at ${destination.path} was removed because registering it failed, so nothing was half-created; `
+        + `fix the problem and run the command again. Cause: ${errorText(error)}`,
+      );
+    }
+    const result = { path, key_id: pair.keyId, signer, privateKeyPath: destination.path, privateKeyMode: "0600" };
+    if (json) {
+      emit(io, true, label, result);
+      return 0;
+    }
+    // The location, never the contents.
+    io.stdout(
+      `Created key ${pair.keyId} for ${signer}; private key written to ${destination.path} (mode 0600) `
+      + `and the public key added to ${path}.\n`,
+    );
+    return 0;
+  }
+
+  if (action === "add") {
+    const fromFile = one(parsed, "--from-file", true) ?? "";
+    if (signer === undefined) throw new UsageError("trust add requires --signer");
+    let raw: string;
+    try {
+      raw = await readFile(resolve(io.cwd, fromFile), "utf8");
+    } catch (error: unknown) {
+      throw new UsageError(`cannot read a public key from ${fromFile}: ${errorText(error)}`);
+    }
+    // The format is checked and normalised before anything is stored, so a
+    // refusal cannot leave a half-written trust store behind. Normalising to SPKI
+    // PEM is what makes the stored bytes and the derived identity agree with what
+    // the verifier will actually be handed later.
+    const publicKey = normalizePublicKey(raw, fromFile);
+    const derived = ed25519KeyId(publicKey);
+    const existing = trustStoreEntry(trust.file, derived);
+    if (existing !== undefined && existing.signer !== signer) {
+      throw new UsageError(
+        `The trust store already binds ${derived} to ${existing.signer}; remove that entry before binding it to ${signer}`,
+      );
+    }
+    const entry: TrustStoreKey = { key_id: derived, signer, revoked: false, public_key: publicKey };
+    const path = await writeLocalTrustStore(repository, upsertTrustKey(trust.file, entry));
+    if (json) {
+      emit(io, true, label, { path, key_id: derived, signer, added: existing === undefined });
+      return 0;
+    }
+    io.stdout(`${existing === undefined ? "Added" : "Updated"} ${derived} for ${signer} in ${path}.\n`);
+    return 0;
+  }
+
+  // `--key` names the entry every remaining action edits. `add` is the one action
+  // that does not take it: it derives the key identity from the public key it is
+  // given, so asking for one there would be asking for the answer.
+  const keyId = one(parsed, "--key", true) ?? "";
+  const existing = trustStoreEntry(trust.file, keyId);
+  if (existing === undefined) {
+    throw new UsageError(`The trust store ${trust.path} has no entry for ${keyId}`);
+  }
+  if (action === "remove") {
+    const path = await writeLocalTrustStore(repository, {
+      keys: trust.file.keys.filter((entry) => entry.key_id !== keyId),
+    });
+    if (json) {
+      emit(io, true, label, { path, key_id: keyId, signer: existing.signer, removed: true });
+      return 0;
+    }
+    io.stdout(
+      `Removed ${keyId} for ${existing.signer} from ${path}. Signatures by that key now report unknown; `
+      + "the signature records themselves are untouched.\n",
+    );
+    return 0;
+  }
+  const revoked = action === "revoke";
+  if (existing.revoked === revoked) {
+    if (json) {
+      emit(io, true, label, { path: trust.path, key_id: keyId, signer: existing.signer, revoked });
+      return 0;
+    }
+    io.stdout(`${keyId} is already ${revoked ? "revoked" : "restored"} in ${trust.path}.\n`);
+    return 0;
+  }
+  const path = await writeLocalTrustStore(repository, upsertTrustKey(trust.file, { ...existing, revoked }));
+  if (json) {
+    emit(io, true, label, { path, key_id: keyId, signer: existing.signer, revoked });
+    return 0;
+  }
+  io.stdout(
+    revoked
+      ? `Revoked ${keyId} for ${existing.signer} in ${path}. Signatures by that key stay in the notes and now report revoked.\n`
+      : `Restored ${keyId} for ${existing.signer} in ${path}.\n`,
+  );
+  return 0;
+}
+
+const ROLE_ACTIONS = new Set(["show", "set", "clear"]);
+
+/**
+ * `reveries role` — the role a remote plays in authoritative publication.
+ *
+ * Writing the key is the easy half. The command reports the *resolved* result
+ * afterwards, because a role only means something next to the other roles: an
+ * operator who sets a mirror needs to see whether that left a primary, and an
+ * operator who sets a second primary needs to see the refusal rather than discover
+ * it through a damaged `doctor` later.
+ */
+async function runRoleCommand(
+  action: string | undefined,
+  parsed: ParsedArguments,
+  json: boolean,
+  io: CliIo,
+  opened: OpenedRepository,
+): Promise<ExitCode> {
+  if (action === undefined) throw new UsageError("role requires an action");
+  if (!ROLE_ACTIONS.has(action)) throw new UsageError(`role action must be one of ${[...ROLE_ACTIONS].join(", ")}`);
+  const label = `role ${action}`;
+  const { reveries } = opened;
+  const repository = reveries.repository;
+
+  const report = async (changed: string | null): Promise<ExitCode> => {
+    const status = await reveries.authorityStatus();
+    const result = {
+      changed,
+      state: status.state,
+      primary: status.primary,
+      notice: status.notice,
+      roles: Object.fromEntries([...status.roles].sort(([a], [b]) => (a < b ? -1 : 1))),
+      diagnostics: status.diagnostics,
+    };
+    if (json) {
+      emit(io, true, label, result, status.diagnostics);
+      return status.diagnostics.length === 0 ? 0 : 1;
+    }
+    if (changed !== null) io.stdout(`${changed}\n`);
+    io.stdout(`Authority: ${status.state}; primary ${status.primary ?? "none"}. ${status.notice}\n`);
+    for (const [remote, role] of [...status.roles].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      io.stdout(`  ${remote}: ${role}\n`);
+    }
+    for (const diagnostic of status.diagnostics) io.stderr(`${diagnostic}\n`);
+    return status.diagnostics.length === 0 ? 0 : 1;
+  };
+
+  if (action === "show") return report(null);
+
+  const remote = requirePositional(parsed, 0, "remote name");
+  validateRemoteName(remote);
+  const key = `reveries.remoteRole.${remote}`;
+  if (action === "clear") {
+    await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
+    return report(`Cleared the role for ${remote}.`);
+  }
+  const role = await refuseAsUsage(async () => remoteRole(requirePositional(parsed, 1, "remote role")));
+  const known = (await repository.run(["remote"])).stdout.trimEnd().split("\n").filter((remote) => remote.length > 0);
+  if (!known.includes(remote)) {
+    throw new UsageError(`Remote ${remote} does not exist in this repository; add it before declaring a role`);
+  }
+  // Refuse a second primary here rather than writing a configuration that makes
+  // authority permanently `invalid`.
+  const current = (await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
+    allowExitCodes: [0, 1],
+  })).stdout;
+  if (role === "primary") {
+    const primaries = current
+      .split("\n")
+      .map((line) => line.split(" "))
+      .filter(([name, value]) => name !== undefined && value === "primary" && name !== key)
+      .map(([name]) => name?.slice("reveries.remoteRole.".length) ?? "")
+      .filter((name) => name.length > 0);
+    if (primaries.length > 0) {
+      throw new UsageError(
+        `Authority must name exactly one primary; reveries.remoteRole already declares ${primaries.join(", ")}. `
+        + `Clear ${primaries.map((name) => `${key.slice(0, key.indexOf("."))}.${name}`).join(" or ")} first.`,
+      );
+    }
+  }
+  await repository.run(["config", key, role]);
+  return report(`Set ${remote} to ${role}.`);
+}
+
+/**
+ * `reveries policy` — which signature roles this repository requires.
+ *
+ * The requirement is what separates `trusted` from `policy-satisfying`, and it is
+ * the one piece of signing policy that travels nowhere: it is a local decision
+ * about what this repository insists on, so it is configuration rather than
+ * evidence.
+ */
+async function runPolicyCommand(
+  action: string | undefined,
+  parsed: ParsedArguments,
+  json: boolean,
+  io: CliIo,
+  opened: OpenedRepository,
+): Promise<ExitCode> {
+  if (action === undefined) throw new UsageError("policy requires an action");
+  if (!ROLE_ACTIONS.has(action)) throw new UsageError(`policy action must be one of ${[...ROLE_ACTIONS].join(", ")}`);
+  const label = `policy ${action}`;
+  const repository = opened.reveries.repository;
+  const key = "reveries.signingRoles";
+
+  const report = async (changed: string | null): Promise<ExitCode> => {
+    const required = await opened.reveries.signingPolicy();
+    const result = { changed, requiredRoles: required.requiredRoles, source: (await repository.run(
+      ["config", "--get", key],
+      { allowExitCodes: [0, 1] },
+    )).stdout.trim() };
+    if (json) {
+      emit(io, true, label, result);
+      return 0;
+    }
+    if (changed !== null) io.stdout(`${changed}\n`);
+    io.stdout(
+      required.requiredRoles.length === 0
+        ? "Signing policy requires no role, so trusted is the strongest state a signature can reach here.\n"
+        : `Signing policy requires ${required.requiredRoles.join(", ")}.\n`,
+    );
+    return 0;
+  };
+
+  if (action === "show") return report(null);
+  if (action === "clear") {
+    await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
+    return report("Cleared the required signing roles.");
+  }
+  const raw = parsed.positionals.join(",");
+  if (raw.trim() === "") throw new UsageError("policy set requires a comma-separated role list");
+  const names = splitList([raw]);
+  for (const name of names) {
+    if (!(SIGNATURE_ROLES as readonly string[]).includes(name)) {
+      throw new UsageError(`reveries.signingRoles must name roles from ${SIGNATURE_ROLES.join(", ")}; found ${name}`);
+    }
+  }
+  await repository.run(["config", key, names.join(",")]);
+  return report(`Set the required signing roles to ${names.join(", ")}.`);
+}
+
+/**
+ * Report an install-layer refusal as a usage error.
+ *
+ * The path checks and the exclusive create fail because of what the operator
+ * asked for, not because the repository could not be evaluated, so they are exit
+ * 3 with the standard hint. The message is preserved verbatim because it names the
+ * exact path that was refused, which is what makes the refusal actionable.
+ */
+async function refuseAsUsage<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error: unknown) {
+    if (error instanceof UsageError) throw error;
+    throw new UsageError(errorText(error));
+  }
+}
+
+function validateRemoteName(remote: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote)) {
+    throw new UsageError(`Remote name ${remote} is not a usable Git remote name`);
+  }
+}
+
+function signatureRoleValue(value: string): SignatureRole {
+  if (!(SIGNATURE_ROLES as readonly string[]).includes(value)) {
+    throw new UsageError(`--role must name a role from ${SIGNATURE_ROLES.join(", ")}; found ${value}`);
+  }
+  return value as SignatureRole;
+}
+
+/** Signature records parsed out of a raw note or envelope body. */
+function signatureRecords(body: string): readonly SignatureRecord[] {
+  const records: SignatureRecord[] = [];
+  for (const line of body.split("\n")) {
+    if (line.trim().length === 0) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line) as unknown;
+    } catch {
+      // A malformed line belongs to the note validator, not to a signature pass.
+      continue;
+    }
+    if (value !== null && typeof value === "object" && (value as { type?: unknown }).type === "signature") {
+      records.push(value as SignatureRecord);
+    }
+  }
+  return records;
+}
+
+const TRUST_STATES: readonly TrustState[] = [
+  "unknown",
+  "valid",
+  "trusted",
+  "policy-satisfying",
+  "invalid",
+  "revoked",
+];
+
+/**
+ * `reveries sign` — attest one record with the configured key.
+ *
+ * A signature is only meaningful over bytes the repository actually holds, so the
+ * target must be present in the current notes: signing a record that is not there
+ * would produce an attestation no reader could resolve to anything. The signer
+ * identity is never typed here either; it comes from the trust store entry for the
+ * loaded key.
+ *
+ * What this reports is deliberately narrow. The signature binds the eight payload
+ * fields, one of which is a hash of the target's exact canonical bytes — so the
+ * target's own content, including its author metadata, is attested. The signature
+ * record's `author_email`, `session`, and `created_at` are outside that payload and
+ * outside the record ID, so they are not reported here as though they were signed.
+ */
+async function runSignCommand(
+  parsed: ParsedArguments,
+  json: boolean,
+  io: CliIo,
+  opened: OpenedRepository,
+): Promise<ExitCode> {
+  const target = requirePositional(parsed, 0, "a record id to sign");
+  let targetId: FactTargetId;
+  try {
+    targetId = factTargetId(target);
+  } catch (error: unknown) {
+    throw new UsageError(errorText(error));
+  }
+  const role = signatureRoleValue(one(parsed, "--role") ?? "author");
+  const { reveries } = opened;
+
+  // Resolve the target from the repository's own evidence before deciding anything
+  // about keys, so a bad target is reported as a bad target.
+  const snapshot = await reveries.loadEvidenceSnapshot({});
+  let found: { readonly record: NoteRecord; readonly subject: ObjectId } | null = null;
+  for (const entry of snapshot.entries) {
+    for (const record of entry.records) {
+      if (recordFactId(record) === targetId) {
+        found = { record, subject: entry.object };
+        break;
+      }
+    }
+    if (found !== null) break;
+  }
+  if (found === null) {
+    throw new UsageError(`No record with id ${targetId} is attached to the current notes`);
+  }
+
+  if (opened.signingKeyError !== null) throw new UsageError(opened.signingKeyError);
+  if (opened.signingKey === null) {
+    if (opened.signingKeyUnauthorized !== null) {
+      const result = { state: "unavailable", target: targetId, reason: opened.signingKeyUnauthorized };
+      if (json) {
+        emit(io, true, "sign", result, [opened.signingKeyUnauthorized]);
+        return 1;
+      }
+      io.stdout(`Cannot sign ${targetId}: ${opened.signingKeyUnauthorized}\n`);
+      return 1;
+    }
+    // Nothing configured is an ordinary state, not a failure: a repository that
+    // never signs is a normal repository.
+    const result = { state: "unavailable", target: targetId, reason: "no signing key is configured" };
+    if (json) {
+      emit(io, true, "sign", result);
+      return 0;
+    }
+    io.stdout(
+      `No signing key is configured, so ${targetId} is unsigned. `
+      + "Create one with 'reveries trust init --signer <you@example.com> --key-file <path outside the repository>', "
+      + "or point --key, REVERIES_SIGNING_KEY, or reveries.signingKey at an existing key.\n",
+    );
+    return 0;
+  }
+
+  const draft = await readDraft(one(parsed, "--from"), io);
+  const metadata = await parseMetadata(asRecord(draft) ?? {}, reveries, io, parsed);
+  const signed = await reveries.signRecord({
+    target: found.record,
+    subject: found.subject,
+    role,
+    metadata,
+  });
+  if (!signed.ok || signed.record === null) {
+    emit(io, json, "sign", signed, signed.diagnostics);
+    return 1;
+  }
+  const report = await reveries.verifySignatureRecord(signed.record, await reveries.signingPolicy());
+  const result = {
+    state: signed.state as "signed",
+    record: signed.record,
+    subject: found.subject,
+    trust: { state: report.state, key_id: report.key_id, signer: report.signer, role: report.role },
+  };
+  if (json) {
+    emit(io, true, "sign", result);
+    return 0;
+  }
+  io.stdout(
+    `Signed ${targetId} on ${found.subject} as ${role} by ${report.signer}; signature ${report.id} (${report.state}). `
+    + `It attests the exact canonical bytes of ${targetId}.\n`,
+  );
+  const ledger = await reveries.ledgerStatus();
+  if (ledger.state !== "absent") {
+    io.stdout(
+      `The ledger envelope ${ledger.tip ?? "(absent)"} is now ${ledger.state === "stale" ? "stale" : ledger.state}; `
+      + "run 'reveries ledger build' to advance it over this signature.\n",
+    );
+  }
+  return 0;
+}
+
+/**
+ * `reveries verify` — report what is actually established about this evidence.
+ *
+ * Trust is a refinement, and this command reports each state at face value: a
+ * signature whose key is not in the store is `unknown`, one whose bytes verify
+ * without an identity binding is `valid`, and one this store binds is `trusted`.
+ * None of those is a failure, because none of them is a claim of forgery. Only
+ * `invalid` and `revoked` are.
+ *
+ * `--require-policy` is a different question. It asks whether this repository's
+ * own policy is satisfied, and the answer is yes only for `policy-satisfying`, so
+ * every other state fails it — including the ones that are perfectly fine
+ * unremarkable evidence on their own. That is the point of the flag: it is how an
+ * operator distinguishes "this repository has signatures" from "this repository
+ * has the signatures it insists on".
+ */
+async function runVerifyCommand(
+  parsed: ParsedArguments,
+  json: boolean,
+  io: CliIo,
+  opened: OpenedRepository,
+): Promise<ExitCode> {
+  const { reveries } = opened;
+  const target = parsed.positionals[0];
+  const ledgerOnly = parsed.flags.has("--ledger");
+  const requirePolicy = parsed.flags.has("--require-policy");
+  const diagnostics: string[] = [];
+  const status = await reveries.signatureStatus();
+
+  if (ledgerOnly) {
+    if (target !== undefined) throw new UsageError("verify --ledger takes no record id");
+    const checkpoint = await reveries.repository.ledgerTip();
+    if (checkpoint === null) {
+      if (json) {
+        emit(io, true, "verify --ledger", { state: "absent", envelope: { ok: true, diagnostics: [] } });
+        return requirePolicy ? 1 : 0;
+      }
+      io.stdout("Ledger: absent; no checkpoint exists to verify.\n");
+      return requirePolicy ? 1 : 0;
+    }
+    const envelope = await reveries.verifyLedgerEnvelope(checkpoint);
+    const stored = await reveries.repository.readLedgerManifestAt(checkpoint);
+    const manifest = stored === null ? null : readLedgerManifest(stored);
+    const policy = await reveries.signingPolicy();
+    const records = stored === null ? [] : signatureRecords(await reveries.repository.readLedgerSignaturesAt(checkpoint) ?? "");
+    const newest = records.length === 0 ? undefined : records[records.length - 1];
+    const signature = newest === undefined || manifest === null
+      ? null
+      : reveries.verifySignatureRecord(newest, policy);
+    const result = {
+      state: envelope.ok ? (signature === null ? "unsigned" : "signed") : "invalid",
+      checkpoint,
+      envelope: { ok: envelope.ok, diagnostics: envelope.diagnostics },
+      signature: signature === null
+        ? null
+        : {
+            id: signature.id,
+            signer: signature.signer,
+            key_id: signature.key_id,
+            role: signature.role,
+            state: signature.state,
+          },
+      requiredRoles: policy.requiredRoles,
+    };
+    // A structural failure always fails, whatever the policy says: an envelope
+    // that contradicts itself is damage, not an unmet preference.
+    if (!envelope.ok) diagnostics.push(...envelope.diagnostics);
+    if (envelope.ok && signature !== null && (signature.state === "invalid" || signature.state === "revoked")) {
+      diagnostics.push(`Ledger manifest signature ${signature.id} is ${signature.state}`);
+    }
+    if (requirePolicy && envelope.ok && signature?.state !== "policy-satisfying") {
+      diagnostics.push(
+        policy.requiredRoles.length === 0
+          ? `The ledger manifest signature is ${signature?.state ?? "absent"}, not policy-satisfying. reveries.signingRoles is unset, so nothing can be policy-satisfying; set one with 'reveries policy set <role>'.`
+          : `The ledger manifest signature is ${signature?.state ?? "absent"}, not policy-satisfying; required roles: ${policy.requiredRoles.join(", ")}`,
+      );
+    }
+    if (json) {
+      emit(io, true, "verify --ledger", result, diagnostics);
+      return diagnostics.length === 0 ? 0 : 1;
+    }
+    io.stdout(
+      `Ledger ${checkpoint}: envelope ${envelope.ok ? "valid" : "invalid"}; manifest `
+      + `${signature === null ? "unsigned" : `signed by ${signature.signer} as ${signature.role} (${signature.state})`}.\n`,
+    );
+    for (const diagnostic of diagnostics) io.stderr(`${diagnostic}\n`);
+    return diagnostics.length === 0 ? 0 : 1;
+  }
+
+  let wanted: FactTargetId | null = null;
+  if (target !== undefined) {
+    try {
+      wanted = factTargetId(target);
+    } catch (error: unknown) {
+      throw new UsageError(errorText(error));
+    }
+    const snapshot = await reveries.loadEvidenceSnapshot({});
+    const known = snapshot.entries.some((entry) => entry.records.some((record) => recordFactId(record) === wanted));
+    if (!known) throw new UsageError(`No record with id ${wanted} is attached to the current notes`);
+  }
+
+  const reports = await reveries.signatureReports();
+  const rows = [...reports.entries()]
+    .filter(([id]) => wanted === null || id === wanted)
+    .flatMap(([, entries]) => entries)
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const counts: Record<TrustState, number> = {
+    unknown: 0,
+    valid: 0,
+    trusted: 0,
+    "policy-satisfying": 0,
+    invalid: 0,
+    revoked: 0,
+  };
+  for (const row of rows) counts[row.state] += 1;
+  // Unscoped, core already counted every signature in the snapshot plus the
+  // checkpoint's own attestations. Scoped to one target, the rows above are the
+  // whole answer and re-counting would double the checkpoint.
+  const scope: Record<TrustState, number> = wanted === null ? { ...status.counts } : counts;
+  for (const row of rows) {
+    if (row.state === "invalid" || row.state === "revoked") {
+      diagnostics.push(`Signature ${row.id} over ${row.target} by ${row.signer} is ${row.state}`);
+    }
+  }
+  if (requirePolicy && scope["policy-satisfying"] === 0) {
+    const observed = rows.length === 0 ? "no signatures" : `the strongest state present is ${strongestState(counts)}`;
+    // `trusted` is not `policy-satisfying`, and an empty policy is not permission
+    // to treat them as the same. Reporting "none configured" would read as though
+    // the requirement were met; the honest statement is that nothing can satisfy a
+    // policy nobody has set, and the fix is named.
+    diagnostics.push(
+      status.requiredRoles.length === 0
+        ? `No signature reaches policy-satisfying (${observed}). reveries.signingRoles is unset, so no role is required and nothing can be policy-satisfying; set one with 'reveries policy set <role>'.`
+        : `No signature reaches policy-satisfying (${observed}); required roles: ${status.requiredRoles.join(", ")}`,
+    );
+  }
+  const result = {
+    state: wanted !== null ? (rows.length === 0 ? "unsigned" : "signed") : status.state,
+    target: wanted,
+    counts: scope,
+    signatures: rows.map((row) => ({
+      id: row.id,
+      target: row.target,
+      subject: row.subject,
+      signer: row.signer,
+      key_id: row.key_id,
+      role: row.role,
+      state: row.state,
+    })),
+    requiredRoles: status.requiredRoles,
+  };
+  if (json) {
+    emit(io, true, "verify", result, diagnostics);
+    return diagnostics.length === 0 ? 0 : 1;
+  }
+  const tally = TRUST_STATES.map((state) => `${scope[state]} ${state}`).join(", ");
+  io.stdout(`Signatures: ${result.state}; ${rows.length} shown; ${tally}.\n`);
+  for (const row of result.signatures) {
+    io.stdout(`  ${row.state} ${row.id} by ${row.signer} as ${row.role}, key ${row.key_id}, over ${row.target}\n`);
+  }
+  for (const diagnostic of diagnostics) io.stderr(`${diagnostic}\n`);
+  return diagnostics.length === 0 ? 0 : 1;
+}
+
+/**
+ * The strongest state actually present, in the order the states refine one another.
+ *
+ * The order is not the declaration order: `revoked` and `invalid` are weaker
+ * claims than `unknown`, so a store that is present but unusable reports the
+ * broken state rather than the empty one.
+ */
+function strongestState(counts: Readonly<Record<TrustState, number>>): TrustState {
+  for (const state of ["policy-satisfying", "trusted", "valid", "unknown", "revoked", "invalid"] as const) {
+    if (counts[state] > 0) return state;
+  }
+  return "unknown";
 }
 
 export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): Promise<ExitCode> {
@@ -1450,9 +2684,20 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     if (command === "remove") {
       const parsed = parseArguments(argv.slice(1), ["--remote"], ["--json"]);
       const result = await removeIntegration(io.cwd, { publishingRemotes: splitList(parsed.values.get("--remote") ?? []) });
+      // A deleted trust store is a notice rather than a diagnostic: the removal
+      // succeeded, and the operator needs to know the file is gone, not that
+      // something went wrong.
+      // A preserved store is a notice, not a diagnostic: the removal succeeded,
+      // the file is still there, and the operator needs to know that.
+      const notices = [
+        ...(result.removedTrustConfig.length === 0
+          ? []
+          : [`Cleared local signing and authority configuration: ${result.removedTrustConfig.join(", ")}`]),
+        result.trustStore.reason,
+      ];
       emit(io, json, command, result, result.preservedSkillPaths.map(
         (path) => `Owned Skill path was preserved for manual review: ${path}`,
-      ));
+      ), {}, notices);
       return result.removed ? 0 : 1;
     }
     if (command === "hook") {
@@ -1501,6 +2746,33 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       });
       emit(io, json, command, receive, receive.diagnostics);
       return receive.ok ? 0 : 1;
+    }
+    if (command === "trust" || command === "role" || command === "policy" || command === "sign" || command === "verify") {
+      // These open the repository themselves because they need the local trust
+      // store, and a signing command needs the key as well. Opening twice would
+      // mean two sets of answers about who this repository trusts.
+      //
+      // Every branch awaits its handler rather than returning the promise, so a
+      // usage error inside one of them still reaches the single catch below and
+      // becomes exit 3 with the standard hint instead of an unhandled rejection.
+      if (command === "sign") {
+        const parsed = parseArguments(argv.slice(1), ["--role", "--key", "--from", "--session"], ["--json"]);
+        return await runSignCommand(parsed, json, io, await openWithTrust(io.cwd, io, one(parsed, "--key")));
+      }
+      if (command === "verify") {
+        const parsed = parseArguments(argv.slice(1), [], ["--json", "--ledger", "--require-policy"]);
+        return await runVerifyCommand(parsed, json, io, await openWithTrust(io.cwd, io));
+      }
+      if (command === "trust") {
+        const parsed = parseArguments(argv.slice(2), ["--signer", "--key-file", "--from-file", "--key"], ["--json"]);
+        return await runTrustCommand(argv[1], parsed, json, io, await openWithTrust(io.cwd, io));
+      }
+      if (command === "role") {
+        const parsed = parseArguments(argv.slice(2), [], ["--json"]);
+        return await runRoleCommand(argv[1], parsed, json, io, await openWithTrust(io.cwd, io));
+      }
+      const parsed = parseArguments(argv.slice(2), [], ["--json"]);
+      return await runPolicyCommand(argv[1], parsed, json, io, await openWithTrust(io.cwd, io));
     }
     if (reveries === null) throw new Error("Reveries service was not opened");
     if (command === "show") {
@@ -1641,15 +2913,50 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       }
       const remote = await remoteArgument(parsed, reveries);
       if (parsed.flags.has("--pull")) {
+        // Fail closed on a contradictory authority configuration before any fetch
+        // or note write. A repository that declares two primaries cannot say which
+        // remote is authoritative, so nothing it fetches may be promoted on the
+        // strength of a role it has not actually resolved.
+        const authority = await reveries.authorityStatus();
+        if (authority.state === "invalid") {
+          const diagnostics = authority.diagnostics.map(
+            (entry) => `${entry}; nothing was fetched or promoted`,
+          );
+          emit(io, json, command, { state: "refused", remote, authority: authority.state }, diagnostics, { remote });
+          return 1;
+        }
         const result = await reveries.syncPull(remote);
         // The envelope is a second, independent route for the same evidence: a
         // remote that will not serve `refs/notes/reveries` can still deliver it
         // through an ordinary branch. Absent envelope and a refusal are both
         // normal here, so only a broken envelope or a lost compare-and-swap is a
         // failure of the sync itself.
-        const ledger = await syncLedger(reveries, remote);
-        const diagnostics = [...result.diagnostics, ...ledger.diagnostics];
-        emit(io, json, command, { ...result, ledger }, diagnostics, { remote });
+        //
+        // The route only runs when the notes route promoted. It transports the
+        // *same* notes, so running it after a withheld or refused promotion would
+        // let a non-primary remote reach canonical state through whichever
+        // transport is checked second. `syncPull` owns the promotion decision and
+        // has already made it; this only refuses to contradict it.
+        const ledger = result.ok && (result.quarantineRef ?? null) === null
+          ? await syncLedger(reveries, remote)
+          : skippedLedger(
+            result.ok
+              ? `${remote} publishes evidence that is quarantined rather than promoted, and an envelope carries the same evidence, so its envelope was not materialized`
+              : `${remote} was refused as a source of Reveries evidence, so its envelope was not materialized`,
+          );
+        // A validated union that is held rather than promoted is a success with
+        // something to say, not a failure. Core already decided the severity in
+        // `ok`, so its messages are routed by that decision instead of every
+        // quarantine reason being promoted into a diagnostic.
+        const diagnostics = result.ok
+          ? [...ledger.diagnostics]
+          : [...result.diagnostics, ...ledger.diagnostics];
+        const notices = result.ok
+          ? [...result.diagnostics, ...(ledger.state === "skipped" && ledger.reason !== undefined ? [ledger.reason] : [])]
+          : result.quarantineRef === null || result.quarantineRef === undefined
+            ? []
+            : [`Notes from ${remote} were quarantined at ${result.quarantineRef} because the union failed validation`];
+        emit(io, json, command, { ...result, ledger }, diagnostics, { remote }, notices);
         return result.ok && ledger.ok ? 0 : 1;
       }
       if (parsed.flags.has("--status")) {
@@ -1669,7 +2976,11 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       if (action !== "status" && action !== "build" && action !== "materialize") {
         throw new UsageError("ledger action must be status, build, or materialize");
       }
-      const parsed = parseArguments(argv.slice(2), [], ["--json"]);
+      const parsed = parseArguments(
+        argv.slice(2),
+        ["--authority", "--signing-role"],
+        ["--json", "--no-authority", "--sign", "--no-sign"],
+      );
       const label = `ledger ${action}`;
       if (action === "status") {
         // Only an `invalid` envelope is damage. `absent` means this repository
@@ -1688,15 +2999,75 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
         return report.ok ? 0 : 1;
       }
       if (action === "build") {
-        // The manifest's `authority` field stays null: RVR-017 owns the primary
-        // remote's role semantics and has not defined them yet.
-        const built = await reveries.buildLedgerCheckpoint({ authority: null });
-        const report: LedgerReport = {
+        // `build` is the only ledger action that writes, and it is the one that
+        // signs: the manifest signature comes from the same local trust store the
+        // rest of the signing surface reads, so the checkpoint a repository
+        // publishes is attested with the identity that repository actually trusts.
+        const trusted = await openWithTrust(io.cwd, io);
+        if (trusted.signingKeyError !== null) throw new UsageError(trusted.signingKeyError);
+        // `authority` is omitted unless the operator says otherwise, and core
+        // resolves the omission from `reveries.remoteRole.*` through the same
+        // `authorityStatus` the doctor reports. An explicit `null` is a different
+        // statement from an omitted value and suppresses the resolution, which is
+        // what makes `--no-authority` a real override rather than a synonym.
+        // An invalid authority configuration is not a request to publish without
+        // one: it means the repository cannot say which remote is authoritative.
+        // The refusal happens before the checkpoint exists, so nothing is written
+        // and no attestation is produced that an operator would have to undo.
+        const authority = await trusted.reveries.authorityStatus();
+        if (authority.state === "invalid") {
+          const diagnostics = authority.diagnostics.map(
+            (entry) => `${entry}; a checkpoint cannot be built until the authority configuration is valid`,
+          );
+          emit(io, json, label, {
+            ...LEDGER_ABSENT_REPORT,
+            ok: false,
+            state: "refused" as const,
+            reason: "The authority configuration is invalid",
+            authority: null,
+            authorityResolved: null,
+            authorityState: authority.state,
+            signed: false,
+            diagnostics,
+          } satisfies LedgerBuildReport, diagnostics);
+          return 1;
+        }
+        const authorityChoice = optionalString(parsed, "--authority", "--no-authority");
+        const signChoice = optionalBoolean(parsed, "--sign", "--no-sign");
+        const signingRole = one(parsed, "--signing-role");
+        // What the caller asked for, before the checkpoint exists. `--no-authority`
+        // is a real value here, not an absence, so it is preserved as `null`.
+        const chosenAuthority = authorityChoice === undefined ? authority.primary : authorityChoice;
+        const built = await trusted.reveries.buildLedgerCheckpoint({
+          ...(authorityChoice === undefined ? {} : { authority: authorityChoice }),
+          ...(signChoice === undefined ? {} : { sign: signChoice }),
+          ...(signingRole === undefined ? {} : { signingRole: signatureRoleValue(signingRole) }),
+        });
+        const signed = built.ok && signChoice !== false
+          ? await trusted.reveries.signatureStatus()
+          : null;
+        // Report and render the authority that was actually stamped. An explicit
+        // `--authority` is what the manifest carries, including the explicit `null`
+        // `--no-authority` produces, so falling back to `authority.primary` here
+        // would name a different remote from the one the checkpoint claims. The
+        // chosen value is not merely echoed from the flag either: it is read back
+        // from the built checkpoint, so the report cannot drift from the bytes.
+        const stamped = built.ok && built.checkpoint === null
+          ? chosenAuthority
+          : built.ok
+            ? await readStampedAuthority(trusted.reveries, built.checkpoint as ObjectId)
+            : chosenAuthority;
+        const report: LedgerBuildReport = {
           ok: built.ok,
           state: built.state,
           checkpoint: built.checkpoint,
           notesTip: built.notesTip,
           notesCommit: null,
+          authority: stamped,
+          authorityResolved: authority.primary,
+          authorityState: authority.state,
+          signed: signed?.checkpointSigned ?? false,
+          reason: buildReason(built, stamped, signChoice, trusted.signingKey !== null),
           diagnostics: built.diagnostics,
         };
         emit(io, json, label, report, report.diagnostics);
@@ -1721,9 +3092,32 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       const repair = parsed.flags.has("--fix")
         ? await repairLocalIntegration(io.cwd, io.helper === undefined ? {} : { helper: io.helper })
         : null;
-      const result = await reveries.doctor();
+      // The trust block is computed here rather than in core, because where the
+      // store lives and which key is loaded are facts about this clone's local
+      // state, not about the evidence. Core reports the trust *states* it derived;
+      // this reports what it derived them from, so a reader can tell "nothing is
+      // trusted" from "nothing was loaded".
+      const opened = await openWithTrust(io.cwd, io);
+      const result = await opened.reveries.doctor();
+      const trust = {
+        path: opened.trust.path,
+        present: opened.trust.present,
+        keys: opened.trust.file.keys.length,
+        revoked: opened.trust.file.keys.filter((entry) => entry.revoked).length,
+        keyLoaded: opened.signingKey !== null,
+        keyId: opened.signingKey?.keyId ?? null,
+        signer: opened.signingKey?.signer ?? null,
+      };
       const diagnostics = [...result.diagnostics, ...(repair?.diagnostics ?? [])];
-      emit(io, json, command, repair === null ? result : { ...result, repair }, diagnostics);
+      // `AuthorityStatus.roles` is a Map, and `JSON.stringify` renders a Map as
+      // `{}`. Flattening it here is what keeps `--json` and the human line honest
+      // about which remotes declared which role.
+      const authority = {
+        ...result.authority,
+        roles: Object.fromEntries([...result.authority.roles].sort(([a], [b]) => (a < b ? -1 : 1))),
+      };
+      const reported = { ...result, authority, trust, ...(repair === null ? {} : { repair }) };
+      emit(io, json, command, reported, diagnostics);
       return result.ok && repair?.state !== "unavailable" ? 0 : 1;
     }
     if (command === "pre-push") {

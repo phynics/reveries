@@ -1,12 +1,12 @@
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { access, chmod, cp, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { GitRepository, LEDGER_REF } from "./git.ts";
-import { parseNote, type ReveriesInit } from "./protocol.ts";
+import { GitRepository, LEDGER_REF, readTrustStore, type TrustStoreFile, type TrustStoreKey } from "./git.ts";
+import { parseNote, type ReveriesInit, type TrustStore } from "./protocol.ts";
 
 /**
  * The ledger envelope branch name, without its `refs/heads/` prefix.
@@ -167,6 +167,10 @@ export interface InitializationResult {
   readonly nextCommands: readonly string[];
   /** Git-only contributor steps; empty when a working helper is configured. */
   readonly noHelperGuidance: readonly string[];
+  /** Where the local trust store is, so an operator can inspect or back it up. */
+  readonly trustStorePath: string;
+  /** False when setup found an existing store and deliberately left it alone. */
+  readonly trustStoreCreated: boolean;
 }
 
 export interface RemovalOptions {
@@ -1190,6 +1194,24 @@ async function convergeLocalIntegration(
       if (!target.publishingRemotes.includes(remote)) await removeManagedRemoteConfig(repository, remote);
     }
     await repository.run(["config", "--unset-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1, 5] });
+    // A role for a remote that no longer exists is a permanent contradiction: it
+    // makes authority `invalid` and keeps `doctor` damaged until someone edits
+    // configuration by hand. Initialization converges configuration, so it drops
+    // exactly those. A role for a remote that still exists is kept even when the
+    // remote no longer publishes, because a mirror, an archive, and an import
+    // source are non-publishing roles by definition.
+    const known = new Set(await configuredRemoteNames(repository));
+    const declared = await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
+      allowExitCodes: [0, 1],
+    });
+    for (const line of declared.stdout.split("\n")) {
+      const separator = line.indexOf(" ");
+      if (separator <= 0) continue;
+      const key = line.slice(0, separator);
+      const remote = key.slice("reveries.remoteRole.".length);
+      if (known.has(remote)) continue;
+      await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
+    }
   }
   const configured = await configValues(repository, "reveries.publishingRemote");
   for (const remote of remotes) {
@@ -1490,6 +1512,15 @@ async function initializeUnlocked(
   const remote = options.publishingRemotes[0];
   if (remote !== undefined) nextCommands.push(`${helperCommand} push ${shellQuote(remote)}`);
 
+  // The trust store is local state a clone never receives, so setup owns creating
+  // it. An existing store is left exactly as it is: initialization converges
+  // configuration, and replacing a trust decision an operator made by hand would
+  // be a silent downgrade of who this repository is willing to believe.
+  const trust = await ensureLocalTrustStore(repository);
+  nextCommands.push(
+    `${helperCommand} trust add --signer <you@example.com> --from-file <public-key.pem>`,
+  );
+
   return {
     state: "prepared",
     enforcement: hookSnippets.length === 0 ? "complete" : "partial",
@@ -1502,6 +1533,8 @@ async function initializeUnlocked(
     hookSnippets,
     nextCommands,
     noHelperGuidance: await resolveNoHelperGuidance(options.helper),
+    trustStorePath: trust.path,
+    trustStoreCreated: trust.created,
   };
 }
 
@@ -1509,6 +1542,10 @@ export interface RemovalResult {
   readonly removed: boolean;
   readonly evidencePreserved: true;
   readonly preservedSkillPaths: readonly string[];
+  /** Local signing and authority configuration this removal cleared. */
+  readonly removedTrustConfig: readonly string[];
+  /** What happened to the trust store, including anything deliberately preserved. */
+  readonly trustStore: TrustStoreRemoval;
 }
 
 export async function removeIntegration(cwd: string, options: RemovalOptions): Promise<RemovalResult> {
@@ -1548,10 +1585,33 @@ async function removeUnlocked(repository: GitRepository, options: RemovalOptions
   }
   await removeOwnedHook(repository, "pre-push");
   await removeOwnedHook(repository, "post-commit");
+  // Signing policy, remote roles, and the trust store are owned local
+  // configuration. Removal clears the decisions and the file *Reveries created*,
+  // and reports both, because a removal that silently left a trust store in place
+  // would leave a reader believing evidence is still trusted when nothing verifies
+  // it any more — and one that silently deleted an unowned store would destroy a
+  // team member's decisions.
+  //
+  // Both the resolved path and the ownership record are snapshotted here, before a
+  // single `config --unset-all` runs. Unsetting `reveries.trustStore` first would
+  // make the later path resolution follow the fallback and retarget the deletion
+  // at the default location, which is a different file from the one this
+  // repository actually used.
+  // The resolved path is captured before any configuration is cleared, so the
+  // report names the store this repository was actually using rather than whatever
+  // the fallback resolves to afterwards. The file itself is never deleted.
+  const trustSnapshot = { path: await trustStorePath(repository) };
+  const trustKeys = await ownedTrustConfigKeys(repository);
+  const trust = await preserveLocalTrustStore(repository, trustSnapshot);
+  for (const key of trustKeys) {
+    await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
+  }
   return {
     removed: skillRemoval.preserved.length === 0,
     evidencePreserved: true,
     preservedSkillPaths: skillRemoval.preserved,
+    removedTrustConfig: trustKeys,
+    trustStore: trust,
   };
 }
 
@@ -1570,6 +1630,9 @@ export interface RepairResult {
   readonly unsupportedManagers: readonly string[];
   /** Git-only contributor steps; empty when a working helper is configured. */
   readonly noHelperGuidance: readonly string[];
+  /** Where the trust store is and whether it exists. Repair never creates one. */
+  readonly trustStorePath: string;
+  readonly trustStorePresent: boolean;
 }
 
 /**
@@ -1610,6 +1673,7 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
         + "fetch the notes ref (`git fetch origin '+refs/notes/reveries*:refs/notes/reveries*'`) "
         + "and run `reveries sync origin --pull` before repairing",
       );
+      const trust = await readLocalTrustStore(repository);
       return {
         state: "unavailable",
         publishingRemotes: [],
@@ -1618,6 +1682,8 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
         diagnostics,
         unsupportedManagers: [],
         noHelperGuidance: await resolveNoHelperGuidance(options.helper),
+        trustStorePath: trust.path,
+        trustStorePresent: trust.present,
       };
     }
 
@@ -1648,6 +1714,13 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
       unusableRemotes,
     });
     const allDiagnostics = [...diagnostics, ...local.diagnostics];
+    // Repair converges the state the committed initialization record describes:
+    // publishing remotes, the merge strategy, the managed refspecs, and the helper
+    // runner. It deliberately does not touch the trust store, the signing policy,
+    // or remote roles. Those are per-clone decisions a record cannot describe, and
+    // re-deriving them from anything else would mean guessing who this clone is
+    // allowed to believe. Reporting them is useful; changing them is not.
+    const trust = await readLocalTrustStore(repository);
     return {
       state: allDiagnostics.length === 0 && local.hookSnippets.length === 0 ? "repaired" : "partial",
       publishingRemotes: initialization.publishing_remotes.filter(
@@ -1658,6 +1731,368 @@ export async function repairLocalIntegration(cwd: string, options: RepairOptions
       diagnostics: allDiagnostics,
       unsupportedManagers: local.unsupportedManagers,
       noHelperGuidance: await resolveNoHelperGuidance(options.helper),
+      trustStorePath: trust.path,
+      trustStorePresent: trust.present,
     };
   });
+}
+
+// Trust store (RVR-009)
+// -------------------------------------------------------------------------------
+
+/**
+ * Where the local trust store lives.
+ *
+ * `reveries.trustStore` overrides it, resolved against the repository root so a
+ * relative value means the same thing from any working directory. The default sits
+ * in the Git common directory, beside the setup lock this module already creates.
+ * That location is local by construction: no clone and no fetch delivers it, which
+ * is what keeps a public key and an identity binding out of the evidence a
+ * repository transports, and keeps private key material out of anything Git moves.
+ */
+export async function trustStorePath(repository: GitRepository): Promise<string> {
+  const configured = (await repository.run(["config", "--get", "reveries.trustStore"], {
+    allowExitCodes: [0, 1],
+  })).stdout.trim();
+  if (configured === "") return join(await repository.commonDirectory(), "reveries", "trust.json");
+  return isAbsolute(configured) ? configured : resolve(repository.root, configured);
+}
+
+export interface LocalTrustStore {
+  readonly path: string;
+  /** False when the file does not exist yet, which is an ordinary state. */
+  readonly present: boolean;
+  readonly file: TrustStoreFile;
+  /** The protocol shape: identity and revocation, never key material. */
+  readonly store: TrustStore;
+  /** `key_id` to SPKI PEM, which is all a verifier needs to check the bytes. */
+  readonly verifierKeys: Readonly<Record<string, string>>;
+  readonly diagnostics: readonly string[];
+}
+
+function emptyTrustStore(path: string): LocalTrustStore {
+  return {
+    path,
+    present: false,
+    file: { keys: [] },
+    store: { keys: [] },
+    verifierKeys: {},
+    diagnostics: [],
+  };
+}
+
+/**
+ * Read the local trust store and adapt it to the two shapes the core needs.
+ *
+ * An absent store is an ordinary state, not an error: a repository that has never
+ * signed has nothing to trust and every signature resolves to `unknown`. A present
+ * but malformed store *is* an error, because silently treating an unreadable trust
+ * decision as an empty one would downgrade every signature to `unknown` and look
+ * exactly like a working repository with no trust configured.
+ */
+export async function readLocalTrustStore(repository: GitRepository): Promise<LocalTrustStore> {
+  const path = await trustStorePath(repository);
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return emptyTrustStore(path);
+    throw new Error(`Trust store ${path} is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error: unknown) {
+    throw new Error(`Trust store ${path} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let file: TrustStoreFile;
+  try {
+    file = await readTrustStore(parsed);
+  } catch (error: unknown) {
+    throw new Error(`Trust store ${path} is invalid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const store: TrustStore = {
+    keys: file.keys.map((entry) => ({ key_id: entry.key_id, signer: entry.signer, revoked: entry.revoked })),
+  };
+  const verifierKeys: Record<string, string> = {};
+  for (const entry of file.keys) verifierKeys[entry.key_id] = entry.public_key;
+  return { path, present: true, file, store, verifierKeys, diagnostics: [] };
+}
+
+/**
+ * Write the trust store, sorted by `key_id` so the file is byte-stable.
+ *
+ * The content is validated through the same reader first, so a writer can never
+ * produce a file that this project's own reader refuses. The replacement goes
+ * through a temporary file in the same directory and a rename, so a reader never
+ * observes a half-written store and a failed write leaves the previous store in
+ * place.
+ *
+ * The file holds public keys and identities only, so it is written with the
+ * default mode. Private key material never goes here: it lives in a file the
+ * operator names, and never in a repository, a note, or this file.
+ */
+export async function writeLocalTrustStore(repository: GitRepository, file: TrustStoreFile): Promise<string> {
+  const path = await trustStorePath(repository);
+  const keys = [...file.keys].sort((a, b) => (a.key_id < b.key_id ? -1 : a.key_id > b.key_id ? 1 : 0));
+  const normalized = await readTrustStore({ keys });
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.trust.json.${process.pid}.${randomUUID()}`);
+  try {
+    await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+    await rename(temporary, path);
+  } catch (error: unknown) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  return path;
+}
+
+/**
+ * Create the store only if nothing is there, atomically and without replacement.
+ *
+ * Reading for absence and then renaming a temporary file over the path has a
+ * window between the two: a file created in that window is silently clobbered. That
+ * is not a theoretical concern here, because two setup processes can run against one
+ * repository, and the loser's rename would destroy the winner's trust decisions.
+ *
+ * `link` is used rather than `rename` because it fails with EEXIST instead of
+ * replacing, and the temporary file is fully written and closed first, so a
+ * concurrent reader sees either nothing or a complete, valid document — never a
+ * partial one. On EEXIST the caller re-reads and adopts what is actually there.
+ */
+async function createTrustStoreExclusive(path: string, file: TrustStoreFile): Promise<boolean> {
+  const keys = [...file.keys].sort((a, b) => (a.key_id < b.key_id ? -1 : a.key_id > b.key_id ? 1 : 0));
+  const normalized = await readTrustStore({ keys });
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.trust.json.${process.pid}.${randomUUID()}`);
+  try {
+    await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+    try {
+      await link(temporary, path);
+      return true;
+    } catch (error: unknown) {
+      // Something else got there first. Its content wins; ours is discarded.
+      if (error instanceof Error && "code" in error && error.code === "EEXIST") return false;
+      throw error;
+    }
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+/**
+ * Create the store when it is absent. Existing setup is never replaced.
+ *
+ * A store that already exists is adopted, whatever holds it. Setup creates a store
+ * only when there is nothing to adopt, and the create is atomic and exclusive so a
+ * concurrent setup cannot have its file clobbered.
+ */
+
+export async function ensureLocalTrustStore(repository: GitRepository): Promise<{ readonly path: string; readonly created: boolean }> {
+  const path = await trustStorePath(repository);
+  // Create first, exclusively, rather than reading and then writing. Reading for
+  // absence would race: a file appearing in between would be overwritten, and the
+  // content that survived would be the empty one, silently discarding whatever the
+  // other writer trusted.
+  if (await createTrustStoreExclusive(path, { keys: [] })) return { path, created: true };
+  // EEXIST means the store is already there. Re-read and adopt whatever it holds,
+  // which also surfaces a malformed store rather than hiding it behind a
+  // successful-looking setup.
+  const existing = await readLocalTrustStore(repository);
+  return { path: existing.path, created: false };
+}
+
+/**
+ * What removal did to the trust store.
+ *
+ * `preserved` is the only outcome. Removal clears configuration; it never deletes
+ * a trust store.
+ */
+export interface TrustStoreRemoval {
+  /** Every path removal considered, in path order. */
+  readonly paths: readonly string[];
+  /** The resolved path this repository was configured to use, when one resolved. */
+  readonly path: string | null;
+  readonly preserved: readonly string[];
+  readonly reason: string;
+}
+
+/**
+ * Preserve the trust store, always.
+ *
+ * An earlier design deleted the store setup had recorded as its own, keyed on a
+ * `reveries.managedTrustStore` marker. A path marker is not proof of ownership. The
+ * store can be repointed, replaced, re-parented through a symlink, or adopted from
+ * somewhere shared, and every one of those leaves a marker that looks valid while
+ * naming a file the operator now depends on. The marker also outlived its own
+ * usefulness: tracking a hash to prove the file was unchanged would add lifecycle
+ * bookkeeping to a few hundred bytes of *public* local state, which is the wrong
+ * trade for a deletion nobody asked for.
+ *
+ * So removal preserves. Trust material is cheap to keep, cheap to inspect, and
+ * destroying it is the one irreversible thing this command could do by accident.
+ * An operator who wants the file gone deletes one file, knowingly; an operator who
+ * runs `reveries remove` expects their integration removed, not their team's trust
+ * decisions.
+ *
+ * Only configuration is cleared, and only what is actually set.
+ */
+export async function preserveLocalTrustStore(
+  repository: GitRepository,
+  snapshot?: { readonly path: string },
+): Promise<TrustStoreRemoval> {
+  const resolved = snapshot ?? { path: await trustStorePath(repository) };
+  const present = (await readLocalTrustStore(repository)).present;
+  const paths = [resolved.path];
+  return {
+    paths,
+    path: resolved.path,
+    preserved: present ? [resolved.path] : [],
+    reason: present
+      ? `Preserved the trust store at ${resolved.path}; reveries remove clears configuration and never deletes trust material`
+      : `No trust store exists at ${resolved.path}`,
+  };
+}
+
+/**
+ * Every directory private key material must never be written into.
+ *
+ * Both Git directories are listed because they are different directories in a
+ * linked worktree: the common directory belongs to the main repository while
+ * `--absolute-git-dir` names this worktree's own private directory. Checking only
+ * one of them would let a key land in the other. The worktree root is included
+ * because anything under it can be staged and committed by accident.
+ */
+async function privateKeyForbiddenRoots(repository: GitRepository): Promise<readonly string[]> {
+  const roots = new Set<string>();
+  const add = async (path: string): Promise<void> => {
+    try {
+      roots.add(await realpath(path));
+    } catch {
+      // A directory that does not exist cannot contain a file we are about to
+      // create, and a root we cannot resolve cannot be checked. The remaining
+      // roots still apply.
+    }
+  };
+  await add(repository.root);
+  await add(await repository.commonDirectory());
+  const gitDir = await repository.run(["rev-parse", "--absolute-git-dir"], { allowExitCodes: [0, 1] });
+  if (gitDir.exitCode === 0 && gitDir.stdout.trim().length > 0) await add(gitDir.stdout.trim());
+  return [...roots].sort();
+}
+
+function containsPath(parent: string, child: string): boolean {
+  if (parent === child) return true;
+  const inside = relative(parent, child);
+  return inside.length > 0 && !inside.startsWith(`..${sep}`) && inside !== ".." && !isAbsolute(inside);
+}
+
+/**
+ * Resolve a private-key destination and refuse anywhere it must not go.
+ *
+ * The check runs on real paths, not on the string the operator typed. A relative
+ * path, a `..` segment, and a symlinked parent directory all resolve to the same
+ * answer this way, so a path that merely *looks* external cannot be used to place
+ * key material inside the repository. The parent directory must already exist:
+ * creating it here would let a key be written into a directory the check never
+ * inspected.
+ */
+export async function resolvePrivateKeyPath(
+  repository: GitRepository,
+  target: string,
+): Promise<{ readonly path: string; readonly resolved: string }> {
+  const path = isAbsolute(target) ? target : resolve(repository.root, target);
+  const parent = dirname(path);
+  let resolvedParent: string;
+  try {
+    resolvedParent = await realpath(parent);
+  } catch {
+    throw new Error(`Private key directory ${parent} does not exist; create it first`);
+  }
+  const resolved = join(resolvedParent, basename(path));
+  for (const forbidden of await privateKeyForbiddenRoots(repository)) {
+    if (containsPath(forbidden, resolved)) {
+      throw new Error(
+        `Refusing to write a private key at ${resolved}: it is inside the repository or its Git directory. `
+        + "Choose a location outside this repository.",
+      );
+    }
+  }
+  return { path, resolved };
+}
+
+/**
+ * Create a private key file that cannot overwrite anything.
+ *
+ * The create is exclusive (`wx`) and the mode is `0600` from the moment the file
+ * exists, so there is no window in which the key is readable by another user and
+ * no way for a second run to replace a key the operator still depends on. A failed
+ * write removes the partial file rather than leaving unusable key material behind.
+ */
+export async function createPrivateKeyFile(target: string, contents: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(target, "wx", 0o600);
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error(`Refusing to overwrite the existing file ${target}; choose a new path or remove it deliberately`);
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(contents, "utf8");
+  } catch (error: unknown) {
+    await handle.close().catch(() => {});
+    await rm(target, { force: true });
+    throw error;
+  }
+  await handle.close();
+  // `open`'s mode is masked by the process umask, so restate it explicitly. This
+  // is what makes 0600 an assertion rather than a hope.
+  await chmod(target, 0o600);
+}
+
+/** Add or replace one trust-store entry, keyed by `key_id`. */
+export function upsertTrustKey(file: TrustStoreFile, entry: TrustStoreKey): TrustStoreFile {
+  const keys = file.keys.filter((existing) => existing.key_id !== entry.key_id);
+  return { keys: [...keys, entry] };
+}
+
+export function trustStoreEntry(file: TrustStoreFile, keyId: string): TrustStoreKey | undefined {
+  return file.keys.find((entry) => entry.key_id === keyId);
+}
+
+/**
+ * Every `reveries.*` key this module owns that is *currently set*.
+ *
+ * Only keys that exist are returned, so `removedTrustConfig` means "configuration
+ * this run actually cleared" rather than "configuration this run looked at". A
+ * second removal therefore reports nothing, instead of claiming to have cleared
+ * keys that were already gone and implying work it did not do.
+ */
+export async function ownedTrustConfigKeys(repository: GitRepository): Promise<readonly string[]> {
+  const candidates = [
+    "reveries.trustStore",
+    "reveries.signingRoles",
+    "reveries.signingKey",
+    // An earlier design recorded the store setup created and then deleted that
+    // file on removal. The marker is now cleared as ordinary local configuration
+    // and its path is never followed, but an existing one still has to go, or the
+    // key would outlive the behaviour it described and mislead the next reader.
+    "reveries.managedTrustStore",
+  ];
+  const keys = new Set<string>();
+  for (const key of candidates) {
+    const result = await repository.run(["config", "--get", key], { allowExitCodes: [0, 1] });
+    if (result.exitCode === 0 && result.stdout.trim() !== "") keys.add(key);
+  }
+  const roles = await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
+    allowExitCodes: [0, 1],
+  });
+  for (const line of roles.stdout.split("\n")) {
+    const separator = line.indexOf(" ");
+    if (separator > 0) keys.add(line.slice(0, separator));
+  }
+  return [...keys].sort();
 }
