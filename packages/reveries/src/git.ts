@@ -330,6 +330,34 @@ export const NOTES_TXN_REF_PREFIX = "refs/notes/reveries-txn/";
  */
 export const QUARANTINE_REF_PREFIX = "refs/reveries/quarantine/";
 
+/**
+ * The configured remote a remote-tracking revision belongs to, or null when it
+ * names none.
+ *
+ * Remote names may contain slashes (`team/vendor`), so the first path segment
+ * is NOT the answer: `refs/remotes/team/vendor/reveries-ledger` belongs to
+ * `team/vendor`, not to `team`. Resolution is by longest exact
+ * `refs/remotes/<name>/` prefix over the configured remote names. A first-
+ * segment match would apply one remote's role to another remote's evidence —
+ * refusing evidence nobody gated, or promoting evidence as the wrong primary.
+ */
+export function matchTrackingRefRemote(
+  revision: string | undefined,
+  knownRemotes: readonly string[],
+): string | null {
+  if (revision === undefined) return null;
+  const prefix = "refs/remotes/";
+  if (!revision.startsWith(prefix)) return null;
+  const rest = revision.slice(prefix.length);
+  let match: string | null = null;
+  for (const name of knownRemotes) {
+    if (name.length === 0) continue;
+    if (rest !== name && !rest.startsWith(`${name}/`)) continue;
+    if (match === null || name.length > match.length) match = name;
+  }
+  return match;
+}
+
 export interface TemporaryNotesRef {
   readonly ref: string;
   /** Committer-date of the temp ref tip, or null when Git reports none. */
@@ -1806,15 +1834,54 @@ export class GitRepository {
     return ref;
   }
 
-  async pushAtomically(remote: string): Promise<void> {
+  /**
+   * Publish the code branch, the notes ref, and the ledger envelope in one
+   * `git push --atomic` transaction. Atomicity is all-or-nothing across every
+   * ref in the transaction: if any ref is rejected, none of them advances.
+   *
+   * Each pushed ref carries its own `--force-with-lease=<ref>:<expected>` guard
+   * (the zero OID when the remote ref is absent), so a concurrent remote advance
+   * fails the whole transaction instead of silently winning or losing. The
+   * capability probe runs the same refspec set as `--dry-run` first: a remote
+   * without atomic support fails closed with `AtomicPushUnavailableError`
+   * before any ref moves. There is no ordered-push fallback — falling back
+   * would let the branch and notes advance after the ledger is refused.
+   *
+   * The ledger refspec is included only when `includeLedger` is set, which the
+   * caller does exactly when a local ledger tip exists. A repository that never
+   * built a checkpoint has no envelope to publish, so the transaction is the
+   * branch plus the notes.
+   */
+  async pushAtomically(remote: string, options: {
+    /** The local branch ref HEAD is pushed to (enables the branch lease). */
+    readonly branchRef?: string;
+    /** Expected remote OIDs; absent (undefined) means the lease is omitted. */
+    readonly expectedBranch?: ObjectId | null;
+    readonly expectedNotes?: ObjectId | null;
+    readonly expectedLedger?: ObjectId | null;
+    /** Include `${LEDGER_REF}:${LEDGER_REF}` in the transaction. */
+    readonly includeLedger?: boolean;
+  } = {}): Promise<void> {
+    const includeLedger = options.includeLedger ?? false;
+    const branchSpec = options.branchRef === undefined ? "HEAD" : `HEAD:${options.branchRef}`;
+    const refspecs = [branchSpec, `${NOTES_REF}:${NOTES_REF}`];
+    if (includeLedger) refspecs.push(`${LEDGER_REF}:${LEDGER_REF}`);
+    const leases: string[] = [];
+    const format = await this.objectFormat();
+    const absent = "0".repeat(format === "sha1" ? 40 : 64);
+    const leaseFor = (ref: string, expected: ObjectId | null | undefined): void => {
+      if (expected !== undefined) leases.push(`--force-with-lease=${ref}:${expected ?? absent}`);
+    };
+    if (options.branchRef !== undefined) leaseFor(options.branchRef, options.expectedBranch);
+    leaseFor(NOTES_REF, options.expectedNotes);
+    if (includeLedger) leaseFor(LEDGER_REF, options.expectedLedger);
     const probe = [
       "push",
       "--atomic",
       "--dry-run",
       "--no-verify",
       remote,
-      "HEAD",
-      `${NOTES_REF}:${NOTES_REF}`,
+      ...refspecs,
     ];
     const result = await this.run(probe, { allowExitCodes: [0, 1, 128] });
     if (result.exitCode !== 0) {
@@ -1824,7 +1891,7 @@ export class GitRepository {
       throw new GitCommandError(probe, result);
     }
     await this.run(
-      ["push", "--atomic", remote, "HEAD", `${NOTES_REF}:${NOTES_REF}`],
+      ["push", "--atomic", ...leases, remote, ...refspecs],
       { environment: { [INTERNAL_ATOMIC_PUSH_ENV]: "1" } },
     );
   }

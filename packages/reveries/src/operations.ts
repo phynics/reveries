@@ -96,6 +96,7 @@ import {
   LEDGER_NOTES_PATH,
   LEDGER_SIGNATURES_PATH,
   LEDGER_SIGNATURE_TIMESTAMP,
+  matchTrackingRefRemote,
   RETENTION_COMMITS_REF,
   RETENTION_OBJECTS_REF,
   SnapshotIndexCorruptError,
@@ -1697,6 +1698,17 @@ export class Reveries {
     if (ledgerUpdate !== undefined && ledgerUpdate.localObject !== null) {
       const verification = await this.verifyLedgerEnvelope(ledgerUpdate.localObject);
       diagnostics.push(...verification.diagnostics);
+      if (verification.ok && ledgerUpdate.remoteObject !== null) {
+        if (!(await this.repository.objectExists("commit", ledgerUpdate.remoteObject))) {
+          diagnostics.push(
+            `Remote ledger ${ledgerUpdate.remoteObject} is unavailable locally; fetch it and rebuild from the current remote tip before publishing`,
+          );
+        } else if (!(await this.repository.isAncestor(ledgerUpdate.remoteObject, ledgerUpdate.localObject))) {
+          diagnostics.push(
+            `The proposed ledger ${ledgerUpdate.localObject} does not extend remote ledger ${ledgerUpdate.remoteObject}; fetch and rebuild from the current remote tip before publishing`,
+          );
+        }
+      }
     }
     try {
       await this.validateNotesRef(NOTES_REF);
@@ -2400,19 +2412,40 @@ export class Reveries {
       return { ok: false, diagnostics: ["Publishing requires an attached branch"] };
     }
     const branchRef = `refs/heads/${branch}`;
+    const branchRemote = await this.liveRepository.remoteObject(remote, branchRef);
+    const notesRemote = await this.liveRepository.remoteObject(remote, NOTES_REF);
+    // The envelope is the third member of the atomic publication transaction.
+    // Reading its local tip decides whether a ledger refspec is published at
+    // all; reading the remote tip arms its lease. A repository that never built
+    // a checkpoint publishes branch plus notes only.
+    const ledgerTip = await this.repository.ledgerTip();
+    const ledgerRemote = await this.liveRepository.remoteObject(remote, LEDGER_REF);
     const check = await this.checkOutgoingUpdates(remote, [{
       localRef: branchRef,
       localObject: await this.repository.resolveCommit("HEAD"),
       remoteRef: branchRef,
-      remoteObject: await this.liveRepository.remoteObject(remote, branchRef),
+      remoteObject: branchRemote,
     }, {
       localRef: NOTES_REF,
       localObject: await this.repository.notesTip(),
       remoteRef: NOTES_REF,
-      remoteObject: await this.liveRepository.remoteObject(remote, NOTES_REF),
-    }]);
+      remoteObject: notesRemote,
+    }, ...(ledgerTip === null ? [] : [{
+      localRef: LEDGER_REF,
+      localObject: ledgerTip,
+      remoteRef: LEDGER_REF,
+      remoteObject: ledgerRemote,
+    }])]);
     if (!check.ok) return check;
-    await this.liveRepository.pushAtomically(remote);
+    // One atomic transaction for all three refs: the leases are the values the
+    // check above approved, so a concurrent remote advance fails the whole
+    // transaction closed instead of publishing a partial set.
+    await this.liveRepository.pushAtomically(remote, {
+      branchRef,
+      expectedBranch: branchRemote,
+      expectedNotes: notesRemote,
+      ...(ledgerTip === null ? {} : { includeLedger: true as const, expectedLedger: ledgerRemote }),
+    });
     return check;
   }
 
@@ -2763,8 +2796,14 @@ export class Reveries {
      * with no authority at all.
      */
     readonly authority?: string | null;
-    /** The ledger tip this update expects to follow; defaults to the current tip. */
+    /** The local ledger tip this ref update expects to replace; defaults to the current tip. */
     readonly expectedLedger?: ObjectId | null;
+    /**
+     * The ledger checkpoint this new manifest extends. Defaults to the local
+     * expected tip; callers may supply a validated remote-tracking base when
+     * bootstrapping a fresh clone whose local ledger ref is absent.
+     */
+    readonly previousLedger?: ObjectId | null;
     readonly retentionCommit?: ObjectId | null;
     /**
      * Sign the manifest into a `signatures` tree entry. Defaults to true when a
@@ -2774,7 +2813,7 @@ export class Reveries {
     readonly sign?: boolean;
     readonly signingRole?: SignatureRole;
   }): Promise<LedgerCheckpointResult> {
-    const expectedLedger = input.expectedLedger !== undefined ? input.expectedLedger : await this.repository.ledgerTip();
+    const expectedLocalLedger = input.expectedLedger !== undefined ? input.expectedLedger : await this.repository.ledgerTip();
     const notesTip = await this.repository.notesTip();
     const notesTree = notesTip === null ? null : await this.repository.treeForCommit(notesTip);
     const retentionCommit = input.retentionCommit !== undefined
@@ -2792,19 +2831,69 @@ export class Reveries {
     // the field already existed and RVR-009 already signs it; only its meaning
     // stops being reserved.
     let authority: string | null;
+    let resolvedAuthority: AuthorityStatus;
     try {
-      authority = input.authority !== undefined
-        ? input.authority
-        : (await this.authorityStatus()).primary;
+      resolvedAuthority = await this.authorityStatus();
+      // Explicit null is intentionally distinct from omission. It controls
+      // only the manifest stamp, never which trusted primary supplies an
+      // existing ledger chain on a fresh clone.
+      authority = input.authority !== undefined ? input.authority : resolvedAuthority.primary;
     } catch (error: unknown) {
       return {
         ok: false,
         diagnostics: [error instanceof Error ? error.message : String(error)],
         state: "refused",
         checkpoint: null,
-        previousLedger: expectedLedger,
+        previousLedger: expectedLocalLedger,
         notesTip,
       };
+    }
+
+    // The local ref expectation and the manifest's predecessor are distinct on
+    // a fresh clone. Keep CAS expectation null so the local branch is created
+    // only if still absent, while extending a verified primary tracking tip.
+    let previousLedger = input.previousLedger !== undefined ? input.previousLedger : expectedLocalLedger;
+    if (input.previousLedger === undefined && expectedLocalLedger === null && resolvedAuthority.primary !== null) {
+      const primary = resolvedAuthority.primary;
+      const trackingRef = `refs/remotes/${primary}/reveries-ledger`;
+      const tracked = await this.repository.ledgerTip(trackingRef);
+      if (tracked !== null) {
+        if (resolvedAuthority.state !== "configured" && resolvedAuthority.state !== "inferred") {
+          return {
+            ok: false,
+            diagnostics: [`Cannot use ${trackingRef} as a ledger base because the publishing authority is ${resolvedAuthority.state}`],
+            state: "refused",
+            checkpoint: null,
+            previousLedger: null,
+            notesTip,
+          };
+        }
+        const base = await this.verifyLedgerEnvelope(tracked);
+        if (!base.ok) {
+          return {
+            ok: false,
+            diagnostics: [`The primary ledger base ${tracked} is invalid: ${base.diagnostics.join("; ")}`],
+            state: "refused",
+            checkpoint: null,
+            previousLedger: null,
+            notesTip,
+          };
+        }
+        previousLedger = tracked;
+      }
+    }
+    if (previousLedger !== null) {
+      const base = await this.verifyLedgerEnvelope(previousLedger);
+      if (!base.ok) {
+        return {
+          ok: false,
+          diagnostics: [`The ledger base ${previousLedger} is invalid: ${base.diagnostics.join("; ")}`],
+          state: "refused",
+          checkpoint: null,
+          previousLedger,
+          notesTip,
+        };
+      }
     }
 
     let manifest: LedgerManifest;
@@ -2812,7 +2901,7 @@ export class Reveries {
       manifest = createLedgerManifest({
         notes_commit: notesTip,
         notes_tree: notesTree,
-        previous_ledger: expectedLedger,
+        previous_ledger: previousLedger,
         retention_commit: retentionCommit,
         authority,
         annotated_subjects: totals.subjects,
@@ -2825,7 +2914,7 @@ export class Reveries {
         diagnostics: [error instanceof Error ? error.message : String(error)],
         state: "refused",
         checkpoint: null,
-        previousLedger: expectedLedger,
+        previousLedger,
         notesTip,
       };
     }
@@ -2841,9 +2930,9 @@ export class Reveries {
         // different one; carrying the previous lines forward is what makes the
         // entry grow-only and preserves the whole chain of attestations instead
         // of replacing the previous checkpoint's.
-        const carried = expectedLedger === null
+        const carried = previousLedger === null
           ? []
-          : (await this.repository.readLedgerSignaturesAt(expectedLedger) ?? "")
+          : (await this.repository.readLedgerSignaturesAt(previousLedger) ?? "")
             .split("\n")
             .filter((line) => line.length > 0);
         signatures = [...carried, signed.trimEnd()].join("\n").concat("\n");
@@ -2856,7 +2945,7 @@ export class Reveries {
         diagnostics: [],
         state: "unchanged",
         checkpoint,
-        previousLedger: expectedLedger,
+        previousLedger,
         notesTip,
       };
     }
@@ -2870,19 +2959,19 @@ export class Reveries {
         diagnostics: verification.diagnostics,
         state: "refused",
         checkpoint: null,
-        previousLedger: expectedLedger,
+        previousLedger,
         notesTip,
       };
     }
     try {
-      await this.repository.updateLedgerRef({ next: checkpoint, expected: expectedLedger });
+      await this.repository.updateLedgerRef({ next: checkpoint, expected: expectedLocalLedger });
     } catch (error: unknown) {
       return {
         ok: false,
         diagnostics: [error instanceof Error ? error.message : String(error)],
         state: "refused",
         checkpoint: null,
-        previousLedger: expectedLedger,
+        previousLedger,
         notesTip,
       };
     }
@@ -2891,7 +2980,7 @@ export class Reveries {
       diagnostics: [],
       state: "created",
       checkpoint,
-      previousLedger: expectedLedger,
+      previousLedger,
       notesTip,
     };
   }
@@ -3018,15 +3107,26 @@ export class Reveries {
   }
 
   /**
-   * Read the declared remote roles (RVR-017) from
-   * `reveries.remoteRole.<remote>`. An absent key yields no roles, which is the
-   * ordinary V1 state. An unknown role throws, naming the offending value and
-   * the valid set, because silently ignoring a typo would leave a repository
-   * believing it has an authority boundary it does not have.
+   * Read the declared remote roles (RVR-017). Two additive encodings, one map:
+   *
+   * - Legacy flat keys, unchanged: `reveries.remoteRole.<remote>` holds the
+   *   role. Git forbids `/` in such a key, so flat names stay slash-free.
+   * - Slash-name subsection keys: `reveries.remoteRole/<remote>.role` holds
+   *   the role (stored as subsection `[reveries "remoteRole/<remote>"]`, key
+   *   `role`; written via
+   *   `git config reveries.remoteRole/<remote>.role <role>`). The `/` after
+   *   `remoteRole` versus `.` keeps the two forms structurally distinct, and
+   *   only the trailing `.role` suffix is stripped, so a remote whose own
+   *   name contains dots still resolves exactly.
+   *
+   * An absent key yields no roles, which is the ordinary V1 state. An unknown
+   * role throws, naming the offending value and the valid set, because
+   * silently ignoring a typo would leave a repository believing it has an
+   * authority boundary it does not have.
    */
   private async readRemoteRoles(): Promise<Record<string, RemoteRole>> {
     const result = await this.repository.run(
-      ["config", "--get-regexp", "^reveries\\.remoteRole\\."],
+      ["config", "--get-regexp", "^reveries\\.remoteRole[./]"],
       { allowExitCodes: [0, 1] },
     );
     const roles: Record<string, RemoteRole> = {};
@@ -3037,7 +3137,18 @@ export class Reveries {
       const separator = line.indexOf(" ");
       if (separator < 0) continue;
       const key = line.slice(0, separator);
-      const remote = key.slice("reveries.remoteRole.".length);
+      if (key.startsWith("reveries.remoteRole.")) {
+        const remote = key.slice("reveries.remoteRole.".length);
+        if (remote.length === 0) continue;
+        roles[remote] = remoteRole(line.slice(separator + 1).trim());
+        continue;
+      }
+      // Subsection form: `reveries.remoteRole/<remote>.role`. Anything else
+      // under the prefix is not a role declaration and is ignored rather
+      // than misread.
+      const subsection = key.slice("reveries.remoteRole/".length);
+      if (!subsection.endsWith(".role")) continue;
+      const remote = subsection.slice(0, -".role".length);
       if (remote.length === 0) continue;
       roles[remote] = remoteRole(line.slice(separator + 1).trim());
     }
@@ -3267,6 +3378,63 @@ export class Reveries {
     };
   }
 
+  /**
+   * Whether an envelope may become canonical state through the envelope route.
+   *
+   * The notes route (`syncPull`) withholds promotion for non-primary roles by
+   * construction, but the envelope route carries the *same* evidence through a
+   * different transport. Without this gate, a direct API caller could route
+   * around the quarantine decision via `materializeNotesFromLedger` with a
+   * mirror/import-only remote-tracking revision — or with the same checkpoint
+   * named by raw OID, which carries no provenance at all. Withholding is
+   * therefore a property of the evidence enforced here, not of whichever
+   * caller or spelling runs first.
+   *
+   * A remote with no declared role keeps its pre-role behaviour: it promotes.
+   * A contradictory configuration is not an undeclared remote, and nothing
+   * promotes while the repository cannot say which remote is authoritative.
+   * The local ledger tip (`revision === undefined`) carries no foreign
+   * provenance to judge, so it is allowed through to verification. An explicit
+   * revision that names no configured remote is an unknown source: refused
+   * whenever any role is declared, allowed only in a repository that never
+   * adopted roles at all.
+   */
+  private async envelopePromotionPolicy(
+    revision: string | undefined,
+  ): Promise<{ readonly allowed: boolean; readonly diagnostic: string | null }> {
+    const authority = await this.authorityStatus();
+    if (authority.state === "invalid") {
+      return {
+        allowed: false,
+        diagnostic: `Authority configuration is invalid, so no envelope may become canonical state: ${authority.diagnostics.join("; ")}`,
+      };
+    }
+    const match = revision === undefined
+      ? null
+      : matchTrackingRefRemote(revision, await this.configuredRemoteNames());
+    const remote = match ?? null;
+    if (remote === null) {
+      // An explicit revision with no configured remote-tracking provenance —
+      // a raw OID, a local branch, a tag — cannot be attributed to any role.
+      // Refuse it as an unknown source whenever roles are declared; a legacy
+      // repository without roles keeps its historical behaviour.
+      if (revision !== undefined && authority.roles.size > 0) {
+        return {
+          allowed: false,
+          diagnostic: `The revision ${revision} names no configured remote, so its evidence cannot be attributed to a role; materialize was refused`,
+        };
+      }
+      return { allowed: true, diagnostic: null };
+    }
+    const role = await this.roleOf(remote);
+    if (role === null) return { allowed: true, diagnostic: null };
+    if (rolePromotion(role) === "promote") return { allowed: true, diagnostic: null };
+    return {
+      allowed: false,
+      diagnostic: `${remote} is an ${role} remote, so its evidence is quarantined rather than promoted, and the ledger envelope transports the same notes; materialize was refused`,
+    };
+  }
+
   async materializeNotesFromLedger(input: {
     /** The local notes tip this call expects to replace; null when absent. */
     readonly expectedNotes: ObjectId | null;
@@ -3278,6 +3446,18 @@ export class Reveries {
     readonly revision?: string;
   }): Promise<LedgerMaterializeResult> {
     const { revision } = input;
+    // The promotion decision runs before verification or any ref move, so a
+    // withheld envelope never reaches canonical state through this route and
+    // the local refs are left exactly as they were.
+    const promotion = await this.envelopePromotionPolicy(revision);
+    if (!promotion.allowed) {
+      return {
+        ok: false,
+        diagnostics: [promotion.diagnostic ?? "The ledger envelope was refused"],
+        state: "unchanged",
+        notesTip: await this.repository.notesTip(),
+      };
+    }
     const verification = await this.verifyLedgerEnvelope(revision);
     if (!verification.ok) {
       return { ok: false, diagnostics: verification.diagnostics, state: "unchanged", notesTip: await this.repository.notesTip() };
@@ -3297,6 +3477,22 @@ export class Reveries {
     const current = await this.repository.notesTip();
     if (current === manifest.notes_commit) {
       return { ok: true, diagnostics: [], state: "unchanged", notesTip: current };
+    }
+    // The envelope REPLACES the notes ref rather than unioning into it, so a
+    // local tip the envelope does not contain must never be overwritten here.
+    // An absent ref is the fresh-clone case the envelope exists for, and a
+    // strict ancestor is a fast-forward; every other state is refused exactly
+    // as the caller-facing gate does, so direct API callers get the same
+    // protection as the command layer.
+    if (current !== null && !(await this.repository.isAncestor(current, manifest.notes_commit))) {
+      return {
+        ok: false,
+        diagnostics: [
+          `The local ${NOTES_REF} carries notes the ledger envelope does not contain, so it was left unchanged`,
+        ],
+        state: "unchanged",
+        notesTip: current,
+      };
     }
     const format = await this.repository.objectFormat();
     const absent = "0".repeat(format === "sha1" ? 40 : 64);
