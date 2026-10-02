@@ -1147,6 +1147,34 @@ It performs:
 
 Agent startup never performs network access automatically.
 
+#### 17.2.1 Inspecting a quarantine
+
+A quarantine ref lives at `refs/reveries/quarantine/<remote>/<oid>`, which is outside `refs/notes/`.
+`git notes --ref=` does not reject that name: given it, git resolves
+`refs/notes/refs/reveries/quarantine/<remote>/<oid>` instead, reports no note, and exits
+successfully. The write and the read are therefore wrong in the same direction, and the failure is
+silent — an operator inspecting a quarantine during an incident concludes the quarantine is empty
+while the candidate sits there intact. Nothing in the design may tell an operator to run
+`git notes --ref=` against a quarantine ref.
+
+Inspection therefore goes through the command layer, which reaches the bytes as Git objects and
+does not depend on the namespace the commit was reached through:
+
+```bash
+reveries ledger quarantine list
+reveries ledger quarantine show refs/reveries/quarantine/<remote>/<oid>
+```
+
+`list` reports every preserved candidate with the remote recovered from the ref — a remote name
+containing a slash keeps its whole name, since the remote is everything between the prefix and the
+trailing object ID. An empty quarantine is the ordinary state of a repository that has never
+refused evidence, so it is reported and exits zero rather than being treated as damage.
+
+`show` reads the candidate's own tree and each note body at that tree. It refuses a `refs/notes/…`
+name instead of quietly reading the shadow ref, because that shadow name is exactly the confusion
+the command exists to remove, and refuses an absent ref by pointing at `list` rather than reporting
+an empty result. Inspection never moves canonical state.
+
 Before substantial shared work, the Skill requires an explicit pull or a clear statement that local Reveries state may be stale.
 
 ### 17.3 Local write concurrency
@@ -2389,6 +2417,33 @@ Roles are declared as `reveries.remoteRole.<remote>` and resolved into at most o
 writer refuses a second `primary` and a role for a remote Git does not have, rather than writing a
 configuration that would make authority permanently `invalid`. Each command reports the *resolved*
 result, because a role only means something next to the other roles.
+
+A remote name may contain a slash (`team/vendor` is a real Git remote), and Git rejects
+`reveries.remoteRole.team/vendor` outright as an invalid key. Such a remote is therefore declared
+through the subsection encoding, and the two forms are additive — a slash-free name always uses the
+flat key, so declaring a role never rewrites configuration that already exists:
+
+```bash
+git config reveries.remoteRole.origin primary          # flat, unchanged
+git config reveries.remoteRole/team.vendor.role import-only
+```
+
+Readers must accept both, and they do so through one shared pattern and one shared parser rather
+than several hand-rolled ones. On git 2.39.5 a `--get-regexp` pattern must extend *past* a
+subsection boundary to match it: `^reveries\.remoteRole` and `^reveries\.remoteRole/` both return
+zero rows when subsection keys exist, and `^reveries\.remoteRole\.` returns only the flat keys. A
+narrowed pattern therefore does not fail loudly — it hides every slash remote's role and leaves
+authority silently `unconfigured`.
+
+A tracking ref for such a remote is `refs/remotes/team/vendor/reveries-ledger`, and its remote is
+`team/vendor`, not the first path segment. Resolution is by longest exact `refs/remotes/<name>/`
+prefix over the configured remotes, applied identically by the command layer and the library. A
+first-segment read would apply one remote's role to another remote's evidence — refusing evidence
+nobody gated, or promoting it as the wrong remote's.
+
+A key under the same prefix that is not a role declaration, such as
+`reveries.remoteRole/team.someOtherSetting`, is never read as one and never cleared: a role writer
+does not own keys it did not create.
 
 ```bash
 reveries policy show

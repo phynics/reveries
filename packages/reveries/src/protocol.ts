@@ -369,6 +369,95 @@ export function remoteRole(value: unknown): RemoteRole {
 }
 
 /**
+ * Every `reveries.remoteRole` declaration, in one `git config --get-regexp` pass.
+ *
+ * Two additive encodings exist, and both must be read together or a role becomes
+ * invisible:
+ *
+ * - Flat: `reveries.remoteRole.<remote>`. Git rejects `/` in such a key, so flat
+ *   names are necessarily slash-free.
+ * - Subsection: `reveries.remoteRole/<remote>.role`, stored as
+ *   `[reveries "remoteRole/<remote>"]` with key `role`. This is the only encoding
+ *   that can represent a remote whose name contains a slash (`team/vendor`),
+ *   which Git permits.
+ *
+ * The character class **must** be `[./]` and the pattern must continue past it.
+ * A pattern that stops at the boundary matches nothing: on git 2.39.5,
+ * `--get-regexp '^reveries\.remoteRole'` and `'^reveries\.remoteRole/'` both
+ * return zero rows even when subsection keys exist, and `'^reveries\.remoteRole\.'`
+ * silently returns only the flat keys. Narrowing this pattern therefore does not
+ * degrade loudly — it makes every slash remote's role unreadable, leaving
+ * authority silently `unconfigured`. `roleConfigKeys` is the single owner of this
+ * string so that failure cannot be reintroduced by a second reader.
+ */
+export const REMOTE_ROLE_CONFIG_PATTERN = "^reveries\\.remoteRole[./]";
+
+/** The key suffix that marks a subsection entry as a role declaration. */
+const REMOTE_ROLE_SUFFIX = ".role";
+
+/**
+ * The configuration key that holds `remote`'s role.
+ *
+ * Flat names keep the legacy key byte for byte, so adopting a slash remote never
+ * rewrites configuration a repository already has. Only a name Git could not
+ * express as a flat key uses the subsection form. A remote whose own name ends
+ * in `.role` is still written unambiguously: the flat branch is chosen by the
+ * presence of `/`, not by the suffix, and the subsection branch appends its own
+ * `.role` so the reader strips exactly one.
+ */
+export function remoteRoleConfigKey(remote: string): string {
+  return remote.includes("/")
+    ? `reveries.remoteRole/${remote}${REMOTE_ROLE_SUFFIX}`
+    : `reveries.remoteRole.${remote}`;
+}
+
+/**
+ * The remote a `reveries.remoteRole` key declares a role for, or null when the
+ * key is not a role declaration.
+ *
+ * Anything else under the prefix is refused rather than misread: a
+ * `reveries.remoteRole/team.someOtherSetting` decoy is a different key that
+ * happens to share a subsection, and treating it as a role would invent an
+ * authority boundary nobody declared.
+ */
+export function remoteFromRoleConfigKey(key: string): string | null {
+  const flat = "reveries.remoteRole.";
+  if (key.startsWith(flat)) {
+    const remote = key.slice(flat.length);
+    return remote.length === 0 ? null : remote;
+  }
+  const subsection = "reveries.remoteRole/";
+  if (!key.startsWith(subsection)) return null;
+  const scoped = key.slice(subsection.length);
+  if (!scoped.endsWith(REMOTE_ROLE_SUFFIX)) return null;
+  const remote = scoped.slice(0, -REMOTE_ROLE_SUFFIX.length);
+  return remote.length === 0 ? null : remote;
+}
+
+/**
+ * Parse the `<key> <value>` lines `git config --get-regexp` prints into roles.
+ *
+ * Pure so the encoding rules can be tested without a repository, and shared so
+ * the CLI, core, and install converge on one reader instead of three
+ * hand-rolled ones — three readers is how the CLI came to read roles the core
+ * could not, and the drift was invisible until a slash remote existed.
+ */
+export function parseRemoteRoleConfigLines(stdout: string): Record<string, RemoteRole> {
+  const roles: Record<string, RemoteRole> = {};
+  for (const line of stdout.split("\n")) {
+    if (line.trim().length === 0) continue;
+    // `--get-regexp` prints "<key> <value>" separated by the first space, and a
+    // remote name cannot contain whitespace, so the split is unambiguous.
+    const separator = line.indexOf(" ");
+    if (separator < 0) continue;
+    const remote = remoteFromRoleConfigKey(line.slice(0, separator));
+    if (remote === null) continue;
+    roles[remote] = remoteRole(line.slice(separator + 1).trim());
+  }
+  return roles;
+}
+
+/**
  * Derive the authoritative publication configuration from declared roles.
  *
  * This is the whole of RVR-017's "exactly one primary" rule, and it is pure so

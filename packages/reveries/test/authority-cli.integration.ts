@@ -841,3 +841,124 @@ test("--no-authority still reports null rather than falling back to the primary"
   // The resolved primary is still reported separately, so nothing is hidden.
   assert.equal(parsed.result.authorityResolved, "origin");
 });
+
+// --- Slash-containing remote names ------------------------------------------
+//
+// Git permits a remote named `team/vendor`, but `reveries.remoteRole.team/vendor`
+// is rejected by git itself as an invalid key, so such a remote is declared
+// through the subsection encoding `reveries.remoteRole/team/vendor.role`. Two
+// things then have to hold, and neither is obvious:
+//
+//  1. a tracking ref for `team/vendor` must resolve to `team/vendor`, not to its
+//     first path segment. Reading `team` applied *that* remote's role to another
+//     remote's evidence, so the command layer refused promotions the direct API
+//     performed; and
+//  2. every reader of role configuration — the CLI writer, init convergence, and
+//     removal — must see the subsection form. A flat-only `--get-regexp` pattern
+//     returns zero rows for a subsection key, so narrowing it hides the role
+//     instead of failing loudly.
+
+test("a slash remote's role can be set, shown, and cleared", async () => {
+  const fixture = await adopted("slash-role-cli-", ["origin", "team", "team/vendor"], ["origin"]);
+  const set = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "set", "team/vendor", "import-only"], set.io), 0, set.stderr());
+
+  // The subsection encoding is the only one git can store for this name.
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole/team/vendor.role"),
+    "import-only",
+  );
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole.team/vendor"),
+    "",
+    "git would reject the flat key for a slash name",
+  );
+
+  const show = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "show", "--json"], show.io), 0, show.stderr());
+  const roles = (JSON.parse(show.stdout()) as { result: { roles: Record<string, string> } }).result.roles;
+  assert.equal(roles["team/vendor"], "import-only");
+
+  const clear = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "clear", "team/vendor"], clear.io), 0, clear.stderr());
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole/team/vendor.role"),
+    "",
+  );
+});
+
+test("a decoy subsection under the role prefix is never a role", async () => {
+  const fixture = await adopted("slash-role-decoy-", ["origin", "team", "team/vendor"], ["origin"]);
+  await git(fixture.directory, "config", "reveries.remoteRole/team/vendor.role", "import-only");
+  // A different key that happens to share the prefix. Reading it as a role would
+  // invent an authority boundary nobody declared.
+  await git(fixture.directory, "config", "reveries.remoteRole/team.someOtherSetting", "hello");
+
+  const show = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "show", "--json"], show.io), 0, show.stderr());
+  const roles = (JSON.parse(show.stdout()) as { result: { roles: Record<string, string> } }).result.roles;
+  assert.equal(roles["team/vendor"], "import-only");
+  assert.equal("team.someOtherSetting" in roles, false, JSON.stringify(roles));
+
+  // Clearing the role must not eat a key the role writer does not own.
+  const clear = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "clear", "team/vendor"], clear.io), 0, clear.stderr());
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole/team.someOtherSetting"),
+    "hello",
+  );
+});
+
+test("a slash-free remote keeps the legacy flat key", async () => {
+  const fixture = await adopted("flat-role-cli-", ["origin", "team/vendor"], ["origin"]);
+  const set = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "set", "origin", "primary"], set.io), 0, set.stderr());
+  // Byte for byte the key a pre-slash-support repository already has: declaring a
+  // role never rewrites configuration that exists.
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole.origin"),
+    "primary",
+  );
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole/origin.role"),
+    "",
+    "a simple name must not gain a subsection key",
+  );
+});
+
+test("a second primary declared through a subsection key is refused", async () => {
+  const fixture = await adopted("slash-two-primary-", ["origin", "team", "team/vendor"], ["origin"]);
+  const first = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "set", "origin", "primary"], first.io), 0, first.stderr());
+  await git(fixture.directory, "config", "reveries.remoteRole/team/vendor.role", "primary");
+
+  // The existing primary is a subsection key, so a flat-only read would miss it
+  // and write the contradiction while reporting success.
+  const second = captureIo(fixture.directory);
+  assert.equal(await runCli(["role", "set", "team", "primary"], second.io), 3);
+  assert.match(second.stderr(), /exactly one primary/i);
+  assert.equal(
+    await gitMaybe(fixture.directory, "config", "--get", "reveries.remoteRole.team"),
+    "",
+    "the refused second primary must not be written",
+  );
+});
+
+test("a tracking ref resolves by longest remote name, not first segment", async () => {
+  const fixture = await adopted("slash-tracking-", ["origin", "team", "team/vendor"], ["origin"]);
+  const reveries = await Reveries.open(fixture.directory);
+  // `team` and `team/vendor` both exist, so the answer depends on the whole
+  // configured name rather than the first path segment.
+  assert.equal(
+    await reveries.trackingRemote("refs/remotes/team/reveries-ledger"),
+    "team",
+  );
+  assert.equal(
+    await reveries.trackingRemote("refs/remotes/team/vendor/reveries-ledger"),
+    "team/vendor",
+  );
+  // Anything that is not a configured remote's tracking ref names no remote.
+  assert.equal(await reveries.trackingRemote("refs/remotes/absent/reveries-ledger"), null);
+  assert.equal(await reveries.trackingRemote("main"), null);
+  assert.equal(await reveries.trackingRemote(undefined), null);
+});

@@ -26,6 +26,7 @@ import {
   INTERNAL_ATOMIC_PUSH_ENV,
   LEDGER_REF,
   NOTES_REF,
+  QUARANTINE_REF_PREFIX,
   createLocalEd25519Signer,
   createLocalEd25519Verifier,
   ed25519KeyId,
@@ -45,9 +46,12 @@ import {
   factTargetId,
   objectId,
   parseNote,
+  parseRemoteRoleConfigLines,
   readLedgerManifest,
   recordFactId,
   remoteRole,
+  remoteRoleConfigKey,
+  REMOTE_ROLE_CONFIG_PATTERN,
   rolePromotion,
   reverieId,
   validateNote,
@@ -234,7 +238,7 @@ Examples:
   reveries sync --status
   reveries sync --pull origin
 `,
-  ledger: `Usage: reveries ledger <status|build|materialize> [<revision>] [--json]
+  ledger: `Usage: reveries ledger <status|build|materialize|quarantine> [<revision>] [--json]
 
 Inspect, advance, or materialize the protected ledger envelope on
 refs/heads/reveries-ledger. The envelope carries the exact notes commit as a
@@ -245,6 +249,8 @@ typed parent, so a clone can recover its evidence from an ordinary branch fetch.
                appends: a line the previous envelope carried cannot be dropped.
   materialize  Recreate refs/notes/reveries from a verified envelope. Refuses
                when the local notes ref carries records the envelope does not.
+  quarantine   list  Report every preserved, unpromoted candidate.
+               show <ref>  Read the records a candidate holds.
 
 materialize never overwrites local notes it cannot prove the envelope already
 contains. Pass <revision> to name a remote envelope, such as
@@ -266,6 +272,12 @@ Examples:
   reveries ledger build
   reveries ledger build --no-sign --no-authority
   reveries ledger materialize refs/remotes/origin/reveries-ledger
+  reveries ledger quarantine list
+  reveries ledger quarantine show refs/reveries/quarantine/origin/<oid>
+
+A quarantined candidate is preserved at ${QUARANTINE_REF_PREFIX}<remote>/<oid>,
+which is not a notes ref: git notes --ref= resolves a different ref for it and
+reports no note for a candidate that is present. Use this command to inspect one.
 `,
   role: `Usage: reveries role <show|set|clear> [<remote> [<role>]] [--json]
 
@@ -1467,11 +1479,116 @@ const LEDGER_ABSENT_REPORT: LedgerReport = {
  *
  * `refs/remotes/<remote>/reveries-ledger` is the shape an operator names by hand,
  * and the remote in it is exactly whose evidence the envelope transports.
+ *
+ * Resolution is delegated to core. Remote names may contain slashes
+ * (`team/vendor`), so the first path segment is not the answer, and this module
+ * used to answer with it: `refs/remotes/team/vendor/reveries-ledger` resolved to
+ * `team`, which applied *that* remote's role to another remote's evidence and
+ * refused a promotion the direct API performed. Matching a local copy of the
+ * rule is how the two drifted; there is now one matcher and one caller.
  */
-function remoteOfRevision(revision: string | undefined): string | null {
-  if (revision === undefined) return null;
-  const match = /^refs\/remotes\/([^/]+)\//.exec(revision);
-  return match?.[1] ?? null;
+async function remoteOfRevision(reveries: Reveries, revision: string | undefined): Promise<string | null> {
+  return reveries.trackingRemote(revision);
+}
+
+/**
+ * `reveries ledger quarantine list|show` — the supported way to inspect a
+ * quarantined candidate (RVR-030).
+ *
+ * This exists because the quarantine ref is in the `refs/reveries/` namespace,
+ * and `git notes --ref=` cannot read it. Given
+ * `refs/reveries/quarantine/<remote>/<oid>`, git resolves
+ * `refs/notes/refs/reveries/quarantine/<remote>/<oid>` instead, so the command
+ * reports "no note found" for a candidate that is present and intact. Write and
+ * read then agree in the wrong direction and the failure is silent: an operator
+ * inspecting a quarantine during an incident concludes the quarantine is empty.
+ *
+ * Every read below goes through `readNoteAt`, which reads the notes commit's
+ * tree directly and does not care what namespace the commit was reached
+ * through. `show` additionally refuses a `refs/notes/...` name rather than
+ * quietly reading the shadow ref, because that shadow name is precisely the
+ * confusion this command exists to remove.
+ */
+async function quarantineCommand(
+  argv: readonly string[],
+  json: boolean,
+  io: CliIo,
+  reveries: Reveries,
+): Promise<ExitCode> {
+  const parsed = parseArguments(argv, [], ["--json"]);
+  const label = "ledger quarantine";
+  const action = parsed.positionals[0];
+  if (action !== "list" && action !== "show") {
+    throw new UsageError("ledger quarantine requires an action: list or show");
+  }
+  const repository = reveries.repository;
+  if (action === "list") {
+    // An empty quarantine is the ordinary state of a repository that has never
+    // refused evidence, so it is reported and not treated as a failure.
+    const candidates = await repository.quarantinedCandidates();
+    if (json) {
+      emit(io, true, label, { action, quarantines: candidates }, [], {});
+      return 0;
+    }
+    if (candidates.length === 0) {
+      io.stdout("No quarantined Reveries evidence. Every fetched union was promoted or absent.\n");
+      return 0;
+    }
+    io.stdout(`${candidates.length} quarantined candidate(s), newest first:\n`);
+    for (const candidate of candidates) {
+      io.stdout(`  ${candidate.ref}\n`);
+      io.stdout(`    remote ${candidate.remote}; notes commit ${candidate.candidate}\n`);
+    }
+    io.stdout("\nRead one with: reveries ledger quarantine show <ref>\n");
+    return 0;
+  }
+
+  const ref = requirePositional(parsed, 1, "quarantine ref");
+  if (ref.startsWith("refs/notes/")) {
+    // Accepting the shadow name would make the failure mode this command exists
+    // to remove reachable again, and would report bytes that are not the
+    // quarantine an operator asked about.
+    throw new UsageError(
+      `${ref} is a refs/notes/ name, not a quarantine. A quarantine ref is under `
+      + `${QUARANTINE_REF_PREFIX}, and git notes --ref= silently reads a different ref for it`,
+    );
+  }
+  if (!ref.startsWith(QUARANTINE_REF_PREFIX)) {
+    throw new UsageError(`A quarantine ref is under ${QUARANTINE_REF_PREFIX}; found ${ref}`);
+  }
+  const candidates = await repository.quarantinedCandidates();
+  const match = candidates.find((candidate) => candidate.ref === ref);
+  if (match === undefined) {
+    throw new UsageError(
+      `No quarantine at ${ref}. List what is present with: reveries ledger quarantine list`,
+    );
+  }
+  // The annotated objects come from the candidate's own tree, and each body is
+  // read at that tree. Neither step goes through `git notes --ref=`, which is the
+  // whole point: that command cannot address this ref.
+  const entries = await repository.listNotesAt(match.candidate);
+  const notes: { object: string; records: string[] }[] = [];
+  for (const entry of entries) {
+    const body = await repository.readNoteAt(match.candidate, entry.object);
+    if (body === null) continue;
+    notes.push({ object: entry.object, records: body.trim().length === 0 ? [] : body.split("\n") });
+  }
+  if (json) {
+    emit(io, true, label, { action, ...match, notes }, [], {});
+    return 0;
+  }
+  io.stdout(`Quarantine ${match.ref}\n`);
+  io.stdout(`  remote ${match.remote}; notes commit ${match.candidate}\n`);
+  io.stdout(`  ${QUARANTINE_REF_PREFIX} is not a notes ref: git notes --ref= cannot read it.\n\n`);
+  if (notes.length === 0) {
+    io.stdout("This candidate annotates no objects.\n");
+    return 0;
+  }
+  for (const note of notes) {
+    io.stdout(`- ${note.object}\n`);
+    for (const line of note.records) io.stdout(`    ${line}\n`);
+  }
+  return 0;
 }
 
 /**
@@ -1486,7 +1603,10 @@ function remoteOfRevision(revision: string | undefined): string | null {
  *
  * A remote with no declared role keeps its pre-role behaviour: it promotes.
  * A contradictory configuration is not an undeclared remote, and nothing promotes
- * while the repository cannot say which remote is authoritative.
+ * while the repository cannot say which remote is authoritative. An explicit
+ * revision that names no configured remote is an unknown source, and is treated
+ * exactly as core's gate treats it, so the command layer and the direct API can
+ * never reach opposite conclusions about the same evidence.
  */
 async function envelopePromotionGate(
   reveries: Reveries,
@@ -1499,8 +1619,16 @@ async function envelopePromotionGate(
       diagnostic: `Authority configuration is invalid, so no envelope may become canonical state: ${authority.diagnostics.join("; ")}`,
     };
   }
-  const remote = remoteOfRevision(revision);
-  if (remote === null) return { allowed: true, diagnostic: null };
+  const remote = await remoteOfRevision(reveries, revision);
+  if (remote === null) {
+    if (revision !== undefined && authority.roles.size > 0) {
+      return {
+        allowed: false,
+        diagnostic: `The revision ${revision} names no configured remote, so its evidence cannot be attributed to a role; materialize was refused`,
+      };
+    }
+    return { allowed: true, diagnostic: null };
+  }
   const role = authority.roles.get(remote) ?? null;
   if (role === null) return { allowed: true, diagnostic: null };
   if (rolePromotion(role) === "promote") return { allowed: true, diagnostic: null };
@@ -2175,7 +2303,11 @@ async function runRoleCommand(
 
   const remote = requirePositional(parsed, 0, "remote name");
   validateRemoteName(remote);
-  const key = `reveries.remoteRole.${remote}`;
+  // Git rejects `reveries.remoteRole.team/vendor` as an invalid key, so a remote
+  // whose name contains a slash is written through the subsection encoding. A
+  // slash-free name keeps the legacy flat key byte for byte, so declaring a role
+  // never rewrites configuration a repository already has.
+  const key = remoteRoleConfigKey(remote);
   if (action === "clear") {
     await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
     return report(`Cleared the role for ${remote}.`);
@@ -2186,21 +2318,22 @@ async function runRoleCommand(
     throw new UsageError(`Remote ${remote} does not exist in this repository; add it before declaring a role`);
   }
   // Refuse a second primary here rather than writing a configuration that makes
-  // authority permanently `invalid`.
-  const current = (await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
-    allowExitCodes: [0, 1],
-  })).stdout;
+  // authority permanently `invalid`. Both encodings are read, because a primary
+  // already declared through a subsection key is just as much a second primary:
+  // missing it here would write the contradiction and report success.
+  const current = (await repository.run(
+    ["config", "--get-regexp", REMOTE_ROLE_CONFIG_PATTERN],
+    { allowExitCodes: [0, 1] },
+  )).stdout;
   if (role === "primary") {
-    const primaries = current
-      .split("\n")
-      .map((line) => line.split(" "))
-      .filter(([name, value]) => name !== undefined && value === "primary" && name !== key)
-      .map(([name]) => name?.slice("reveries.remoteRole.".length) ?? "")
-      .filter((name) => name.length > 0);
+    const declared = parseRemoteRoleConfigLines(current);
+    const primaries = Object.entries(declared)
+      .filter(([name, value]) => value === "primary" && name !== remote)
+      .map(([name]) => name);
     if (primaries.length > 0) {
       throw new UsageError(
         `Authority must name exactly one primary; reveries.remoteRole already declares ${primaries.join(", ")}. `
-        + `Clear ${primaries.map((name) => `${key.slice(0, key.indexOf("."))}.${name}`).join(" or ")} first.`,
+        + `Clear ${primaries.map((name) => remoteRoleConfigKey(name)).join(" or ")} first.`,
       );
     }
   }
@@ -2283,7 +2416,12 @@ async function refuseAsUsage<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 function validateRemoteName(remote: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote)) {
+  // Git allows `/` in a remote name (`team/vendor` is a real remote), and
+  // refusing it here made a slash remote's role impossible to declare or clear
+  // while `role show` happily displayed one. Existence is checked against
+  // `git remote` by the caller, so this only has to reject names that could not
+  // name a remote at all.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(remote) || remote.includes("..") || remote.endsWith("/")) {
     throw new UsageError(`Remote name ${remote} is not a usable Git remote name`);
   }
 }
@@ -2973,8 +3111,11 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     }
     if (command === "ledger") {
       const action = argv[1];
+      if (action === "quarantine") {
+        return await quarantineCommand(argv.slice(2), json, io, reveries);
+      }
       if (action !== "status" && action !== "build" && action !== "materialize") {
-        throw new UsageError("ledger action must be status, build, or materialize");
+        throw new UsageError("ledger action must be status, build, materialize, or quarantine");
       }
       const parsed = parseArguments(
         argv.slice(2),

@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { promisify } from "node:util";
 
 import { GitRepository, LEDGER_REF, readTrustStore, type TrustStoreFile, type TrustStoreKey } from "./git.ts";
-import { parseNote, type ReveriesInit, type TrustStore } from "./protocol.ts";
+import { parseNote, remoteFromRoleConfigKey, REMOTE_ROLE_CONFIG_PATTERN, type ReveriesInit, type TrustStore } from "./protocol.ts";
 
 /**
  * The ledger envelope branch name, without its `refs/heads/` prefix.
@@ -1201,15 +1201,19 @@ async function convergeLocalIntegration(
     // remote no longer publishes, because a mirror, an archive, and an import
     // source are non-publishing roles by definition.
     const known = new Set(await configuredRemoteNames(repository));
-    const declared = await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
+    // Both role encodings are read. A role declared for a remote named
+    // `team/vendor` lives under a subsection key, and a flat-only pattern would
+    // not see it — so the pruning this is here to do would silently skip exactly
+    // the keys that keep `doctor` permanently `invalid` after the remote is gone.
+    const declared = await repository.run(["config", "--get-regexp", REMOTE_ROLE_CONFIG_PATTERN], {
       allowExitCodes: [0, 1],
     });
     for (const line of declared.stdout.split("\n")) {
       const separator = line.indexOf(" ");
       if (separator <= 0) continue;
       const key = line.slice(0, separator);
-      const remote = key.slice("reveries.remoteRole.".length);
-      if (known.has(remote)) continue;
+      const remote = remoteFromRoleConfigKey(key);
+      if (remote === null || known.has(remote)) continue;
       await repository.run(["config", "--unset-all", key], { allowExitCodes: [0, 1, 5] });
     }
   }
@@ -2087,12 +2091,24 @@ export async function ownedTrustConfigKeys(repository: GitRepository): Promise<r
     const result = await repository.run(["config", "--get", key], { allowExitCodes: [0, 1] });
     if (result.exitCode === 0 && result.stdout.trim() !== "") keys.add(key);
   }
-  const roles = await repository.run(["config", "--get-regexp", "^reveries\\.remoteRole\\."], {
+  // Both role encodings, so a role declared for a slash remote is actually
+  // removed. A flat-only pattern leaves those keys behind, and a key that
+  // outlives the behaviour it described misleads the next reader.
+  //
+  // Only genuine role declarations are claimed. A `reveries.remoteRole/team.x`
+  // key that is not a role is a different setting that merely shares the
+  // prefix, and removal does not own it — clearing it would delete
+  // configuration Reveries never created. Flat keys are unaffected: under the
+  // flat encoding every key in this prefix is a role declaration.
+  const roles = await repository.run(["config", "--get-regexp", REMOTE_ROLE_CONFIG_PATTERN], {
     allowExitCodes: [0, 1],
   });
   for (const line of roles.stdout.split("\n")) {
     const separator = line.indexOf(" ");
-    if (separator > 0) keys.add(line.slice(0, separator));
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator);
+    if (remoteFromRoleConfigKey(key) === null) continue;
+    keys.add(key);
   }
   return [...keys].sort();
 }

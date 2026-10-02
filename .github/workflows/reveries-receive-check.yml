@@ -12,8 +12,24 @@ jobs:
   receive-check:
     name: Reveries receive-check
     runs-on: ubuntu-latest
+    # Read-only, and no permission is added for the binding. The binding travels
+    # as an artifact of this run, and artifact upload uses the Actions runtime
+    # rather than the token, so recording it needs nothing here.
+    #
+    # That is deliberate. A custom check run would need `checks: write`, and a
+    # same-repository pull request can add a workflow that requests the same
+    # permission and post a look-alike check under the same `github-actions` App
+    # identity. An artifact cannot be forged that way: artifacts belong to one run
+    # and only that run can upload to it.
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       REVERIES_REQUIRED_CHECK: Reveries receive-check
+      # Job-level, because the producer step and the upload step must agree and a
+      # step-scoped `env:` does not reach later steps. The producer script writes
+      # to $BINDING_DIR and the upload step reads the file from the same directory.
+      BINDING_DIR: ${{ runner.temp }}/reveries-binding
     steps:
       - name: Check out the trusted base revision
         uses: actions/checkout@v7
@@ -27,3 +43,22 @@ jobs:
 
       - name: Run the pinned receive check
         uses: ./.github/actions/reveries-receive-check
+
+      # Only after the check passes, and only from the trusted base revision's copy
+      # of the script. The binding records the pull request number, head, and base
+      # the checker validated, so the controlled-merge bot can tell a check that
+      # describes *this* merge from one left over from before the base moved.
+      - name: Record the base and head binding
+        if: success()
+        run: node scripts/publish-receive-check-binding.mjs
+
+      - name: Publish the binding as an artifact of this run
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reveries-receive-check-binding
+          path: ${{ env.BINDING_DIR }}/binding.json
+          if-no-files-found: error
+          # Long enough to merge, short enough that a stale binding does not
+          # linger. An expired artifact is a refusal, never a fallback.
+          retention-days: 7

@@ -815,11 +815,11 @@ test("ledger requires a known action", async () => {
 
   const missing = captureIo(directory);
   assert.equal(await runCli(["ledger"], missing.io), 3);
-  assert.match(missing.stderr(), /status, build, or materialize/);
+  assert.match(missing.stderr(), /status, build, materialize, or quarantine/);
 
   const unknown = captureIo(directory);
   assert.equal(await runCli(["ledger", "frobnicate"], unknown.io), 3);
-  assert.match(unknown.stderr(), /status, build, or materialize/);
+  assert.match(unknown.stderr(), /status, build, materialize, or quarantine/);
 });
 
 test("help documents the ledger command", async () => {
@@ -830,7 +830,11 @@ test("help documents the ledger command", async () => {
 
   const topic = captureIo(directory);
   assert.equal(await runCli(["help", "ledger"], topic.io), 0);
-  assert.match(topic.stdout(), /reveries ledger <status\|build\|materialize>/);
+  assert.match(topic.stdout(), /reveries ledger <status\|build\|materialize\|quarantine>/);
+  // The help names the namespace hazard, because an operator who reaches for
+  // `git notes --ref=` on a quarantine ref gets a silent false negative.
+  assert.match(topic.stdout(), /not a notes ref/);
+  assert.match(topic.stdout(), /reveries ledger quarantine show/);
 });
 
 test("ledger build advances the envelope over the current notes", async () => {

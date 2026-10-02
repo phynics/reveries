@@ -98,6 +98,19 @@ one publishing remote has an unambiguous source, one with several is unconfigure
 only a configuration that contradicts itself, such as two declared primaries or a role
 for a remote that does not exist, is a diagnostic.
 
+A remote name may contain a slash (`team/vendor` is a real Git remote), and Git rejects
+`reveries.remoteRole.team/vendor` as an invalid key, so such a remote is declared through
+the subsection key `reveries.remoteRole/team.vendor.role`. The two encodings are additive
+and read together: a slash-free name keeps the flat key byte for byte, so declaring a role
+never rewrites existing configuration. All four readers — the command layer's writer,
+init convergence, removal, and core resolution — go through one shared pattern and parser,
+because a reader that sees only flat keys does not fail loudly: it reports no role at all
+and leaves authority silently unconfigured. A tracking ref for such a remote resolves by
+longest exact `refs/remotes/<name>/` prefix, so `refs/remotes/team/vendor/reveries-ledger`
+belongs to `team/vendor` and not to `team`; the command layer and the library apply the same
+matcher, so a first-segment read cannot apply one remote's role to another remote's
+evidence.
+
 A sync from a non-primary remote runs the identical full-snapshot validation and then has
 promotion withheld: the candidate is preserved at
 `refs/reveries/quarantine/<remote>/<oid>` and `refs/notes/reveries` is left unchanged.
@@ -141,6 +154,16 @@ init` rolls back a newly created key when the store write fails, so the retry su
 an existing key is never removed. `trust add` accepts only a PEM public key, normalises it
 to SPKI before touching the store, and names the formats it refuses rather than surfacing a
 decoder error.
+
+RVR-030: a quarantined candidate is preserved at `refs/reveries/quarantine/<remote>/<oid>`,
+which is outside `refs/notes/`, and `git notes --ref=` cannot read it — it resolves
+`refs/notes/refs/reveries/...` instead, reports no note, and exits successfully. The write and
+the read are wrong in the same direction, so the failure is silent and an operator inspecting
+a quarantine concludes there is nothing to inspect. `reveries ledger quarantine list|show` is
+therefore the supported inspection path: it reads the candidate's own tree and each note body
+at that tree, recovers the remote from the ref so a slash-containing name keeps its whole
+name, treats an empty quarantine as the ordinary state rather than damage, and refuses a
+`refs/notes/…` name rather than reading the shadow ref.
 
 Two boundaries remain open and nothing here is a claim about them. `receive.ts` verifies
 the envelope but cannot enforce "only the primary may publish", because it has no notion of

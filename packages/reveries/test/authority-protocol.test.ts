@@ -5,6 +5,10 @@ import {
   authorityId,
   originStreamRef,
   ORIGIN_REF_PREFIX,
+  parseRemoteRoleConfigLines,
+  remoteFromRoleConfigKey,
+  remoteRoleConfigKey,
+  REMOTE_ROLE_CONFIG_PATTERN,
   REMOTE_ROLES,
   resolveAuthorityRoles,
   rolePromotion,
@@ -173,4 +177,79 @@ test("an origin ref is recognized only for its own prefix", () => {
   // This is the guard that keeps an origin stream evidence rather than code: a
   // branch that merely starts with `reveries-` must not inherit the exemption.
   assert.equal(originStreamRef("north").startsWith(ORIGIN_REF_PREFIX), true);
+});
+
+// --- Role configuration keys for slash-containing remote names ----------------
+//
+// Git permits a remote named `team/vendor` but rejects the flat key
+// `reveries.remoteRole.team/vendor` outright, so a slash remote needs the
+// subsection encoding. Reading it back is where this goes wrong, and it goes
+// wrong quietly: on git 2.39.5 a `--get-regexp` pattern that stops at the
+// subsection boundary matches nothing, so narrowing the pattern does not raise
+// an error — it makes the role unreadable and leaves authority silently
+// `unconfigured`. These tests pin the encoding and the pattern together.
+
+test("a slash-free remote keeps the legacy flat key byte for byte", () => {
+  // Adopting a slash remote must not rewrite configuration a repository
+  // already has.
+  assert.equal(remoteRoleConfigKey("origin"), "reveries.remoteRole.origin");
+  assert.equal(remoteRoleConfigKey("team"), "reveries.remoteRole.team");
+  // A name with dots stays flat: the flat form is chosen by the absence of `/`,
+  // not by the absence of a dot.
+  assert.equal(remoteRoleConfigKey("a.b"), "reveries.remoteRole.a.b");
+});
+
+test("a slash remote uses the subsection key Git can actually store", () => {
+  assert.equal(remoteRoleConfigKey("team/vendor"), "reveries.remoteRole/team/vendor.role");
+  // A name that itself ends in `.role` is still written unambiguously, because
+  // the reader strips exactly one suffix.
+  assert.equal(remoteRoleConfigKey("team/vendor.role"), "reveries.remoteRole/team/vendor.role.role");
+});
+
+test("both encodings round-trip to the remote they declare", () => {
+  for (const remote of ["origin", "a.b", "team/vendor", "team/vendor.role", "a/b/c"]) {
+    assert.equal(
+      remoteFromRoleConfigKey(remoteRoleConfigKey(remote)),
+      remote,
+      `expected ${remote} to round-trip through its own key`,
+    );
+  }
+});
+
+test("a key that is not a role declaration is not read as one", () => {
+  // A decoy sharing the prefix is a different key. Treating it as a role would
+  // invent an authority boundary nobody declared.
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRole/team.someOtherSetting"), null);
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRole.origin"), "origin");
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRole."), null);
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRole/team"), null);
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRole/"), null);
+  assert.equal(remoteFromRoleConfigKey("reveries.remoteRoles.origin"), null);
+  assert.equal(remoteFromRoleConfigKey("core.bare"), null);
+});
+
+test("both encodings are read together, and a decoy subsection is ignored", () => {
+  const roles = parseRemoteRoleConfigLines([
+    "reveries.remoteRole.origin primary",
+    "reveries.remoteRole/team/vendor.role import-only",
+    "reveries.remoteRole/team.someOtherSetting hello",
+  ].join("\n"));
+  assert.deepEqual(roles, { origin: "primary", "team/vendor": "import-only" });
+  assert.equal("team.someOtherSetting" in roles, false, "a decoy must never become a role");
+});
+
+test("an empty configuration declares no roles", () => {
+  assert.deepEqual(parseRemoteRoleConfigLines(""), {});
+  assert.deepEqual(parseRemoteRoleConfigLines("\n\n"), {});
+});
+
+test("the read pattern is the one that actually matches a subsection key", () => {
+  // Guards the specific narrowing that fails open on git 2.39.5. Each of these
+  // narrower patterns returns zero rows when a subsection key exists, so a
+  // "simplification" to any of them silently hides every slash remote's role.
+  assert.match(REMOTE_ROLE_CONFIG_PATTERN, /\[\.\/\]/, "the pattern must cover both encodings");
+  assert.equal(REMOTE_ROLE_CONFIG_PATTERN, "^reveries\\.remoteRole[./]");
+  // A trailing `/` is exactly as broken as no suffix at all.
+  assert.notEqual(REMOTE_ROLE_CONFIG_PATTERN, "^reveries\\.remoteRole/");
+  assert.notEqual(REMOTE_ROLE_CONFIG_PATTERN, "^reveries\\.remoteRole\\.");
 });

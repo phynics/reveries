@@ -25,7 +25,8 @@ import {
   readLedgerManifest,
   redactionPayload,
   recordFactId,
-  remoteRole,
+  REMOTE_ROLE_CONFIG_PATTERN,
+  parseRemoteRoleConfigLines,
   resolutionPayload,
   resolveAuthorityRoles,
   resolveLimits,
@@ -3126,33 +3127,10 @@ export class Reveries {
    */
   private async readRemoteRoles(): Promise<Record<string, RemoteRole>> {
     const result = await this.repository.run(
-      ["config", "--get-regexp", "^reveries\\.remoteRole[./]"],
+      ["config", "--get-regexp", REMOTE_ROLE_CONFIG_PATTERN],
       { allowExitCodes: [0, 1] },
     );
-    const roles: Record<string, RemoteRole> = {};
-    for (const line of result.stdout.split("\n")) {
-      if (line.trim().length === 0) continue;
-      // `--get-regexp` prints "<key> <value>" separated by the first space, and a
-      // remote name cannot contain whitespace, so the split is unambiguous.
-      const separator = line.indexOf(" ");
-      if (separator < 0) continue;
-      const key = line.slice(0, separator);
-      if (key.startsWith("reveries.remoteRole.")) {
-        const remote = key.slice("reveries.remoteRole.".length);
-        if (remote.length === 0) continue;
-        roles[remote] = remoteRole(line.slice(separator + 1).trim());
-        continue;
-      }
-      // Subsection form: `reveries.remoteRole/<remote>.role`. Anything else
-      // under the prefix is not a role declaration and is ignored rather
-      // than misread.
-      const subsection = key.slice("reveries.remoteRole/".length);
-      if (!subsection.endsWith(".role")) continue;
-      const remote = subsection.slice(0, -".role".length);
-      if (remote.length === 0) continue;
-      roles[remote] = remoteRole(line.slice(separator + 1).trim());
-    }
-    return roles;
+    return parseRemoteRoleConfigLines(result.stdout);
   }
 
   /**
@@ -3173,6 +3151,26 @@ export class Reveries {
 
   private async configuredRemoteNames(): Promise<readonly string[]> {
     return (await this.repository.run(["remote"])).stdout.trimEnd().split("\n").filter(Boolean);
+  }
+
+  /**
+   * The configured remote a remote-tracking revision belongs to, or null.
+   *
+   * `refs/remotes/<remote>/reveries-ledger` is the shape an operator names by
+   * hand, and the remote in it is exactly whose evidence the revision carries.
+   *
+   * This is the single entry point for that question. The matcher resolves by
+   * longest exact `refs/remotes/<name>/` prefix, so a remote whose name contains
+   * a slash (`team/vendor`) resolves to itself rather than to its first segment
+   * — and the command layer calls this instead of parsing the ref itself. It
+   * previously did, and the two answers disagreed: the command layer read
+   * `team` from `refs/remotes/team/vendor/reveries-ledger` and applied *that*
+   * remote's role to another remote's evidence, refusing promotions the direct
+   * API allowed. One question, one answer.
+   */
+  async trackingRemote(revision: string | undefined): Promise<string | null> {
+    if (revision === undefined) return null;
+    return matchTrackingRefRemote(revision, await this.configuredRemoteNames());
   }
 
   /**
@@ -3409,9 +3407,7 @@ export class Reveries {
         diagnostic: `Authority configuration is invalid, so no envelope may become canonical state: ${authority.diagnostics.join("; ")}`,
       };
     }
-    const match = revision === undefined
-      ? null
-      : matchTrackingRefRemote(revision, await this.configuredRemoteNames());
+    const match = await this.trackingRemote(revision);
     const remote = match ?? null;
     if (remote === null) {
       // An explicit revision with no configured remote-tracking provenance —

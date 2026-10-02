@@ -1121,3 +1121,65 @@ test("setup creates a complete store a concurrent reader can never see half-writ
 async function trustStorePathFor(directory: string): Promise<string> {
   return (await readLocalTrustStore((await GitRepository.open(directory)))).path;
 }
+
+// --- Roles for slash-containing remote names --------------------------------
+//
+// Git permits a remote named `team/vendor` and rejects the flat key
+// `reveries.remoteRole.team/vendor` outright, so the role is declared through
+// the subsection key `reveries.remoteRole/team/vendor.role`. Both of the reads
+// below used to use a flat-only `git config --get-regexp` pattern, and on git
+// 2.39.5 such a pattern returns zero rows for a subsection key. That fails
+// quietly: convergence stops pruning the dangling role that keeps `doctor`
+// permanently `invalid`, and removal leaves a key behind that outlives the
+// behaviour it described.
+
+test("initialization drops a slash remote's role once that remote is gone", async () => {
+  const directory = await fresh("slash-role-converge-");
+  await git(directory, "remote", "add", "team/vendor", "https://example.invalid/team-vendor.git");
+  await git(directory, "config", "reveries.remoteRole.origin", "primary");
+  await git(directory, "config", "reveries.remoteRole/team/vendor.role", "import-only");
+  // A different key sharing the prefix. Convergence must leave it alone: the
+  // role writer does not own it.
+  await git(directory, "config", "reveries.remoteRole/team.someOtherSetting", "hello");
+
+  await git(directory, "remote", "remove", "team/vendor");
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team/vendor.role"),
+    "",
+    "a role for a deleted remote is a permanent contradiction and must be dropped",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole.origin"),
+    "primary",
+    "a role for a remote that still exists is kept",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team.someOtherSetting"),
+    "hello",
+    "a key that is not a role declaration is not convergence's to remove",
+  );
+});
+
+test("removal clears a slash remote's role and ignores a decoy subsection", async () => {
+  const directory = await fresh("slash-role-removal-");
+  await git(directory, "config", "reveries.remoteRole/team/vendor.role", "import-only");
+  await git(directory, "config", "reveries.remoteRole/team.someOtherSetting", "hello");
+
+  const result = await remove(directory);
+
+  assert.ok(
+    result.removedTrustConfig.includes("reveries.remoteRole/team/vendor.role"),
+    `expected the subsection role key to be owned, got ${JSON.stringify(result.removedTrustConfig)}`,
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team/vendor.role"),
+    "",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team.someOtherSetting"),
+    "hello",
+    "removal must not clear a key that is not a role declaration",
+  );
+});

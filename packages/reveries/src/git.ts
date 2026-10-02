@@ -330,6 +330,18 @@ export const NOTES_TXN_REF_PREFIX = "refs/notes/reveries-txn/";
  */
 export const QUARANTINE_REF_PREFIX = "refs/reveries/quarantine/";
 
+/** One preserved, unpromoted notes candidate, as reported by the repository. */
+export interface QuarantinedCandidate {
+  /** The canonical quarantine ref. Never a `refs/notes/` name. */
+  readonly ref: string;
+  /** The remote whose fetch produced the candidate, slashes included. */
+  readonly remote: string;
+  /** The notes commit the ref points at, and the thing to read the bytes from. */
+  readonly candidate: ObjectId;
+  /** Committer-date of the quarantine ref, or null when Git reports none. */
+  readonly createdAtUnix: number | null;
+}
+
 /**
  * The configured remote a remote-tracking revision belongs to, or null when it
  * names none.
@@ -1832,6 +1844,48 @@ export class GitRepository {
     const ref = `${QUARANTINE_REF_PREFIX}${remote}/${candidate}`;
     await this.run(["update-ref", ref, candidate]);
     return ref;
+  }
+
+  /**
+   * Every quarantined candidate, newest first, with the remote it came from.
+   *
+   * This is the supported way to find a quarantine, and it exists because the
+   * obvious alternative is a silent false negative. `git notes --ref=` does not
+   * accept a ref outside `refs/notes/`: given
+   * `refs/reveries/quarantine/<remote>/<oid>` it resolves
+   * `refs/notes/refs/reveries/quarantine/...` instead, so the command reports
+   * "no note found" for a candidate that is sitting right there. Write and read
+   * then agree in the wrong direction, and an operator inspecting a quarantine
+   * during an incident concludes there is nothing to inspect.
+   *
+   * The remote is recovered from the ref rather than trusted from a caller,
+   * because the ref is the record. A remote name may contain slashes
+   * (`team/vendor`), so the remote is everything between the prefix and the
+   * trailing object ID — a first-segment split would report `team` for a
+   * candidate fetched from `team/vendor`.
+   */
+  async quarantinedCandidates(): Promise<readonly QuarantinedCandidate[]> {
+    const result = await this.run(
+      ["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname) %(committerdate:unix)", QUARANTINE_REF_PREFIX],
+      { allowExitCodes: [0, 1] },
+    );
+    const candidates: QuarantinedCandidate[] = [];
+    for (const line of result.stdout.split("\n")) {
+      if (line.trim().length === 0) continue;
+      const parts = line.split(" ");
+      const ref = parts[0];
+      const candidate = parts[1];
+      if (ref === undefined || candidate === undefined) continue;
+      const scope = ref.slice(QUARANTINE_REF_PREFIX.length);
+      const remote = scope.slice(0, Math.max(0, scope.length - candidate.length - 1));
+      candidates.push({
+        ref,
+        remote,
+        candidate: objectId(candidate),
+        createdAtUnix: parts[2] === undefined || parts[2] === "" ? null : Number(parts[2]),
+      });
+    }
+    return candidates;
   }
 
   /**
