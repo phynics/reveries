@@ -1147,29 +1147,52 @@ It performs:
 
 Agent startup never performs network access automatically.
 
-Before substantial shared work, the Skill requires an explicit pull or a clear statement that local Reveries state may be stale.
+#### 17.2.1 Inspecting a quarantine
 
-### 17.3 Local write locking
+A quarantine ref lives at `refs/reveries/quarantine/<remote>/<oid>`, which is outside `refs/notes/`.
+`git notes --ref=` does not reject that name: given it, git resolves
+`refs/notes/refs/reveries/quarantine/<remote>/<oid>` instead, reports no note, and exits
+successfully. The write and the read are therefore wrong in the same direction, and the failure is
+silent — an operator inspecting a quarantine during an incident concludes the quarantine is empty
+while the candidate sits there intact. Nothing in the design may tell an operator to run
+`git notes --ref=` against a quarantine ref.
 
-The helper serializes notes-ref writes with a lock under the common Git directory:
+Inspection therefore goes through the command layer, which reaches the bytes as Git objects and
+does not depend on the namespace the commit was reached through:
 
-```text
-<git-common-dir>/reveries/write.lock
+```bash
+reveries ledger quarantine list
+reveries ledger quarantine show refs/reveries/quarantine/<remote>/<oid>
 ```
 
-This covers linked worktrees.
+`list` reports every preserved candidate with the remote recovered from the ref — a remote name
+containing a slash keeps its whole name, since the remote is everything between the prefix and the
+trailing object ID. An empty quarantine is the ordinary state of a repository that has never
+refused evidence, so it is reported and exits zero rather than being treated as damage.
 
-A write:
+`show` reads the candidate's own tree and each note body at that tree. It refuses a `refs/notes/…`
+name instead of quietly reading the shadow ref, because that shadow name is exactly the confusion
+the command exists to remove, and refuses an absent ref by pointing at `list` rather than reporting
+an empty result. Inspection never moves canonical state.
 
-1. acquires the lock;
-2. reads the current notes-ref tip;
-3. validates existing note content;
-4. applies the mutation;
-5. verifies the result;
-6. updates the ref;
-7. releases the lock.
+Before substantial shared work, the Skill requires an explicit pull or a clear statement that local Reveries state may be stale.
 
-If another process changes the ref outside the lock, the helper retries from the new tip or refuses with a concurrency error.
+### 17.3 Local write concurrency
+
+The helper publishes notes-ref writes without a lock. A write:
+
+1. reads the current notes-ref tip;
+2. validates existing note content;
+3. applies the mutation onto a unique temporary ref under `refs/notes/reveries-txn/`;
+4. verifies the result;
+5. updates `refs/notes/reveries` with the old tip as a compare-and-swap guard.
+
+If another process changes the ref first, the helper retries from the new tip with exponential
+backoff and jitter, then fails with a bounded contention error after its attempt budget. Linked
+worktrees share the same refs, so the compare-and-swap guard covers them. A writer that dies
+mid-write leaves only a disposable temporary ref and loose objects; `doctor` reports them and the
+helper can prune them. No process can block future writes by holding a stale lock. The guard also
+detects writers that bypass the helper.
 
 ---
 
@@ -1230,8 +1253,10 @@ git push --no-verify origin HEAD
 
 The second command must run only after the first succeeds. This avoids code-before-evidence but is
 not atomic: a later code push can still omit notes, and a failure between the two commands leaves
-the remote with evidence ahead of code. The `--no-verify` flag is an explicit bypass of the local
-raw-publication guard. Use receive-side enforcement when this distinction matters.
+the remote with evidence ahead of code. The `--no-verify` flag skips the entire configured pre-push
+hook, not only Reveries' raw-publication guard. Inspect the hook first. Run other required checks
+separately, or do not use this fallback. Require receive-side enforcement because local hooks can be
+bypassed.
 
 ### 18.5 Pre-push enforcement
 
@@ -1854,7 +1879,433 @@ Checks:
 * adapter status;
 * initialization boundary;
 * notes divergence;
-* record damage.
+* record damage;
+* retention policy, vault coverage, and the annotated subjects a vault misses;
+* ledger envelope state: absent, valid, stale, or invalid;
+* signature state, per trust state, and whether the checkpoint is attested;
+* primary authority, and each configured mirror's agreement with the primary;
+* the local trust store: where it is, how many keys it holds, how many are revoked,
+  and whether a signing key is loaded.
+
+The last four each get their own line rather than appearing only inside the generic notice
+list, because an operator reads them as four separate questions. The matching notices are
+suppressed so no fact is printed twice. An unconfigured repository is not thereby damaged:
+an absent trust store, an unsigned repository, an unknown key, and an inferred primary are
+all ordinary states that contribute notices only.
+
+A retention gap is a diagnostic, not a notice: an annotated object the vault does not
+keep can be pruned, which would leave the evidence explaining bytes Git no longer has.
+
+The ledger reports four states, and only one of them is damage. `absent` means the
+repository never adopted the ledger. `valid` means the envelope verifies against its own
+manifest, tree, and parents and describes the current notes tip. `stale` means the
+envelope is structurally sound but the local notes ref has moved past it, which is an
+ordinary unpublished state. `invalid` means the envelope contradicts itself, and that
+is a diagnostic.
+
+### 27.3.1 Ledger envelope branch
+
+`refs/heads/reveries-ledger` carries evidence through ordinary branch fetches. A custom
+notes ref is not fetched by a normal clone and is barely represented by hosted branch
+governance, so the envelope makes the notes state reachable without either.
+
+```text
+refs/heads/reveries-ledger
+└── commit  "Reveries ledger checkpoint\n"
+    tree:
+      100644 blob  <manifest.json>
+      040000 tree  <exact notes tree OID>   notes/
+    parents, in this exact order:
+      [0] previous ledger commit      (absent only on a genesis checkpoint)
+      [1] notes commit                (absent only when no notes exist)
+      [2] retention checkpoint        (optional)
+```
+
+The `notes` entry is the existing notes tree grafted at its own object ID. Nothing is
+copied, so the envelope adds no note blobs, and the tree entry stays directly comparable
+to the manifest field that names it. Grafting by object ID is layout-agnostic: Git uses a
+flat notes tree below 256 notes and a fanout tree above.
+
+A checkpoint uses the fixed `Reveries Ledger <ledger@reveries.local>` identity and a fixed
+epoch date, the same construction the retention vault already uses, so a checkpoint
+rebuilt from the same evidence reproduces the same object ID. That is why the manifest
+carries no timestamp of its own: RVR-009 signs these canonical bytes instead.
+
+`manifest.json` is not a note record. It describes the notes boundary rather than living
+inside it, so it does not inherit note placement, union, or fork rules. Its fields are
+the protocol version, both ref names, the notes commit and notes tree, the previous
+ledger, the optional retention checkpoint, the reserved `authority` name, and three
+informational totals recomputed from the grafted tree. `authority` has exactly one
+documented value today, the configured primary remote name; RVR-017 gives it role
+semantics and RVR-009 signs it, so both extend a stable field instead of breaking the
+schema.
+
+Verification fails closed on the three structural classes, and reports the fourth:
+
+| Class | Outcome |
+| --- | --- |
+| manifest | rejects a body that is absent, malformed, noncanonical, or that describes a different envelope |
+| tree | rejects a tree entry beyond `manifest.json` and `notes`, or a `notes` subtree whose OID is not the manifest's `notes_tree` |
+| parent | rejects a parent list that is not exactly `[previous ledger, notes commit, retention checkpoint]` in that order, a dangling parent, or a retention parent that is not a retention checkpoint |
+| notes tip | does not reject: a local `refs/notes/reveries` that has moved past the envelope is reported as `stale`, because unpublished notes are an ordinary state and not damage |
+
+Updates are fast-forward by construction: the previous ledger is always the first
+parent, and the branch moves only through an expected-old-OID compare-and-swap, so a
+non-fast-forward ledger update is impossible rather than merely reported.
+
+A build is refused outright while the authority configuration is `invalid`, before the checkpoint
+exists: two declared primaries, or a role for a remote that does not exist, means the repository
+cannot say which remote it publishes for. A refused build writes no branch tip and produces no
+attestation. The same rule fails a `sync --pull` closed before it fetches anything.
+
+`build` reports and renders the authority the checkpoint actually carries. That value is read back
+out of the built manifest rather than recomputed from the flags, so the report cannot drift from the
+bytes: an explicit `--authority` naming a mirror or an unrecognised remote is recorded and reported
+as given, and `--no-authority` reports `null` as a real value rather than falling back to the
+primary. The resolved primary is reported alongside it as a separate field, and the human line shows
+the divergence when the two differ, so a deliberately non-primary stamp is visible instead of silent.
+
+A build is an **append, never an idempotent no-op.** The manifest names
+`previous_ledger`, so a second build over identical notes cannot reproduce the previous
+manifest, and each build is a new checkpoint whose attestation covers its own manifest.
+The signature entry grows accordingly: the earlier line is carried forward byte-identically
+and a new one is appended. An operator wiring `build` into a loop should know that a repeat
+call is a real new checkpoint, not a no-op; idempotence belongs to `materialize` and to
+publication against an unchanged ref, both of which *do* detect that nothing moved.
+
+Updates are append-only in the strong sense. The check compares per-subject canonical
+line sets between the previous checkpoint and the new one, so appending a line inside one
+note is allowed while removing a line is rejected even when the subject still exists and
+the blob object ID changed. A proposed checkpoint is verified as a loose object before it
+can become the branch tip, so a failed check moves no ref.
+
+Materializing the local notes ref verifies the envelope first and only then moves
+`refs/notes/reveries` to the manifest's notes commit under the same expected-old-OID
+guard. It never runs against an unverified envelope.
+
+The role applies to the envelope route on its own terms, not only inside a sync. An explicitly named
+`reveries ledger materialize refs/remotes/<remote>/reveries-ledger` resolves the remote from the ref
+it was given and applies the same rule: a `mirror` or `import-only` remote's envelope transports
+exactly the notes that route quarantined, so materializing it explicitly is refused. Otherwise the
+gate would exist only until an operator typed a different command. A remote with no declared role
+still materializes, so a repository that never adopted roles is unaffected, and a contradictory
+authority configuration refuses every materialization, because a repository that cannot say which
+remote is authoritative has not authorized anything.
+
+`refs/heads/reveries-ledger` lives under `refs/heads` but carries evidence, not code, so
+the outgoing checker excludes it from session-summary and transition coverage while still
+verifying its envelope.
+
+### 27.3.2 Signatures and signed checkpoints
+
+A semantic record claims who typed an email address. A signature claims who holds a key.
+The two are separate facts, and keeping them separate is what makes key rotation harmless.
+
+#### The `signature` record
+
+A signature is an immutable, ID-bearing `signature` record on the annotated subject's note:
+
+```jsonc
+{
+  "v": 1,
+  "type": "signature",
+  "id": "sg:<object-id>",           // this record's own content, never the target's
+  "domain": "reveries/v1/record",    // or reveries/v1/ledger-manifest
+  "role": "author",                  // author | reviewer | publisher
+  "target": "rv:<object-id>",        // or tr:, cr:, rs:, rd:, or ledger-manifest
+  "subject": "<object-id>",          // the annotated object
+  "signer": "alice@example.test",    // stable identity; survives rotation
+  "key_id": "SHA256:<fingerprint>",  // key material identity; this is what rotates
+  "algorithm": "ed25519",
+  "signature": "<base64>",
+  "content_id": "<object-id>",       // the target's exact canonical bytes
+  "author_email": "...", "session": null, "created_at": "..."
+}
+```
+
+Every ID-bearing fact is a valid `target`, including a redaction: redactions are never
+supersession heads, but a reviewer may still attest that one was deliberate. A record with
+no stable identity — a session summary, an init record, a publication attestation — cannot
+be attested, because a signature over it would name a target no reader could resolve.
+
+#### What a signature commits to
+
+The signed payload is canonical JSON over exactly eight fields:
+
+```text
+v, domain, role, target, subject, signer, algorithm, content_id
+```
+
+It omits the signature itself, the record ID, and all author metadata. That omission is
+deliberate: a signature must stay verifiable across a metadata-only rewrite while remaining
+bound to the exact content it attests.
+
+`content_id` is the repository object ID of the target's **canonical bytes** — the record's
+canonical line without its trailing LF, or `ledgerManifestPayload` for a checkpoint — taken
+through the repository's own object algorithm, so SHA-1 and SHA-256 repositories both work
+with no format branching. Binding a hash rather than the bytes keeps a signature line inside
+the per-record size budget, and it also means a signature covers the full canonical line,
+`author_email` included, which `id` alone does not.
+
+`domain` is inside the signed payload, so a signature produced for a fact record can never
+be replayed as a checkpoint signature. `ledger-manifest` is reachable only under the manifest
+domain, so a record-domain signature cannot claim to have attested a checkpoint.
+
+Author metadata is outside the signed payload, and it is outside the `sg:` ID as well.
+`signatureIdentityPayload` covers the attestation's causal fields, `key_id`, and the signature
+bytes; it does not cover `author_email`, `session`, or `created_at`. Rewriting any of those three
+therefore changes **neither** the signed payload **nor** the record ID, and the signature remains
+`policy-satisfying`: the attestation still says the same thing about the same target, and the
+record's own provenance is simply unclaimed. That is a deliberate division. The signature attests
+*what was signed*; the record's metadata records *who ran the helper and when*, and a reader who
+needs that provenance authenticated has to get it from somewhere other than an unkeyed hash. No
+output presents those three fields as attested, and the ledger's fixed epoch timestamp is never
+rendered as a signing time.
+
+`key_id` is a different case and is worth being precise about. It is *not* in the signed payload,
+so a verifier resolves the key by `key_id` and the payload binds `signer` and `content_id`
+instead. Substituting a `key_id` changes the record's ID and, for any key the local store does not
+hold, resolves the signature to `unknown` rather than to `trusted`. Tampering with `content_id`
+is what the cryptographic verdict actually catches, because `content_id` is inside the payload.
+
+#### Why `sg:` and not a field on the record it signs
+
+`rv:`, `tr:`, `cr:`, `rs:`, and `rd:` are content hashes of causal fields only. A signature
+must therefore never enter one of those payloads: if `signer` were a field of
+`ReverieSemantic`, rotating a key would change the decision ID. A signature instead carries
+its own `sg:` identity, derived from its own content, and references its target by ID. So
+key rotation is a pure append: the same record gains a second `signature` and every semantic
+ID is byte-identical. `signer` is the stable identity and `key_id` is the rotating one, which
+is what lets a trust store move a signer from one key to another without touching evidence.
+
+Signatures are ordinary monotonic facts. N distinct signatures may share one `target`, which
+is what a rotation and a multi-role review both produce, and only two records claiming the
+**same** `sg:` ID with different content are a fork.
+
+#### Trust state
+
+Trust is a strict refinement, so each state is a strictly stronger claim and no signature
+satisfies two of them:
+
+| State | Means |
+| --- | --- |
+| `unknown` | The key is not in the trust store. Nothing is claimed. |
+| `valid` | The bytes verify, but no trust store entry binds this key to this signer. Cryptographic validity is not identity. |
+| `trusted` | The bytes verify and the trust store binds this key to this signer. |
+| `policy-satisfying` | `trusted`, and the signed role is one the policy requires. |
+| `invalid` | A known key whose bytes do not verify. |
+| `revoked` | A key the trust store has explicitly revoked. |
+
+Trust is resolved before the cryptographic verdict: an unknown key is `unknown` even when its
+bytes do not verify, because unverifiable material about a key we know nothing about is not a
+claim of forgery. `invalid` and `revoked` are states, not deletions — the record stays in the
+note bytes and stays reported, so a reader can always see that an attestation once existed
+and why it no longer counts.
+
+#### `reveries.signingRoles`
+
+```bash
+git config reveries.signingRoles author,reviewer
+```
+
+A comma-separated role list, in the order written. An absent or empty key requires no role,
+and then `trusted` is the honest ceiling: no signature can reach `policy-satisfying`. An
+unknown role is refused with a diagnostic naming the offending value and the valid set,
+because silently ignoring a typo would leave a repository believing it has a policy it does
+not have. An explicit `requiredRoles` option overrides the key outright, including an
+explicit empty list, so a caller's stated intent is never silently overridden by
+configuration.
+
+#### The growing append-only signature log
+
+A checkpoint's `signatures` tree entry is an **append-only log of manifest attestations**,
+not a set of current signatures. A signature covers one manifest, so every checkpoint
+necessarily has a different one; a new checkpoint therefore carries the previous
+checkpoint's lines forward and appends its own. Verification enforces three rules: once a
+chain is signed it stays signed, no line is ever dropped or rewritten, and the newest line's
+`content_id` must equal the hash of this checkpoint's manifest. A fourth tree entry is still
+refused, so RVR-009 extended RVR-005's two-entry allow-list to exactly three and no further.
+
+The manifest signature binds the notes, ledger, and retention tips because all three are
+inside `ledgerManifestPayload`, which RVR-005 made byte-reproducible and which RVR-009
+therefore signs unchanged. No manifest field was added, so the manifest's reproducibility
+guarantee and its schema-drift test both stand. A signed checkpoint is still reproducible:
+the signature carries a fixed epoch timestamp, the counterpart of the fixed
+`Reveries Ledger <ledger@reveries.local>` identity the commit already uses, and ed25519 over
+fixed bytes is deterministic.
+
+A signed annotated tag was rejected for the same checkpoint signature: tags live outside
+`refs/heads/reveries-ledger`, are not fetched by a normal clone, and are not covered by the
+append-only check, so a checkpoint's trust would depend on a ref the envelope does not
+transport.
+
+#### Verifier backends
+
+Verification runs through an injectable port; the trust vocabulary above is the contract and
+the backend is swappable. The default is an in-process ed25519 implementation with a local
+trust store, so the test suite is hermetic and needs no `ssh-keygen` and no agent. Git SSH
+`allowed_signers` support is a second implementation behind the same port and is not
+implemented yet. Private key material is never written to a repository or a note: a record
+stores only `signer`, `key_id`, and the signature bytes.
+
+The in-process backend is sufficient on its own. Writing and loading a trust store is what makes
+`trusted` and `policy-satisfying` reachable in a real repository; the SSH backend is an
+independent second implementation of the same port and is not a prerequisite for any trust state.
+
+#### The local trust store
+
+The trust store is a JSON file holding public key material and the identity each key is
+authorized to speak for:
+
+```jsonc
+{
+  "keys": [
+    {
+      "key_id": "SHA256:<hex of the SPKI DER>",  // the verifier's lookup key
+      "signer": "alice@example.test",           // the identity it may speak for
+      "revoked": false,                         // a state, never a deletion
+      "public_key": "-----BEGIN PUBLIC KEY-----\n…"
+    }
+  ]
+}
+```
+
+It lives at `reveries.trustStore` when that key is set, resolved against the repository root, and
+otherwise at `<git-common-dir>/reveries/trust.json` beside the setup lock. That location is
+load-bearing: no clone and no fetch delivers it, so a trust decision stays local while the
+evidence it judges travels. A repository whose store is absent resolves every signature to
+`unknown`, which is an ordinary state and never damage. A store that is *present but malformed* is
+an error, because silently treating an unreadable trust decision as an empty one would downgrade
+every signature to `unknown` and look exactly like a repository with no trust configured.
+
+```bash
+reveries trust init --signer me@example.com --key-file ~/.config/reveries/signing.pem
+reveries trust add  --signer me@example.com --from-file ~/.config/reveries/reveries.pub.pem
+reveries trust list
+reveries trust revoke  --key SHA256:…   # signatures stay visible and report revoked
+reveries trust restore --key SHA256:…
+reveries trust remove  --key SHA256:…   # signatures stay visible and report unknown
+```
+
+`--from-file` takes a **PEM public** key (`-----BEGIN PUBLIC KEY-----`), and the `.pem` suffix in
+the examples is deliberate. An OpenSSH `ssh-ed25519 AAAA...` line is a legitimate key in a format
+the verifier cannot consume, so it is refused by name rather than stored as something that could
+never verify. An ed25519 pair can be produced as PEM with `openssl genpkey -algorithm ed25519
+-out signing.pem` followed by `openssl pkey -in signing.pem -pubout -out reveries.pub.pem`, which
+is also exactly what `reveries trust init` writes and registers for you.
+
+`trust init` is the only key-generation path, it runs only when an operator asks for it, and it
+holds three rules at once. The create is *exclusive* and the mode is `0600` from the moment the
+file exists, so there is no window in which the key is readable by another user and no way for a
+second run to replace a key the operator still depends on. The destination is checked on its
+*real* path, so a relative path, a `..` segment, and a symlinked parent all resolve to the same
+answer and none of them can place key material inside the worktree or either Git directory. And
+only the location is ever reported: no private key material appears in output, in `--json`, or in
+a diagnostic.
+
+Accepted public-key input is a PEM **public** key, and nothing else. Two formats are refused by
+name at that boundary rather than by parse failure: a PKCS#8 *private* key, which parses just as
+successfully as a public one and would otherwise be written into a file this design calls public
+material only; and an OpenSSH `ssh-ed25519` line, which is a legitimate key in a format the
+verifier cannot consume, so accepting it would register a key that could never verify. Everything
+accepted is normalised to SPKI PEM *before* the store is touched, and `key_id` is derived from the
+normalised bytes, so the stored identity and the stored key describe the same key. A non-ed25519 key
+is refused too, since only ed25519 is signed with here.
+
+`trust init` writes the private key before the trust store, so a store failure would otherwise leave
+a key behind whose only symptom on the next attempt is an EEXIST refusal. A failure rolls back the
+key file *this run created* and reports that it did so; because the create is exclusive, an existing
+key produces EEXIST before any rollback point, so a key the operator depends on is never removed. A
+failed `trust init` therefore leaves the repository as it started, and the same command succeeds on
+retry.
+
+A signer identity must be email shaped. `signLedgerManifest` records the signer identity as the
+signature's `author_email`, and the protocol validates that field as an email address, so a
+non-email identity would make a signed checkpoint impossible to construct. `trust add` refuses one
+and says why.
+
+**Identity is derived, never typed.** `reveries sign` takes a key, not a signer: the key's own
+fingerprint is looked up in the store, and a key with no non-revoked entry is refused. A key
+precedence resolves where that key comes from — `--key`, then `REVERIES_SIGNING_KEY`, then
+`reveries.signingKey` — mirroring the existing `--session` idiom. Letting the caller pass an
+identity alongside the key would let any key speak for any signer, which is precisely the gap
+between `valid` and `trusted` that the vocabulary above exists to close.
+
+Setup creates the store when it is absent and never replaces one, because initialization
+converges configuration and silently replacing a trust decision would downgrade who a repository
+is willing to believe. A store that already exists is *adopted*, whatever holds it.
+
+Creation is atomic and exclusive. Reading for absence and then renaming a temporary file over the
+path has a window between the two, in which a file created by a concurrent setup is silently
+clobbered — and the surviving content would be the empty one, discarding whatever the other writer
+trusted. The create therefore uses `link`, which fails with `EEXIST` rather than replacing, from a
+temporary file that is written and closed in full first. A concurrent reader sees either nothing or
+a complete, valid document, never a partial one, and the loser of the race re-reads and adopts what
+is actually there. This is creation only; `trust add`, `trust revoke`, and `trust restore` remain
+intentional writes that replace the store.
+
+**Removal preserves the trust store, always.** It clears configuration and deletes no trust
+material. An earlier design recorded `reveries.managedTrustStore` naming the file setup created and
+deleted that file on removal; a path marker is not proof of ownership. The store can be repointed,
+replaced, reached through a symlinked parent, or adopted from somewhere shared, and each leaves a
+marker that looks valid while naming a file the operator now depends on. Tracking a content hash to
+prove the file was unchanged would add lifecycle bookkeeping to a few hundred bytes of *public*
+local state, which is the wrong trade for a deletion nobody asked for. So there is no deletion path
+and no override flag to request one: the marker key is cleared as ordinary local configuration and
+its path is never followed.
+
+`reveries remove` therefore reports which paths it considered and that it preserved them, and
+resolves the store path *before* any `config --unset-all` so the report names the store this
+repository actually used rather than whatever the fallback resolves to afterwards. An operator who
+wants the file gone deletes one file, knowingly. Trust material is cheap to keep and cheap to
+inspect; destroying it is the one irreversible thing this command could do by accident.
+
+`reveries repair` reports the store's path and presence and neither creates nor rewrites it:
+roles, policy, and identity are per-clone decisions no initialization record describes, so
+re-deriving them would mean guessing.
+
+#### Reading signatures back
+
+`reveries verify` reports each state at face value. `unknown`, `valid`, and `trusted` are answers,
+not failures: none of them is a claim of forgery, and only `invalid` and `revoked` exit non-zero.
+
+`--require-policy` asks a different question — whether *this repository's* policy is satisfied —
+and its answer is yes only for `policy-satisfying`. It therefore fails for every weaker state,
+including `absent`, `unsigned`, `unknown`, `valid`, and `trusted`. That is the point of the flag:
+it is how an operator distinguishes "this repository has signatures" from "this repository has the
+signatures it insists on". A structurally invalid envelope always fails regardless of policy,
+because an envelope that contradicts itself is damage rather than an unmet preference.
+
+`trusted` is never quietly promoted to `policy-satisfying`, and an unset policy is not permission to
+treat them as equivalent. With `reveries.signingRoles` unset, nothing *can* be policy-satisfying, so
+`--require-policy` fails and says so, naming `reveries policy set` as the way to make the question
+answerable. Reporting "none required" there would read as though the requirement were met.
+
+A row reports `state`, `sg:` ID, `signer`, `role`, `key_id`, and `target`. It does not report
+`created_at`, by the argument above; a caveat inside a per-row listing would train readers to skip
+the line that matters.
+
+### 27.3.3 Retention policy and vault
+
+`git config reveries.retention <none|active|all|archive>` selects which annotated
+subjects the vault keeps. An unset key means `active`.
+
+| Policy | Annotated subjects kept |
+| --- | --- |
+| `none` | none; this is the only setting that removes retention. |
+| `active` | subjects carrying a reverie that the whole evidence set still projects as active. |
+| `all` | every subject the notes ref references. |
+| `archive` | `all`, unioned with every subject the vault already keeps, so coverage only grows. |
+
+The vault holds two refs. `refs/reveries/retention/objects` is a fanout tree at
+`<oid[0:2]>/<oid[2:]>` holding annotated blobs and trees. `refs/reveries/retention/commits`
+is a chain whose first parent is the previous checkpoint and whose other parents are the
+newly annotated commits, which keeps those commits reachable without copying content.
+Checkpoints use a fixed identity and a fixed epoch date, so a rebuild from the same
+evidence reproduces the same object IDs. Both refs move in one guarded ref transaction.
+
+Bundles carry the notes, ledger, and retention refs, filtered to the refs a repository
+actually has.
 
 ### 27.4 `reveries show`
 
@@ -1939,6 +2390,93 @@ reveries history rv:<id>
 ```bash
 reveries sync --status origin
 reveries sync --pull origin
+```
+
+A sync promotes on the notes route and, only when that route promoted, on the envelope route.
+The two carry the *same* evidence, so running the envelope route after a withheld or refused
+promotion would hand the decision to whichever transport is checked second. A remote whose union
+is quarantined therefore has its envelope fetched, verified, and left unmaterialized, and the
+reason is reported.
+
+A validated union that is *held* rather than promoted is a success with something to say, not a
+failure. The human line names the quarantine ref and states that the canonical ref is unchanged;
+`--json` reports `ok: true` with the explanation in a `notices` array. The `notices` key is
+emitted only when there is something to notice, so a command with no notice keeps a
+byte-identical envelope.
+
+```bash
+reveries role show
+reveries role set origin primary
+reveries role set backup mirror
+reveries role set vault archive
+reveries role set vendor import-only
+reveries role clear backup
+```
+
+Roles are declared as `reveries.remoteRole.<remote>` and resolved into at most one primary. The
+writer refuses a second `primary` and a role for a remote Git does not have, rather than writing a
+configuration that would make authority permanently `invalid`. Each command reports the *resolved*
+result, because a role only means something next to the other roles.
+
+A remote name may contain a slash (`team/vendor` is a real Git remote), and Git rejects
+`reveries.remoteRole.team/vendor` outright as an invalid key. Such a remote is therefore declared
+through the subsection encoding, and the two forms are additive — a slash-free name always uses the
+flat key, so declaring a role never rewrites configuration that already exists:
+
+```bash
+git config reveries.remoteRole.origin primary          # flat, unchanged
+git config reveries.remoteRole/team.vendor.role import-only
+```
+
+Readers must accept both, and they do so through one shared pattern and one shared parser rather
+than several hand-rolled ones. On git 2.39.5 a `--get-regexp` pattern must extend *past* a
+subsection boundary to match it: `^reveries\.remoteRole` and `^reveries\.remoteRole/` both return
+zero rows when subsection keys exist, and `^reveries\.remoteRole\.` returns only the flat keys. A
+narrowed pattern therefore does not fail loudly — it hides every slash remote's role and leaves
+authority silently `unconfigured`.
+
+A tracking ref for such a remote is `refs/remotes/team/vendor/reveries-ledger`, and its remote is
+`team/vendor`, not the first path segment. Resolution is by longest exact `refs/remotes/<name>/`
+prefix over the configured remotes, applied identically by the command layer and the library. A
+first-segment read would apply one remote's role to another remote's evidence — refusing evidence
+nobody gated, or promoting it as the wrong remote's.
+
+A key under the same prefix that is not a role declaration, such as
+`reveries.remoteRole/team.someOtherSetting`, is never read as one and never cleared: a role writer
+does not own keys it did not create.
+
+```bash
+reveries policy show
+reveries policy set author,reviewer
+reveries policy clear
+```
+
+The role requirement is what separates `trusted` from `policy-satisfying`. It is local
+configuration rather than evidence, so it is deliberately not part of the envelope.
+
+```bash
+reveries sign rv:<id>
+reveries sign rv:<id> --role reviewer
+reveries sign rv:<id> --key ~/.config/reveries/signing.pem
+```
+
+A signature binds the repository's own bytes, so the target must already be present in the current
+notes; signing a record that is not there would produce an attestation no reader could resolve. A
+repository with no configured key is *unsigned*, which is an ordinary state and exits `0`. After
+signing, the ledger envelope is `stale` and the exact `reveries ledger build` command is printed.
+
+```bash
+reveries verify
+reveries verify rv:<id> --json
+reveries verify --require-policy
+reveries verify --ledger
+```
+
+```bash
+reveries trust init   --signer me@example.com --key-file ~/.config/reveries/signing.pem
+reveries trust add    --signer me@example.com --from-file ~/.config/reveries/reveries.pub.pem
+reveries trust list
+reveries trust revoke --key SHA256:…
 ```
 
 ### 27.11 `reveries push`

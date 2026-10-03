@@ -1,11 +1,21 @@
-# Evaluate Reveries locally
+# Reveries conformance grades
 
-The release evaluator executes the V1 acceptance matrix without network access or writes outside
-disposable directories. It uses temporary Git repositories and bare remotes, a temporary home for
-the Skills installer, and content-bound evidence captured from Pi 0.84.1. It does not push to a
-hosted remote.
+Reveries reports readiness as a matrix of four independent grades. No grade is
+ever inferred from a lower one: a passing LOCAL suite says nothing about team,
+hosted, or automatic-delivery readiness. Each runner produces its own report
+naming host and version, merge mode, repository, and evidence scale, and each
+runner exits non-zero while its grade is unverified or not claimed.
 
-## Run the evaluation
+## Grade matrix
+
+| Grade | Runner | Current verdict |
+| --- | --- | --- |
+| LOCAL | `npm run evaluate:local` (`scripts/evaluate-local.mjs`) and `npm run conformance` (`scripts/conformance.mjs`) | verified (see V1.0.2 result below) |
+| TEAM | `npm run conformance:team` (`scripts/conformance-team.mjs`) | unverified: executable checks run, but no multi-user pilot and no fuzzer exist |
+| HOSTED | `npm run conformance:hosted` (`scripts/conformance-hosted.mjs`) | unverified: no named host deployment exists |
+| AUTOMATIC DELIVERY | `npm run conformance:delivery` (`scripts/conformance-delivery.mjs`) | not-claimed for every host version |
+
+## Run the evaluations
 
 From the repository root, run:
 
@@ -14,7 +24,7 @@ npm ci
 npm run verify
 ```
 
-`npm run verify` is the strict release gate. It runs:
+`npm run verify` is the strict LOCAL release gate. It runs:
 
 1. TypeScript checking.
 2. The complete unit and integration suite.
@@ -31,8 +41,67 @@ Use JSON output for automation:
 npm run evaluate:local -- --strict --json
 ```
 
-Normal mode fails when an executable gate fails or recorded evidence is stale. Strict mode also
-fails when any claimed criterion is partial, uncovered, or environment-blocked.
+The LOCAL report carries `grade: "LOCAL"`, the workstation host and version
+(Node plus Git), the repository scope, and the evidence scale (criteria and
+gate counts). Normal mode fails when an executable gate fails or recorded
+evidence is stale. Strict mode also fails when any claimed criterion is
+partial, uncovered, or environment-blocked.
+
+Each grade runner accepts `--json` and writes a standalone report to stdout.
+Capture acceptance-runner reports with:
+
+```bash
+npm run conformance -- --json > evidence/conformance-local.json
+npm run conformance:team -- --json > evidence/conformance-team.json
+npm run conformance:hosted -- --json > evidence/conformance-hosted.json
+npm run conformance:delivery -- --json > evidence/conformance-delivery.json
+```
+
+Every report carries `grade`, `generated_at`, `host` (name and version),
+`merge_mode`, `repository`, `evidence_scale`, per-criterion results, open
+`blockers`, and a `verdict` of `verified`, `unverified`, `not-claimed`, or
+`failed`. Captured reports are run artifacts: inspect them, do not check them
+in as claims.
+
+## TEAM grade
+
+`scripts/conformance-team.mjs` executes fourteen named criteria. Plain-Git
+fixtures in disposable repositories cover concurrent-writer convergence,
+stale-push rejection, force-push and deleted-branch detection, shallow history
+bounds, partial-clone blob deferral, and transport scale (repository size,
+record count, latency, memory). Composed subprocesses cover invalid-union
+fail-closed behavior, compare-and-swap retries, retention survival under
+aggressive pruning, resource ceilings, and snapshot-loader scale. The shared
+report helpers live in `scripts/conformance-report.mjs`.
+
+Two criteria keep the grade unverified by design: no multi-user repository
+pilot has been completed and recorded, and no note-parsing fuzzer is
+committed. A stable TEAM claim requires the pilot. Protocol-level latency and
+memory tables remain with the benchmark scripts themselves:
+
+```bash
+node --experimental-transform-types scripts/protocol-limits-benchmark.mjs
+node --experimental-transform-types scripts/reveries-snapshot-benchmark.mjs
+```
+
+## HOSTED grade
+
+`scripts/conformance-hosted.mjs` runs the receive fixture, the post-merge
+fixture, and the workflow trust-boundary tests, then reports the merge-method
+matrix (merge, squash, rebase, merge queue), fork isolation, required checks,
+and transport-failure recovery as explicitly unverified cells. Each cell names
+the deployment evidence that would verify it: a named host deployment with the
+Reveries App installed, `REVERIES_APP_ID` configured, and the App-owned check
+pinned in branch protection. Hosted behavior remains a deployment contract as
+described in `COMPATIBILITY.md` and `HOSTED_ENFORCEMENT.md`.
+
+## AUTOMATIC DELIVERY grade
+
+`scripts/conformance-delivery.mjs` verifies that the recorded Skill-routing
+evidence is fresh and records the per-host status of the DESIGN section 36.4
+20-case native adapter suite. Routing evidence alone never implies delivery:
+all hosts remain `not-claimed` until a named host version passes the complete
+suite.
 
 ## Evidence architecture
 
@@ -53,7 +122,7 @@ stale evidence. Recapture requires Pi and model access; verification does not.
 
 ## V1.0.2 result
 
-The strict evaluation on 2026-08-25 produced:
+The strict LOCAL evaluation on 2026-08-25 produced:
 
 | Status | Criteria |
 | --- | ---: |

@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
 import { Reveries } from "../src/operations.ts";
-import { blobId, type ReverieInput, type ReverieMetadata, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
+import {
+  NOTES_REF,
+  RETENTION_BUNDLE_REFS,
+  RETENTION_COMMITS_REF,
+  RETENTION_OBJECTS_REF,
+} from "../src/git.ts";
+import { blobId, objectId, type ReverieInput, type ReverieMetadata, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
@@ -17,10 +23,15 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
-async function createRepository(): Promise<string> {
+async function gitPath(cwd: string, path: string): Promise<string> {
+  const resolved = await git(cwd, "rev-parse", "--git-path", path);
+  return isAbsolute(resolved) ? resolved : join(cwd, resolved);
+}
+
+async function createRepository(objectFormat: "sha1" | "sha256" = "sha1"): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "reveries-ops-"));
   temporaryRepositories.push(directory);
-  await git(directory, "init", "-b", "main");
+  await git(directory, "init", "-b", "main", `--object-format=${objectFormat}`);
   await git(directory, "config", "user.name", "Reveries Test");
   await git(directory, "config", "user.email", "reveries@example.com");
   await writeFile(join(directory, "state.txt"), "first\n", "utf8");
@@ -319,4 +330,489 @@ test("merge continuity is checked independently from every parent", async () => 
   });
   const reconciled = await reveries.checkCommit(mergeCommit);
   assert.equal(reconciled.ok, true, JSON.stringify(reconciled.diagnostics));
+});
+
+test("atomically creates a commit and attaches its session summary", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const base = await git(directory, "rev-parse", "HEAD");
+  await reveries.summarize({ commit: base, summary: summary() });
+  await reveries.attachInitialization({
+    commit: base,
+    record: {
+      v: 1,
+      type: "reveries-init",
+      protocol: 1,
+      notes_ref: "refs/notes/reveries",
+      publishing_remotes: [],
+      hosts: ["codex"],
+      author_email: "reveries@example.com",
+      created_at: "2026-08-25T03:05:00Z",
+    },
+  });
+  const previousNotes = await git(directory, "rev-parse", "refs/notes/reveries");
+  await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+  await git(directory, "add", "state.txt");
+
+  const commit = await reveries.commitWithSummary({ message: "atomic summary", summary: summary() });
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), commit);
+  assert.equal(await git(directory, "rev-parse", `${commit}^`), base);
+  assert.equal(await git(directory, "show", `${commit}:state.txt`), "second");
+  assert.equal(await git(directory, "show", "-s", "--format=%s", commit), "atomic summary");
+  assert.notEqual(await git(directory, "rev-parse", "refs/notes/reveries"), previousNotes);
+  assert.equal(await git(directory, "for-each-ref", "--format=%(refname)", "refs/notes/reveries-txn"), "");
+  await assert.rejects(access(reveries.repository.writeLockPath()), { code: "ENOENT" });
+  const evidence = await reveries.show({ target: commit });
+  assert.deepEqual(evidence.records, [summary()]);
+  const check = await reveries.checkCommit(commit);
+  assert.equal(check.ok, true, JSON.stringify(check.diagnostics));
+});
+
+test("post-commit hook sees the published summary and cannot undo the commit", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "post-commit");
+  const markerPath = join(directory, "post-commit-state");
+  await writeFile(
+    hookPath,
+    `#!/bin/sh\n{ git rev-parse HEAD; git notes --ref=refs/notes/reveries show HEAD; } > '${markerPath}'\nexit 1\n`,
+    "utf8",
+  );
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+
+  const commit = await reveries.commitWithSummary({ message: "post-commit check", summary: summary() });
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), commit);
+  const hookOutput = await readFile(markerPath, "utf8");
+  assert.match(hookOutput, new RegExp(`^${commit}\\n`));
+  assert.match(hookOutput, /"type":"session-summary"/);
+});
+
+test("a rejecting commit-msg hook leaves the branch and notes refs unchanged", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "commit-msg");
+  const markerPath = join(directory, "commit-msg-ran");
+  await writeFile(hookPath, `#!/bin/sh\nprintf invoked > '${markerPath}'\nexit 1\n`, "utf8");
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+  const branchBefore = await git(directory, "rev-parse", "HEAD");
+  const notesBefore = await reveries.repository.notesTip();
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "rejected", summary: summary() }),
+    /commit-msg/i,
+  );
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), branchBefore);
+  assert.equal(await reveries.repository.notesTip(), notesBefore);
+  assert.equal(await readFile(markerPath, "utf8"), "invoked");
+  assert.equal(await git(directory, "for-each-ref", "--format=%(refname)", "refs/notes/reveries-txn"), "");
+  await assert.rejects(access(reveries.repository.writeLockPath()), { code: "ENOENT" });
+});
+
+test("prepare-commit-msg can edit the message before atomic commit creation", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "prepare-commit-msg");
+  await writeFile(hookPath, "#!/bin/sh\nprintf 'prepared by hook\\n' >> \"$1\"\n", "utf8");
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+
+  const commit = await reveries.commitWithSummary({ message: "original message", summary: summary() });
+
+  assert.equal(await git(directory, "show", "-s", "--format=%B", commit), "original message\nprepared by hook");
+});
+
+test("atomic commit creation preserves merge parents", async () => {
+  const directory = await createRepository();
+  await git(directory, "branch", "side");
+  await git(directory, "checkout", "side");
+  await writeFile(join(directory, "side.txt"), "side\n", "utf8");
+  await git(directory, "add", "side.txt");
+  await git(directory, "commit", "-m", "side change");
+  const side = await git(directory, "rev-parse", "HEAD");
+
+  await git(directory, "checkout", "main");
+  await writeFile(join(directory, "main.txt"), "main\n", "utf8");
+  await git(directory, "add", "main.txt");
+  await git(directory, "commit", "-m", "main change");
+  const main = await git(directory, "rev-parse", "HEAD");
+  await git(directory, "merge", "--no-commit", "side");
+  assert.equal(await git(directory, "rev-parse", "MERGE_HEAD"), side);
+  const mergeHead = await gitPath(directory, "MERGE_HEAD");
+  const mergeMessage = await gitPath(directory, "MERGE_MSG");
+  const mergeMode = await gitPath(directory, "MERGE_MODE");
+  const cherryPickHead = await gitPath(directory, "CHERRY_PICK_HEAD");
+  await writeFile(mergeMode, "no-ff\n", "utf8");
+  await writeFile(cherryPickHead, `${side}\n`, "utf8");
+
+  const commit = await (await Reveries.open(directory)).commitWithSummary({
+    message: "merge with summary",
+    summary: summary(),
+  });
+
+  assert.equal(await git(directory, "show", "-s", "--format=%P", commit), `${main} ${side}`);
+  await assert.rejects(access(mergeHead), { code: "ENOENT" });
+  await assert.rejects(access(mergeMessage), { code: "ENOENT" });
+  await assert.rejects(access(mergeMode), { code: "ENOENT" });
+  assert.equal(await readFile(cherryPickHead, "utf8"), `${side}\n`);
+});
+
+test("rejected atomic merge publication preserves MERGE_HEAD, MERGE_MSG, and MERGE_MODE", async () => {
+  const directory = await createRepository();
+  await git(directory, "branch", "side");
+  await git(directory, "checkout", "side");
+  await writeFile(join(directory, "side.txt"), "side\n", "utf8");
+  await git(directory, "add", "side.txt");
+  await git(directory, "commit", "-m", "side change");
+  await git(directory, "checkout", "main");
+  await writeFile(join(directory, "main.txt"), "main\n", "utf8");
+  await git(directory, "add", "main.txt");
+  await git(directory, "commit", "-m", "main change");
+  await git(directory, "merge", "--no-commit", "side");
+  const mergeHead = await gitPath(directory, "MERGE_HEAD");
+  const mergeMessage = await gitPath(directory, "MERGE_MSG");
+  const mergeMode = await gitPath(directory, "MERGE_MODE");
+  await writeFile(mergeMode, "no-ff\n", "utf8");
+  const hookPath = join(directory, ".git", "hooks", "commit-msg");
+  await writeFile(hookPath, "#!/bin/sh\ngit notes --ref=refs/notes/reveries add -f -m concurrent HEAD\n", "utf8");
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "stale merge notes", summary: summary() }),
+    /update-ref|lock ref|transaction|changed concurrently/i,
+  );
+
+  await access(mergeHead);
+  await access(mergeMessage);
+  assert.equal(await readFile(mergeMode, "utf8"), "no-ff\n");
+  assert.equal(await git(directory, "symbolic-ref", "--short", "HEAD"), "main");
+});
+
+test("a stale notes tip prevents the branch update in the same ref transaction", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "commit-msg");
+  const postCommitPath = join(directory, ".git", "hooks", "post-commit");
+  const postCommitMarker = join(directory, "post-commit-ran");
+  await writeFile(hookPath, "#!/bin/sh\ngit notes --ref=refs/notes/reveries add -f -m concurrent HEAD\n", "utf8");
+  await writeFile(postCommitPath, `#!/bin/sh\nprintf invoked > '${postCommitMarker}'\n`, "utf8");
+  await execFileAsync("chmod", ["+x", hookPath]);
+  await execFileAsync("chmod", ["+x", postCommitPath]);
+  const reveries = await Reveries.open(directory);
+  const branchBefore = await git(directory, "rev-parse", "HEAD");
+  assert.equal(await reveries.repository.notesTip(), null);
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "stale notes", summary: summary() }),
+    /update-ref|lock ref|transaction|changed concurrently/i,
+  );
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), branchBefore);
+  assert.notEqual(await reveries.repository.notesTip(), null);
+  await assert.rejects(access(postCommitMarker), { code: "ENOENT" });
+});
+
+test("a stale branch tip prevents the notes update in the same ref transaction", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "commit-msg");
+  await writeFile(
+    hookPath,
+    "#!/bin/sh\nparent=$(git rev-parse HEAD)\ntree=$(git write-tree)\nother=$(printf external | git commit-tree \"$tree\" -p \"$parent\")\ngit update-ref refs/heads/main \"$other\" \"$parent\"\n",
+    "utf8",
+  );
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+  const branchBefore = await git(directory, "rev-parse", "HEAD");
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "stale branch", summary: summary() }),
+    /update-ref|lock ref|transaction|changed concurrently/i,
+  );
+
+  assert.notEqual(await git(directory, "rev-parse", "HEAD"), branchBefore);
+  assert.equal(await reveries.repository.notesTip(), null);
+});
+
+test("a branch switch during message preparation aborts without advancing the original branch", async () => {
+  const directory = await createRepository();
+  const hookPath = join(directory, ".git", "hooks", "prepare-commit-msg");
+  await writeFile(hookPath, "#!/bin/sh\ngit checkout -b parallel-work >/dev/null 2>&1\n", "utf8");
+  await execFileAsync("chmod", ["+x", hookPath]);
+  const reveries = await Reveries.open(directory);
+  const branchBefore = await git(directory, "rev-parse", "refs/heads/main");
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "branch changed", summary: summary() }),
+    /branch changed|concurrent/i,
+  );
+
+  assert.equal(await git(directory, "rev-parse", "refs/heads/main"), branchBefore);
+  assert.equal(await reveries.repository.notesTip(), null);
+  assert.equal(await git(directory, "symbolic-ref", "--short", "HEAD"), "parallel-work");
+});
+
+test("atomic commit creation preserves author and committer environment metadata", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const identity = {
+    GIT_AUTHOR_NAME: "Original Author",
+    GIT_AUTHOR_EMAIL: "author@example.test",
+    GIT_AUTHOR_DATE: "2001-02-03T04:05:06+00:00",
+    GIT_COMMITTER_NAME: "Original Committer",
+    GIT_COMMITTER_EMAIL: "committer@example.test",
+    GIT_COMMITTER_DATE: "2002-03-04T05:06:07+00:00",
+  };
+  const previous = new Map(Object.keys(identity).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(identity)) process.env[key] = value;
+  let commit: string;
+  try {
+    commit = await reveries.commitWithSummary({ message: "preserve identity", summary: summary() });
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  assert.equal(
+    await git(directory, "show", "-s", "--format=%an <%ae> %aI|%cn <%ce> %cI", commit),
+    "Original Author <author@example.test> 2001-02-03T04:05:06+00:00|Original Committer <committer@example.test> 2002-03-04T05:06:07+00:00",
+  );
+});
+
+test("configured commit signing runs before either canonical ref moves", async () => {
+  const directory = await createRepository();
+  const signerPath = join(directory, "fake-gpg");
+  const markerPath = join(directory, "signer-ran");
+  await writeFile(signerPath, `#!/bin/sh\nprintf called > '${markerPath}'\ncat >/dev/null\nexit 1\n`, "utf8");
+  await execFileAsync("chmod", ["+x", signerPath]);
+  await git(directory, "config", "gpg.format", "openpgp");
+  await git(directory, "config", "commit.gpgSign", "true");
+  await git(directory, "config", "gpg.program", signerPath);
+  const reveries = await Reveries.open(directory);
+  const branchBefore = await git(directory, "rev-parse", "HEAD");
+
+  await assert.rejects(
+    reveries.commitWithSummary({ message: "signed commit", summary: summary() }),
+    /sign|gpg/i,
+  );
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), branchBefore);
+  assert.equal(await reveries.repository.notesTip(), null);
+  assert.equal(await readFile(markerPath, "utf8"), "called");
+});
+
+test("atomic commit-and-summary creation supports SHA-256 repositories", async () => {
+  const directory = await createRepository("sha256");
+  const reveries = await Reveries.open(directory);
+
+  const commit = await reveries.commitWithSummary({ message: "sha256 commit", summary: summary() });
+
+  assert.equal(commit.length, 64);
+  assert.equal(await git(directory, "rev-parse", "HEAD"), commit);
+  assert.equal((await reveries.show({ target: commit })).records.length, 1);
+});
+
+test("atomic commit-and-summary creation supports an unborn branch", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "reveries-ops-unborn-"));
+  temporaryRepositories.push(directory);
+  await git(directory, "init", "-b", "main");
+  await git(directory, "config", "user.name", "Reveries Test");
+  await git(directory, "config", "user.email", "reveries@example.com");
+  await writeFile(join(directory, "state.txt"), "first\n", "utf8");
+  await git(directory, "add", "state.txt");
+  const reveries = await Reveries.open(directory);
+
+  const commit = await reveries.commitWithSummary({ message: "initial summarized commit", summary: summary() });
+
+  assert.equal(await git(directory, "rev-parse", "HEAD"), commit);
+  assert.equal(await git(directory, "show", "-s", "--format=%P", commit), "");
+  assert.equal((await reveries.show({ target: commit })).records.length, 1);
+});
+
+test("retention defaults to the active policy and rejects an unknown one", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+
+  assert.equal(await reveries.retentionPolicy(), "active");
+
+  await git(directory, "config", "reveries.retention", "all");
+  assert.equal(await reveries.retentionPolicy(), "all");
+
+  await git(directory, "config", "reveries.retention", "forever");
+  await assert.rejects(() => reveries.retentionPolicy(), /reveries\.retention|forever/);
+});
+
+test("the active policy retains only subjects with an active reverie", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const original = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+  await git(directory, "add", "state.txt");
+  const successor = await reveries.recordSupersede({
+    path: "state.txt",
+    revision: "index",
+    semantic: { ...semantic, decision: `${semantic.decision} A sharper rule.` },
+    metadata,
+    old: original.record.id,
+  });
+
+  const result = await reveries.retain();
+
+  assert.equal(result.policy, "active");
+  assert.deepEqual([...result.retained], [successor.object]);
+  assert.deepEqual(await reveries.repository.listRetentionCommits(), []);
+  assert.equal(await reveries.repository.objectType(commit), "commit");
+});
+
+test("the all policy retains every annotated subject", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+
+  const result = await reveries.retain();
+
+  assert.deepEqual([...result.retained].sort(), [recorded.object, commit].sort());
+  assert.deepEqual(
+    [...await reveries.repository.listRetentionCommits()],
+    [commit],
+  );
+});
+
+test("the archive policy keeps subjects that later evidence supersedes", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const original = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await git(directory, "config", "reveries.retention", "archive");
+  await reveries.retain();
+  await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+  await git(directory, "add", "state.txt");
+  await reveries.recordSupersede({
+    path: "state.txt",
+    revision: "index",
+    semantic: { ...semantic, decision: `${semantic.decision} A sharper rule.` },
+    metadata,
+    old: original.record.id,
+  });
+  const staged = await reveries.repository.resolvePath({ path: "state.txt", revision: "index" });
+
+  const result = await reveries.retain();
+
+  assert.equal(result.policy, "archive");
+  assert.deepEqual([...result.retained].sort(), [original.object, staged].sort());
+});
+
+test("the none policy removes retention and an empty rebuild never does", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await reveries.retain();
+  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  assert.notEqual(objectsTip, null);
+
+  await git(directory, "config", "reveries.retention", "none");
+  const removed = await reveries.retain();
+  assert.equal(removed.changed, true);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), null);
+  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), null);
+
+  await git(directory, "config", "reveries.retention", "all");
+  await reveries.retain();
+  const restored = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  await writeFile(join(directory, "state.txt"), "third\n", "utf8");
+  await git(directory, "add", "state.txt");
+  const second = await reveries.repository.resolvePath({ path: "state.txt", revision: "index" });
+  await reveries.repository.run(["notes", "--ref=refs/notes/reveries", "remove", second], { allowExitCodes: [0, 1, 5] });
+  const empty = await reveries.retain();
+
+  assert.deepEqual([...empty.retained], [recorded.object]);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), restored);
+});
+
+test("doctor reports retention coverage and the subjects a vault misses", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+
+  const uncovered = await reveries.doctor();
+  assert.equal(uncovered.retention.policy, "active");
+  assert.equal(uncovered.retention.state, "incomplete");
+  assert.deepEqual([...uncovered.retention.missing], [recorded.object]);
+  assert.match(uncovered.diagnostics.join(" "), /Retention policy active does not keep 1 annotated subject/);
+  assert.match(uncovered.notices.join(" "), /Retention: policy active; incomplete; 0 of 1 annotated subject/);
+
+  await reveries.retain();
+  const covered = await reveries.doctor();
+  assert.equal(covered.retention.state, "current");
+  assert.deepEqual([...covered.retention.missing], []);
+  assert.match(covered.notices.join(" "), /Retention: policy active; current; 1 of 1 annotated subject/);
+});
+
+test("retained annotated objects survive aggressive pruning and controls do not", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await reveries.retain();
+  const unretained = objectId((await reveries.repository.run(["hash-object", "-w", "--stdin"], { input: "control\n" })).stdout.trim());
+
+  await writeFile(join(directory, "orphan.txt"), "orphan\n", "utf8");
+  await git(directory, "add", "orphan.txt");
+  await git(directory, "commit", "-m", "orphan commit");
+  await git(directory, "reset", "--hard", "HEAD~1");
+  await git(directory, "reflog", "expire", "--expire=now", "--all");
+  await git(directory, "gc", "--prune=now", "--aggressive");
+
+  assert.equal(await reveries.repository.objectType(recorded.object), "blob");
+  assert.equal(await reveries.repository.objectType(commit), "commit");
+  assert.equal(await reveries.repository.objectType(unretained), null);
+});
+
+test("a vault rebuilt from evidence reproduces the same objects", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+  const first = await reveries.retain();
+  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  const commitsTip = await reveries.repository.notesTip(RETENTION_COMMITS_REF);
+  assert.notEqual(objectsTip, null);
+  assert.notEqual(commitsTip, null);
+
+  await reveries.repository.deleteRetentionRefs({ objects: objectsTip, commits: commitsTip });
+  const rebuilt = await reveries.retain();
+
+  assert.equal(rebuilt.changed, true);
+  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), objectsTip);
+  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), commitsTip);
+  assert.deepEqual([...first.retained].sort(), [recorded.object, commit].sort());
+});
+
+test("a bundle carries notes, ledger, and retention refs", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
+  await git(directory, "config", "reveries.retention", "all");
+  await reveries.retain();
+  const bundlePath = join(directory, "reveries.bundle");
+  const created = join(directory, "created.bundle");
+
+  const withoutLedger = await reveries.repository.existingRetentionBundleRefs();
+  await git(directory, "bundle", "create", bundlePath, ...withoutLedger);
+  assert.equal(withoutLedger.includes("refs/heads/reveries-ledger"), false);
+
+  await git(directory, "update-ref", "refs/heads/reveries-ledger", await git(directory, "rev-parse", "HEAD"));
+  const refs = await reveries.repository.existingRetentionBundleRefs();
+  await git(directory, "bundle", "create", created, ...refs);
+  const heads = await git(directory, "bundle", "list-heads", created);
+
+  for (const ref of [NOTES_REF, "refs/heads/reveries-ledger", RETENTION_OBJECTS_REF, RETENTION_COMMITS_REF]) {
+    assert.match(heads, new RegExp(`^\\S+ ${ref}$`, "m"), `the bundle is missing ${ref}`);
+  }
 });

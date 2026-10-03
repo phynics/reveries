@@ -38,7 +38,7 @@ The package has four modules grouped by the knowledge they own:
 
 External JSON, CLI arguments, Git output, and host events are `unknown` until their boundary parser returns domain values. Blob IDs, commit IDs, object IDs, and reverie IDs use separate branded types. Protocol functions do not import process, filesystem, or child-process modules.
 
-Every notes mutation acquires `<git-common-dir>/reveries/write.lock`, snapshots `refs/notes/reveries`, writes through a temporary notes ref, validates the result, and updates the canonical ref with the old tip as a compare-and-swap guard. This protects linked worktrees and detects writers that bypass the helper.
+Every notes mutation reads `refs/notes/reveries`, applies the change through a unique temporary ref under `refs/notes/reveries-txn/`, validates the result, and updates the canonical ref with the old tip as a compare-and-swap guard, retrying with bounded backoff on contention. This protects linked worktrees, detects writers that bypass the helper, and never lets a killed writer block future writes.
 
 The public interface is small because each operation hides canonicalization, validation, Git resolution, and mutation ordering. Callers provide intent and receive a typed result with exit code `0`, `1`, `2`, or `3`.
 

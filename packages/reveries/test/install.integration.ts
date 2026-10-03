@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { commitAdoption, initializeRepository, removeIntegration } from "../src/install.ts";
+import { GitRepository } from "../src/git.ts";
+import { commitAdoption, initializeRepository, readLocalTrustStore, removeIntegration } from "../src/install.ts";
 import { Reveries } from "../src/operations.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
 let previousGlobalConfig: string | undefined;
+const manualSetupGuide = join(dirname(fileURLToPath(import.meta.url)), "../../../skills/reveries-git-notes-init/references/manual-setup.md");
 const helper = {
   command: "/bin/sh",
   args: ["-c", "if [ \"$1\" = --version ]; then echo 'reveries 1.0.1'; fi", "reveries-test-helper"],
@@ -32,8 +35,8 @@ async function configValues(cwd: string, key: string): Promise<readonly string[]
   }
 }
 
-async function createRepository(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "reveries-init-"));
+async function createRepository(prefix = "reveries-init-"): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
   temporaryRepositories.push(directory);
   await git(directory, "init", "-b", "main");
   await git(directory, "config", "user.name", "Reveries Test");
@@ -733,4 +736,450 @@ test("removal keeps the notes ref and unknown prose", async () => {
   assert.equal(await git(directory, "config", "--get-all", "remote.origin.push"), "HEAD");
   assert.match(await readFile(hook, "utf8"), /retained-custom-step/);
   assert.doesNotMatch(await readFile(hook, "utf8"), /reveries:begin/);
+});
+
+function documentedTemplate(markdown: string, label: string): string {
+  const marker = `<!-- manual-template:${label} -->`;
+  const markerOffset = markdown.indexOf(marker);
+  assert.notEqual(markerOffset, -1, `manual setup guide is missing template ${label}`);
+  const fence = "```markdown\n";
+  const fenceOffset = markdown.indexOf(fence, markerOffset + marker.length);
+  assert.notEqual(fenceOffset, -1, `manual setup template ${label} has no markdown fence`);
+  const contentStart = fenceOffset + fence.length;
+  const contentEnd = markdown.indexOf("\n```", contentStart);
+  assert.notEqual(contentEnd, -1, `manual setup template ${label} has no closing fence`);
+  return markdown.slice(contentStart, contentEnd).replaceAll(
+    "{{SKILL_REPOSITORY}}",
+    "https://github.com/phynics/reveries",
+  );
+}
+
+function ownedInstructionBlock(text: string): string {
+  const begin = "<!-- reveries:begin -->";
+  const end = "<!-- reveries:end -->";
+  const start = text.indexOf(begin);
+  assert.notEqual(start, -1, "helper output is missing its Reveries begin marker");
+  const endOffset = text.indexOf(end, start);
+  assert.notEqual(endOffset, -1, "helper output is missing its Reveries end marker");
+  return text.slice(start, endOffset + end.length);
+}
+
+test("manual setup blocks match every helper Skill and host template byte-for-byte", async () => {
+  const guide = await readFile(manualSetupGuide, "utf8");
+  const repositoryUrl = "https://github.com/phynics/reveries";
+  const setups = [
+    { label: "agents-reminder", setup: { kind: "reminder" } as const },
+    { label: "agents-pull", setup: { kind: "pull", repository: repositoryUrl } as const },
+    { label: "agents-vendored", setup: { kind: "vendored", sourceRoot: "skills" } as const },
+    { label: "agents-symlink", setup: { kind: "symlink", sourceRoot: "skills" } as const },
+    { label: "agents-submodule", setup: { kind: "submodule", repository: repositoryUrl } as const },
+  ];
+
+  for (const { label, setup } of setups) {
+    const directory = await createRepository();
+    if (setup.kind === "vendored" || setup.kind === "symlink") await createSkillSource(directory);
+    if (setup.kind === "submodule") {
+      const source = await createSkillRepository();
+      await configureLocalSubmoduleSource(directory, source);
+    }
+    await initializeRepository(directory, {
+      hosts: ["claude", "gemini"],
+      publishingRemotes: ["origin"],
+      directiveEmail: "user@example.com",
+      skillSetup: setup,
+      helper,
+    });
+
+    const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
+    assert.equal(
+      documentedTemplate(guide, label),
+      ownedInstructionBlock(agents),
+      `${label} differs from the helper-owned AGENTS.md block`,
+    );
+    assert.equal(
+      documentedTemplate(guide, "host-claude"),
+      ownedInstructionBlock(await readFile(join(directory, "CLAUDE.md"), "utf8")),
+      "Claude host block differs from helper output",
+    );
+    assert.equal(
+      documentedTemplate(guide, "host-gemini"),
+      ownedInstructionBlock(await readFile(join(directory, "GEMINI.md"), "utf8")),
+      "Gemini host block differs from helper output",
+    );
+  }
+});
+
+test("initialization without a helper emits Git-only contributor guidance", async () => {
+  const directory = await createRepository();
+  const withoutHelper = await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+  });
+  assert.ok(withoutHelper.noHelperGuidance.length > 0);
+  assert.match(withoutHelper.noHelperGuidance.join("\n"), /CONTRIBUTING\.md/);
+
+  const withHelper = await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+  assert.deepEqual(withHelper.noHelperGuidance, []);
+});
+
+test("initialization manages the ledger fetch refspec alongside the notes refspec", async () => {
+  const directory = await createRepository();
+  await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+
+  // The envelope is a normal branch, so a plain `git fetch` must be able to
+  // refresh its mirror the same way it refreshes the notes ref. The refspec is a
+  // glob so that a remote which has not published a checkpoint yet can still be
+  // fetched from, which is the state a new collaborator starts in.
+  const fetchValues = await configValues(directory, "remote.origin.fetch");
+  assert.ok(
+    fetchValues.includes("+refs/heads/reveries-ledger*:refs/remotes/origin/reveries-ledger*"),
+    `the ledger refspec is not managed: ${JSON.stringify(fetchValues)}`,
+  );
+  assert.ok(fetchValues.includes("+refs/notes/reveries*:refs/notes/remotes/origin/reveries*"));
+});
+
+test("removal takes the ledger refspec with the notes refspec", async () => {
+  const directory = await createRepository();
+  await initializeRepository(directory, {
+    hosts: ["pi"],
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" },
+    helper,
+  });
+  assert.ok((await configValues(directory, "remote.origin.fetch")).length > 0);
+
+  const result = await removeIntegration(directory, { publishingRemotes: ["origin"] });
+
+  assert.equal(result.removed, true);
+  const remaining = await configValues(directory, "remote.origin.fetch");
+  assert.equal(
+    remaining.some((value) => value.includes("reveries-ledger")),
+    false,
+    `reveries remove left the ledger refspec behind: ${JSON.stringify(remaining)}`,
+  );
+  assert.equal(
+    remaining.some((value) => value.includes("refs/notes/reveries")),
+    false,
+    `reveries remove left the notes refspec behind: ${JSON.stringify(remaining)}`,
+  );
+});
+
+test("the ledger refspec stays idempotent across repeated convergence", async () => {
+  const directory = await createRepository();
+  const options = {
+    hosts: ["pi"] as const,
+    publishingRemotes: ["origin"],
+    directiveEmail: null,
+    skillSetup: { kind: "reminder" as const },
+    helper,
+  };
+  await initializeRepository(directory, options);
+  const first = await configValues(directory, "remote.origin.fetch");
+
+  await initializeRepository(directory, options);
+  const second = await configValues(directory, "remote.origin.fetch");
+
+  assert.deepEqual(second, first, "re-running setup duplicated a refspec");
+});
+
+const REMOVAL_INIT = {
+  hosts: ["codex"] as const,
+  publishingRemotes: ["origin"],
+  directiveEmail: "user@example.com",
+  skillSetup: { kind: "reminder" } as const,
+  helper,
+};
+
+async function defaultStoreOf(directory: string): Promise<string> {
+  return (await readLocalTrustStore((await GitRepository.open(directory)))).path;
+}
+
+async function remove(directory: string) {
+  return removeIntegration(directory, { publishingRemotes: ["origin"] });
+}
+
+function storeBody(signer: string): string {
+  return `${JSON.stringify({ keys: [{ key_id: "SHA256:aa", signer, revoked: false, public_key: "pem" }] }, null, 2)}\n`;
+}
+
+/** `git config --get` whose answer may legitimately be "not set". */
+async function configOf(directory: string, key: string): Promise<string> {
+  try {
+    return await git(directory, "config", "--get", key);
+  } catch {
+    return "";
+  }
+}
+
+async function storeExists(path: string): Promise<boolean> {
+  try {
+    await readFile(path, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fresh(prefix: string, options: { readonly trustStore?: string } = {}): Promise<string> {
+  const directory = await createRepository(prefix);
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
+  // Configuration is set before setup runs, because which file setup creates or
+  // adopts is exactly what these tests are about.
+  if (options.trustStore !== undefined) await git(directory, "config", "reveries.trustStore", options.trustStore);
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+  return directory;
+}
+
+test("removal clears owned configuration and preserves the trust store it created", async () => {
+  const directory = await fresh("removal-preserves-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+  await git(directory, "config", "reveries.remoteRole.origin", "primary");
+  await git(directory, "config", "reveries.signingRoles", "author");
+  await git(directory, "config", "reveries.signingKey", "/tmp/does-not-matter.pem");
+  await git(directory, "notes", "--ref=refs/notes/reveries", "add", "-m", "evidence", "HEAD");
+  const notesTip = await git(directory, "rev-parse", "refs/notes/reveries");
+
+  const result = await remove(directory);
+
+  assert.deepEqual([...result.removedTrustConfig].sort(), [
+    "reveries.remoteRole.origin",
+    "reveries.signingKey",
+    "reveries.signingRoles",
+  ]);
+  assert.deepEqual(result.trustStore.preserved, [store]);
+  assert.match(result.trustStore.reason, /never deletes trust material/);
+  // A store setup created is still a store an operator may depend on. Removal
+  // clears configuration; deleting trust material is a separate, deliberate act.
+  assert.equal(await storeExists(store), true, "removal must not delete a trust store it created");
+  for (const key of result.removedTrustConfig) {
+    assert.equal(await configOf(directory, key), "", `${key} is still set after removal`);
+  }
+  assert.equal(await git(directory, "rev-parse", "refs/notes/reveries"), notesTip);
+});
+
+test("removal clears a legacy marker key without chasing it to a deletion", async () => {
+  // Older setup recorded the store it created. The key is local configuration and
+  // is cleared; the path in it is never followed to remove anything.
+  const directory = await fresh("removal-marker-");
+  const storePath = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(storePath, storeBody("alice@example.test"), "utf8");
+  await git(directory, "config", "reveries.managedTrustStore", storePath);
+
+  const result = await remove(directory);
+
+  assert.equal(await configOf(directory, "reveries.managedTrustStore"), "", "the marker key is cleared");
+  assert.equal(await storeExists(storePath), true, "the marker must never be chased to a deletion");
+});
+
+test("removal preserves a configured custom store and reports the path it resolved", async () => {
+  const custom = join(await mkdtemp(join(tmpdir(), "reveries-custom-store-")), "team-trust.json");
+  await writeFile(custom, storeBody("team@example.test"), "utf8");
+  const directory = await fresh("removal-custom-preserve-", { trustStore: custom });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [custom]);
+  assert.equal(result.trustStore.path, custom, "the reported path is the configured one, resolved before the config was cleared");
+  assert.equal(await readFile(custom, "utf8"), storeBody("team@example.test"));
+});
+
+test("removal preserves an external store that replaced the one setup created", async () => {
+  // The store setup created is repointed away from and a shared file takes its
+  // place. Neither is deleted: the first is ours to leave behind, the second was
+  // never ours at all.
+  const directory = await fresh("removal-replaced-");
+  const created = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(created, storeBody("alice@example.test"), "utf8");
+  const external = join(await mkdtemp(join(tmpdir(), "reveries-external-")), "trust.json");
+  await writeFile(external, storeBody("team@example.test"), "utf8");
+  await git(directory, "config", "reveries.trustStore", external);
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [external]);
+  assert.equal(await readFile(external, "utf8"), storeBody("team@example.test"), "the replacement survives byte for byte");
+  assert.equal(await storeExists(created), true, "the superseded store is left for the operator to remove knowingly");
+});
+
+test("removal preserves a store reached through a symlinked parent directory", async () => {
+  // A symlinked parent is the case a path comparison alone would get wrong: the
+  // configured path and the real path differ, and deleting either one is a guess.
+  const outside = await mkdtemp(join(tmpdir(), "reveries-symlink-store-"));
+  const real = join(outside, "real");
+  await mkdir(real, { recursive: true });
+  const linkPath = join(outside, "link");
+  await symlink(real, linkPath);
+  const viaLink = join(linkPath, "trust.json");
+  await writeFile(viaLink, storeBody("team@example.test"), "utf8");
+  const directory = await fresh("removal-symlink-", { trustStore: viaLink });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, [viaLink]);
+  assert.equal(
+    await readFile(viaLink, "utf8"),
+    storeBody("team@example.test"),
+    "a store under a symlinked parent is still a store, and removal still keeps it",
+  );
+});
+
+test("removal with no trust store reports that honestly", async () => {
+  const directory = await fresh("removal-no-store-");
+  const store = await defaultStoreOf(directory);
+  await rm(store, { force: true });
+
+  const result = await remove(directory);
+
+  assert.deepEqual(result.trustStore.preserved, []);
+  assert.match(result.trustStore.reason, /No trust store exists/);
+  assert.equal(result.removed, true);
+});
+
+test("a second removal preserves again and reports no configuration as cleared", async () => {
+  const directory = await fresh("removal-rerun-preserve-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+
+  await remove(directory);
+  const second = await remove(directory);
+
+  assert.deepEqual(second.removedTrustConfig, []);
+  assert.deepEqual(second.trustStore.preserved, [store]);
+  assert.equal(await storeExists(store), true, "a re-run must not delete anything either");
+});
+
+test("setup never clobbers a store that appears between its check and its write", async () => {
+  // The read-then-write window is a real race between two setup processes, and the
+  // loser's rename would destroy the winner's trust decisions. The create is
+  // exclusive, so the second writer adopts instead of replacing.
+  const directory = await fresh("race-create-");
+  const store = await defaultStoreOf(directory);
+  await mkdir(join(directory, ".git", "reveries"), { recursive: true });
+  await writeFile(store, storeBody("alice@example.test"), "utf8");
+
+  // A second setup runs against the same repository, which is the loser's position.
+  const again = await initializeRepository(directory, { ...REMOVAL_INIT });
+
+  assert.equal(again.trustStoreCreated, false, "an existing store is adopted, never replaced");
+  assert.equal(
+    await readFile(store, "utf8"),
+    storeBody("alice@example.test"),
+    "the concurrent writer's content survives intact",
+  );
+});
+
+test("setup creates a complete store a concurrent reader can never see half-written", async () => {
+  const directory = await createRepository("race-partial-");
+  await git(directory, "config", "--add", "remote.origin.push", "HEAD");
+  const store = (await trustStorePathFor(directory));
+
+  // Sample the store while setup writes it. Every observation must be either
+  // absent or a complete, parseable document; a partial write would break that.
+  const observations: (string | null)[] = [];
+  const sampling = (async () => {
+    for (let attempt = 0; attempt < 200 && observations.length < 200; attempt += 1) {
+      try {
+        observations.push(await readFile(store, "utf8"));
+      } catch {
+        observations.push(null);
+      }
+    }
+  })();
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+  await sampling;
+
+  for (const observation of observations) {
+    if (observation === null) continue;
+    assert.doesNotThrow(
+      () => JSON.parse(observation) as unknown,
+      "a reader observed a partially written trust store",
+    );
+  }
+  assert.deepEqual(JSON.parse(await readFile(store, "utf8")) as unknown, { keys: [] });
+});
+
+async function trustStorePathFor(directory: string): Promise<string> {
+  return (await readLocalTrustStore((await GitRepository.open(directory)))).path;
+}
+
+// --- Roles for slash-containing remote names --------------------------------
+//
+// Git permits a remote named `team/vendor` and rejects the flat key
+// `reveries.remoteRole.team/vendor` outright, so the role is declared through
+// the subsection key `reveries.remoteRole/team/vendor.role`. Both of the reads
+// below used to use a flat-only `git config --get-regexp` pattern, and on git
+// 2.39.5 such a pattern returns zero rows for a subsection key. That fails
+// quietly: convergence stops pruning the dangling role that keeps `doctor`
+// permanently `invalid`, and removal leaves a key behind that outlives the
+// behaviour it described.
+
+test("initialization drops a slash remote's role once that remote is gone", async () => {
+  const directory = await fresh("slash-role-converge-");
+  await git(directory, "remote", "add", "team/vendor", "https://example.invalid/team-vendor.git");
+  await git(directory, "config", "reveries.remoteRole.origin", "primary");
+  await git(directory, "config", "reveries.remoteRole/team/vendor.role", "import-only");
+  // A different key sharing the prefix. Convergence must leave it alone: the
+  // role writer does not own it.
+  await git(directory, "config", "reveries.remoteRole/team.someOtherSetting", "hello");
+
+  await git(directory, "remote", "remove", "team/vendor");
+  await initializeRepository(directory, { ...REMOVAL_INIT });
+
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team/vendor.role"),
+    "",
+    "a role for a deleted remote is a permanent contradiction and must be dropped",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole.origin"),
+    "primary",
+    "a role for a remote that still exists is kept",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team.someOtherSetting"),
+    "hello",
+    "a key that is not a role declaration is not convergence's to remove",
+  );
+});
+
+test("removal clears a slash remote's role and ignores a decoy subsection", async () => {
+  const directory = await fresh("slash-role-removal-");
+  await git(directory, "config", "reveries.remoteRole/team/vendor.role", "import-only");
+  await git(directory, "config", "reveries.remoteRole/team.someOtherSetting", "hello");
+
+  const result = await remove(directory);
+
+  assert.ok(
+    result.removedTrustConfig.includes("reveries.remoteRole/team/vendor.role"),
+    `expected the subsection role key to be owned, got ${JSON.stringify(result.removedTrustConfig)}`,
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team/vendor.role"),
+    "",
+  );
+  assert.equal(
+    await configOf(directory, "reveries.remoteRole/team.someOtherSetting"),
+    "hello",
+    "removal must not clear a key that is not a role declaration",
+  );
 });

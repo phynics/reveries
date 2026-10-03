@@ -1,0 +1,30 @@
+name: Reveries post-merge summaries
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reveries-post-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  synthesize:
+    name: Summarize host-created commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the protected default-branch revision
+        uses: actions/checkout@v7
+        with:
+          # The privileged job runs only code from the protected default branch.
+          # Pull request commits are fetched below as Git objects and never checked out.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Synthesize and publish host-created summaries
+        uses: ./.github/actions/reveries-post-merge

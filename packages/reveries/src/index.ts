@@ -1,12 +1,24 @@
 export * from "./protocol.ts";
-export { AtomicPushUnavailableError, GitCommandError, GitRepository, NotesLockError } from "./git.ts";
+export {
+  AtomicPushUnavailableError,
+  GitCommandError,
+  GitRepository,
+  hashBlobContent,
+  NotesContentionError,
+  NotesLockError,
+  NOTES_TXN_REF_PREFIX,
+  SnapshotIndexCorruptError,
+} from "./git.ts";
 export type {
+  BatchReadOptions,
   GitResult,
   NoteListEntry,
   NotesRefValidator,
   NotesTransaction,
   NotesValidationFailure,
+  TemporaryNotesRef,
   TreeEntry,
+  WithNotesWriteOptions,
 } from "./git.ts";
 export * from "./hooks.ts";
 export * from "./install.ts";

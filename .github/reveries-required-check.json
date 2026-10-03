@@ -1,8 +1,29 @@
 {
-  "v": 1,
+  "v": 6,
   "check_name": "Reveries receive-check",
-  "app_slug": "reveries",
-  "app_id_env": "REVERIES_APP_ID",
-  "events": ["pull_request", "merge_group"],
-  "policy": "Branch protection must require this exact check from the installed Reveries App, not an unpinned workflow name."
+  "app_slug": "github-actions",
+  "app_id": "15368",
+  "app_slug_env": "REVERIES_REQUIRED_APP_SLUG",
+  "app_id_env": "REVERIES_REQUIRED_APP_ID",
+  "events": [
+    "pull_request_target"
+  ],
+  "merge_trigger": "workflow_run",
+  "merge_environment": "reveries-merge",
+  "merge_enabled": false,
+  "merge_disable_reason": "Hard-disabled pending independent review of the source-run artifact binding, required-reviewer environment configuration, strict required status checks on the default-branch ruleset, and head-SHA merge guard.",
+  "merge_environment_note": "The workflow_run merge workflow names the reveries-merge environment, but required reviewers and protected-branch deployment rules are repository settings that must be configured externally before any merge permission is restored.",
+  "policy": "Branch protection must require this exact check from the named App, not an unpinned workflow name. The App identity here is the GitHub Actions App, because the check runs from a workflow in this repository; an earlier revision named a `reveries` App that no installation provides, which made the pin permanently unsatisfiable rather than strict.",
+  "override_note": "Overriding the App through the REVERIES_REQUIRED_APP_SLUG/ID repository variables changes what the bot trusts, and branch protection must be changed to require the same App in the same step. The two are one control: a bot that trusts App A while the ruleset requires App B checks nothing, and a ruleset requiring App B while the bot trusts App A means the bot's gate is not the repository's gate.",
+  "binding_note": "A passing check is not sufficient on its own, and neither is a check run of the same name. The github-actions App is shared by every workflow in the repository, and a same-repository pull request can add a workflow that requests checks: write and post a look-alike check citing a real trusted run. So no binding is ever read from a check run. Instead the trusted pull_request_target receive-check records the pull request number, head SHA, base SHA, and base tree as an artifact named reveries-receive-check-binding, belonging to its own run: artifacts belong to one run and only that run can upload to it, so the evidence is bound to the run that produced it. The bot resolves runs of this workflow file by path, requires the pull_request_target event whose code comes from the base branch plus a successful conclusion on the current head, and reads that run's artifact. Missing, unreadable, ambiguous, stale, or untrusted-source bindings are refused. Recording the binding needs no token permission.",
+  "strict_required_status_checks": true,
+  "strict_base_note": "A binding can only describe the state at the moment it was read. Between the bot's final pull-request read and PUT /pulls/{n}/merge the base can advance, and the merge request's `sha` guards the head only. strict_required_status_checks_policy is the host-side guard: with it on, GitHub refuses a merge whose branch is behind its base, so the window is closed by the platform rather than by a check the bot already performed. The bot reads the ruleset and refuses to merge when the setting is absent or unreadable. Merge queues serialise candidates instead and are an acceptable alternative, but are out of scope here.",
+  "permission_note": "Reading the ruleset needs no extra permission on a public repository. Where it cannot be read at all - a private repository, or a token without access - the bot refuses rather than assuming the setting is on.",
+  "binding_artifact_name": "reveries-receive-check-binding",
+  "merge_enablement_prerequisites": [
+    "Independently review the exact trusted-run artifact binding and the head-SHA merge guard.",
+    "Configure the default-branch ruleset with strict_required_status_checks_policy=true, then verify it through GitHub's API.",
+    "Configure the reveries-merge environment with required reviewers and a protected-branch deployment policy.",
+    "Only after those checks pass, make the bot's script and workflow merge-capable together."
+  ]
 }

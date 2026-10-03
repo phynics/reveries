@@ -123,6 +123,7 @@ test("receive fixture validates proposed ref updates without moving refs", async
     baseTree,
   });
   assert.equal(accepted.ok, true, JSON.stringify(accepted.diagnostics));
+  assert.deepEqual(accepted.findings, []);
   assert.equal(await git(bare, "rev-parse", "refs/heads/main"), oldObject);
 
   const missingEvidence = await checkReceive(bare, {
@@ -130,6 +131,12 @@ test("receive fixture validates proposed ref updates without moving refs", async
   });
   assert.equal(missingEvidence.ok, false);
   assert.match(missingEvidence.diagnostics.join("\n"), /notes\/reveries.*update/i);
+  assert.ok(missingEvidence.findings.some((finding) => finding.code === "missing-notes-publication"));
+  assert.ok(
+    missingEvidence.findings
+      .filter((finding) => finding.code === "missing-notes-publication")
+      .every((finding) => finding.remediation.includes("refs/notes/reveries")),
+  );
 
   const staleBase = await checkReceive(bare, {
     updates: [
@@ -141,4 +148,78 @@ test("receive fixture validates proposed ref updates without moving refs", async
   });
   assert.equal(staleBase.ok, false);
   assert.match(staleBase.diagnostics.join("\n"), /base tree changed/i);
+
+  await writeFile(join(source, "other.txt"), "unannotated\n", "utf8");
+  await git(source, "add", "other.txt");
+  await git(source, "commit", "-m", "change unannotated file");
+  const unsummarized = commitId(await git(source, "rev-parse", "HEAD"));
+  await git(source, "push", "origin", `${unsummarized}:refs/fixtures/proposed`);
+  const unsummarizedBaseTree = objectId(await git(bare, "rev-parse", `${oldObject}^{tree}`));
+
+  const missingSummary = await checkReceive(bare, {
+    updates: [
+      { ref: "refs/heads/main", oldObject, newObject: unsummarized },
+      { ref: "refs/notes/reveries", oldObject: oldNotes, newObject: proposedNotes },
+    ],
+    evidence: [{ object: unsummarized, baseTree: unsummarizedBaseTree }],
+    baseTree: unsummarizedBaseTree,
+  });
+  assert.equal(missingSummary.ok, false);
+  const summaryFinding = missingSummary.findings.find((finding) => finding.code === "missing-session-summary");
+  assert.ok(summaryFinding, JSON.stringify(missingSummary.findings));
+  assert.equal(summaryFinding?.grade, "strict");
+  assert.equal(summaryFinding?.commit, unsummarized);
+  assert.match(summaryFinding?.remediation ?? "", /session-summary/);
+
+  const fallbackWithoutDescription = await checkReceive(bare, {
+    updates: [
+      { ref: "refs/heads/main", oldObject, newObject: unsummarized },
+      { ref: "refs/notes/reveries", oldObject: oldNotes, newObject: proposedNotes },
+    ],
+    evidence: [{ object: unsummarized, baseTree: unsummarizedBaseTree }],
+    baseTree: unsummarizedBaseTree,
+    allowPrDescriptionSummary: true,
+  });
+  assert.equal(fallbackWithoutDescription.ok, false);
+
+  const fallbackCovered = await checkReceive(bare, {
+    updates: [
+      { ref: "refs/heads/main", oldObject, newObject: unsummarized },
+      { ref: "refs/notes/reveries", oldObject: oldNotes, newObject: proposedNotes },
+    ],
+    evidence: [{ object: unsummarized, baseTree: unsummarizedBaseTree }],
+    baseTree: unsummarizedBaseTree,
+    prDescription: "Describe the transition for reviewers.",
+    allowPrDescriptionSummary: true,
+  });
+  assert.equal(fallbackCovered.ok, true, JSON.stringify(fallbackCovered.diagnostics));
+  const lowerGrade = fallbackCovered.findings.find((finding) => finding.code === "summary-from-pr-description");
+  assert.ok(lowerGrade, JSON.stringify(fallbackCovered.findings));
+  assert.equal(lowerGrade?.grade, "lower");
+  assert.equal(lowerGrade?.commit, unsummarized);
+
+  await writeFile(join(source, "state.txt"), "third\n", "utf8");
+  await git(source, "add", "state.txt");
+  await git(source, "commit", "-m", "change state without disposition");
+  const undispositioned = commitId(await git(source, "rev-parse", "HEAD"));
+  await reveries.summarize({ commit: undispositioned, summary: summary() });
+  await git(source, "push", "origin", `${undispositioned}:refs/fixtures/proposed`);
+  await git(source, "push", "origin", "refs/notes/reveries:refs/notes/proposed");
+  const undispositionedNotes = objectId(await git(bare, "rev-parse", "refs/notes/proposed"));
+
+  const missingDisposition = await checkReceive(bare, {
+    updates: [
+      { ref: "refs/heads/main", oldObject, newObject: undispositioned },
+      { ref: "refs/notes/reveries", oldObject: oldNotes, newObject: undispositionedNotes },
+    ],
+    evidence: [{ object: undispositioned, baseTree: unsummarizedBaseTree }],
+    baseTree: unsummarizedBaseTree,
+  });
+  assert.equal(missingDisposition.ok, false);
+  const dispositionFinding = missingDisposition.findings.find(
+    (finding) => finding.code === "missing-continuity-disposition",
+  );
+  assert.ok(dispositionFinding, JSON.stringify(missingDisposition.findings));
+  assert.equal(dispositionFinding?.commit, undispositioned);
+  assert.match(dispositionFinding?.remediation ?? "", /disposition|continue/i);
 });

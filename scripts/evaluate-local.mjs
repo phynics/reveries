@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,6 +41,16 @@ const criteria = [
   { category: "protocol-git", criterion: "Arbitrary unstaged object write is refused", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "continuity refuses an arbitrary unstaged object")] },
   { category: "receive", criterion: "Receive fixture validates proposed ref updates", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "receive fixture validates proposed ref updates without moving refs")] },
   { category: "receive", criterion: "Base-tree changes invalidate earlier receive evidence", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "base tree changed")] },
+  { category: "protocol-git", criterion: "Host-created merge commits receive one summary per pull request commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a host-created merge commit receives one entry per pull request commit")] },
+  { category: "protocol-git", criterion: "Squash preserves recorded retirement evidence", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a squashed pull request keeps the retirement evidence recorded on its commits")] },
+  { category: "protocol-git", criterion: "A rebased pull request summarizes only the new tip commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a rebased pull request summarizes only the new tip commit"), evidence("scripts/reveries-post-merge.test.mjs", "a rebased pull request plans only the new tip commit and defers the intermediates")] },
+  { category: "protocol-git", criterion: "A synthesized summary that fails strict validation is never written", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a synthesized summary that fails strict validation is never written")] },
+  { category: "protocol-git", criterion: "A repeated post-merge run is a no-op", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a repeated run leaves the notes ref unchanged")] },
+  { category: "protocol-git", criterion: "A concurrent human summary wins over a synthesized summary", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a concurrently attached human summary wins over a synthesized summary")] },
+  { category: "receive", criterion: "Notes publication reconciles a concurrent writer before its compare-and-swap push", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication incorporates a concurrent writer before its compare-and-swap push")] },
+  { category: "receive", criterion: "An invalid concurrent notes union fails closed", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication fails closed on an invalid concurrent union and leaves the remote untouched")] },
+  { category: "host-adapters", criterion: "The post-merge workflow never executes pull request code", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "the post-merge workflow trusts the pushed default-branch revision and writes only notes")] },
+  { category: "host-adapters", criterion: "An ambiguous rebased commit is reported instead of guessed", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "an ambiguous rebase mapping is reported and never planned")] },
 
   { category: "initialization", criterion: "Repeated initialization is idempotent", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
   { category: "initialization", criterion: "Existing AGENTS prose is preserved", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
@@ -65,6 +75,12 @@ const criteria = [
   { category: "installer", criterion: "Global npx Skills install for five hosts", status: "covered", evidence: [evidence("scripts/installer-acceptance.mjs", "Reveries Skills installer acceptance passed.")] },
   { category: "installer", criterion: "Skills update and removal paths", status: "covered", evidence: [evidence("scripts/installer-acceptance.mjs", "Reveries Skills installer acceptance passed.")] },
 ];
+
+// RVR-020: every criterion in this runner belongs to the LOCAL grade. The
+// TEAM, HOSTED, and AUTOMATIC DELIVERY grades have their own runners and
+// reports; no higher grade is inferred from this one.
+const GRADE = "LOCAL";
+for (const item of criteria) item.grade ??= GRADE;
 
 async function run(command, args) {
   const started = performance.now();
@@ -96,6 +112,17 @@ async function run(command, args) {
   });
 }
 
+async function markdownFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const paths = [];
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) paths.push(...await markdownFiles(path));
+    else if (entry.isFile() && path.endsWith(".md")) paths.push(path);
+  }
+  return paths;
+}
+
 async function validateSkills() {
   const names = [
     "reveries-git-notes-init",
@@ -113,7 +140,29 @@ async function validateSkills() {
     if (!frontmatter?.[1].includes("description:")) failures.push(`${name}: missing description`);
     if (content.split("\n").length > 120) failures.push(`${name}: main Skill exceeds 120 lines`);
   }
-  await readFile(join(workspace, "skills", "using-reveries", "references", "direct-git.md"), "utf8");
+  const skillDirectory = join(workspace, "skills", "using-reveries");
+  for (const path of await markdownFiles(skillDirectory)) {
+    const content = await readFile(path, "utf8");
+    for (const match of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+      const link = match[1].trim().match(/^<([^>]*)>|^(\S+)/);
+      if (link === null) continue;
+      const target = (link[1] ?? link[2]).split(/[?#]/, 1)[0];
+      if (target.length === 0 || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(target)) continue;
+
+      const resolved = resolve(dirname(path), decodeURIComponent(target));
+      const relativeTarget = relative(skillDirectory, resolved);
+      if (relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) {
+        failures.push(`${relative(skillDirectory, path)}: link escapes the using-reveries Skill folder`);
+        continue;
+      }
+      try {
+        await readFile(resolved, "utf8");
+      } catch {
+        failures.push(`${relative(skillDirectory, path)}: link target does not exist (${target})`);
+      }
+    }
+  }
+  await readFile(join(skillDirectory, "references", "direct-git.md"), "utf8");
   return failures;
 }
 
@@ -141,6 +190,8 @@ try {
   gates.push(await run("npm", ["run", "test:full"]));
   gates.push(await run("npm", ["run", "conformance"]));
   gates.push(await run("node", ["scripts/direct-git-acceptance.mjs"]));
+  gates.push(await run("node", ["scripts/post-merge-fixture.mjs"]));
+  gates.push(await run("npm", ["run", "test:scripts"]));
   gates.push(await run("npm", ["run", "acceptance:receive"]));
   gates.push(await run("node", ["scripts/native-skill-evidence.mjs"]));
   gates.push(await run("node", ["scripts/installer-acceptance.mjs"]));
@@ -168,8 +219,22 @@ try {
   const releaseReady = gatesOk
     && evidenceFailures.length === 0
     && criteria.every((item) => item.status === "covered" || item.status === "not-claimed");
+  const hostVersion = await run("git", ["--version"]);
   const result = {
+    grade: GRADE,
     generated_at: new Date().toISOString(),
+    host: {
+      name: "local-workstation",
+      version: `${process.version}, ${hostVersion.stdout.trim()}`,
+    },
+    merge_mode: "not-applicable (local grade; hosted merge modes belong to HOSTED)",
+    repository: "local worktree (no network access, no writes outside disposable directories)",
+    evidence_scale: {
+      criteria: criteria.length,
+      gates: gates.length,
+      unit: "acceptance criteria and executable gates",
+    },
+    verdict: releaseReady ? "verified" : "failed",
     environment: {
       network_used: false,
       external_writes: false,
@@ -194,7 +259,7 @@ try {
   if (json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } else {
-    process.stdout.write("Reveries local evaluation\n\n");
+    process.stdout.write("Reveries LOCAL evaluation (grade: LOCAL; TEAM, HOSTED, and AUTOMATIC DELIVERY have their own runners)\n\n");
     for (const gate of result.gates) {
       process.stdout.write(`${gate.ok ? "PASS" : "FAIL"} ${gate.command.join(" ")} (${gate.duration_ms} ms)\n`);
       if (!gate.ok && gate.diagnostic !== null) process.stdout.write(`  ${gate.diagnostic.replaceAll("\n", "\n  ")}\n`);

@@ -157,7 +157,7 @@ RVR-006 provides the local plumbing path. RVR-007 generalizes immutable facts. R
 **Priority:** P0
 **Feasibility:** Core / V2 plus Adapter
 **Stage:** 3
-**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5)
+**Tracker:** [GitHub issue #5](https://github.com/phynics/reveries/issues/5). The envelope, manifest contract, mismatch validation, and signed checkpoints are implemented; authority acceptance (RVR-017) and the review projection (RVR-019) are still open, so this ticket is not yet complete.
 
 ### Problem
 
@@ -188,6 +188,17 @@ RVR-008 supplies retention. RVR-009 supplies signed checkpoints. RVR-017 defines
 - Manifest, parent, and subtree mismatches are rejected.
 - V1 notes history imports without rewriting.
 - Ledger additions cannot remove existing facts.
+
+### Remaining
+
+- Authority role semantics for the reserved `manifest.authority` field (RVR-017).
+- A generated `review/` projection subtree (RVR-019).
+
+Signed ledger checkpoints over the manifest, receive-side classification of
+`refs/heads/reveries-ledger` as evidence, and the `reveries ledger` command, the
+human-readable doctor ledger line, and `sync --pull` wiring for envelope
+materialization have all landed.
+- Publishing the ledger branch alongside the code and notes refs in one atomic push.
 
 ## RVR-006: Add atomic local commit-and-summary creation
 
@@ -229,7 +240,7 @@ RVR-002 defines safe publication. RVR-004 later changes the causal record used b
 **Priority:** P1
 **Feasibility:** Core / V2
 **Stage:** 2
-**Tracker:** [GitHub issue #7](https://github.com/phynics/reveries/issues/7)
+**Tracker:** [GitHub issue #7](https://github.com/phynics/reveries/issues/7). Implemented on `feature/plan-open-reveries-w-7df`.
 
 ### Problem
 
@@ -301,7 +312,7 @@ RVR-012 provides efficient evidence loading. RVR-005 carries the vault checkpoin
 **Priority:** P1
 **Feasibility:** Core / V2 records and checkpoints; Boundary identity enforcement
 **Stage:** 3
-**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9)
+**Tracker:** [GitHub issue #9](https://github.com/phynics/reveries/issues/9). The `signature` record family, the trust vocabulary, key rotation that preserves decision IDs, the `reveries.signingRoles` policy read, signed ledger checkpoints over the manifest bytes, the signing and trust CLI, and the `install.ts` trust-store setup are implemented, and a real repository reaches `trusted` and `policy-satisfying` with the in-process ed25519 backend alone. The Git SSH verifier and boundary acceptance remain, so this ticket is not yet complete.
 
 ### Problem
 
@@ -330,6 +341,51 @@ RVR-004 defines transition IDs. RVR-005 defines the checkpoint envelope. RVR-017
 - A checkpoint binds exact notes, ledger, and retention tips.
 - Key rotation does not change decision IDs.
 - Trust state distinguishes unknown, valid, trusted, and policy-satisfying signatures.
+
+### Remaining
+
+- A Git SSH `allowed_signers` verifier behind the existing port; the in-process
+  ed25519 verifier is the only backend today, and it is sufficient on its own.
+- Boundary acceptance of a signature. Verification and classification are
+  implemented and readable through `reveries verify`, but nothing yet refuses a
+  commit or a receive based on them; authority acceptance belongs to RVR-017.
+
+### Proven
+
+- `reveries sign` attests a record already in the notes and appends an `sg:` record to
+  its subject; `reveries verify` reports every trust state and fails only for `invalid`
+  and `revoked`, while `--require-policy` fails for every state below
+  `policy-satisfying`.
+- `reveries trust init` is the only key-generation path: exclusive create, mode `0600`,
+  no overwrite, a destination refused inside the worktree or either Git directory after
+  resolving the real path, and no key material in any output.
+- Removal preserves every trust store and deletes no trust material: created, adopted,
+  external, repointed, or reached through a symlinked parent. It clears only the owned
+  configuration that is actually set, resolves the store path before clearing it, and reports
+  the paths it considered. There is no deletion path and no override flag.
+- Setup creates the store atomically and exclusively, so a concurrent setup adopts what is
+  there instead of clobbering it, and a reader never observes a partial document.
+- Identity is derived from the loaded key's fingerprint; a key with no trust-store entry
+  is refused rather than allowed to claim an identity.
+- `trust add` accepts a PEM public key only. A PKCS#8 private key is refused by content so
+  secret material never reaches a public store, an OpenSSH `ssh-ed25519` line is refused by
+  name with the accepted formats stated, and everything accepted is normalised to SPKI before
+  the store is touched so the stored `key_id` matches the stored bytes.
+- `trust init` rolls back the key it created when the store write fails, so the retry
+  succeeds and a pre-existing key is never removed.
+- `--require-policy` with `reveries.signingRoles` unset fails and names
+  `reveries policy set`; `trusted` is never treated as `policy-satisfying`.
+- An invalid authority configuration fails `ledger build`, `sync --pull`, and
+  `ledger materialize` closed, before any checkpoint, fetch, or note write.
+- `ledger build` reports the authority read back out of the built manifest, so
+  `result.authority` cannot disagree with `manifest.authority`; the resolved primary is
+  reported separately and a deliberate `--authority` divergence is rendered.
+- An explicit `ledger materialize` of a `mirror` or `import-only` remote's envelope is
+  refused, so the quarantine cannot be routed around by naming the ref directly.
+- Author metadata is outside both the signed payload and the `sg:` ID: rewriting
+  `created_at`, `author_email`, or `session` leaves the state unchanged, so those fields
+  are unclaimed provenance and no output presents them as attested. Tampering with
+  `content_id` is what the cryptographic verdict catches.
 
 ## RVR-010: Add protocol resource limits and bounded validation
 
@@ -611,107 +667,148 @@ RVR-005 defines checkpoints. RVR-009 defines signer trust. RVR-001 defines quara
 - Federation preserves each origin history.
 - Union and conflicts do not depend on processing order.
 
-## RVR-018: Define redaction, secrets, and confidential-evidence policy
+### Proven
+
+- `reveries role set` writes `reveries.remoteRole.*`, refuses a second primary and a
+  role for a remote Git does not have, and reports the *resolved* authority.
+- `reveries ledger build` stamps the manifest with the resolved primary; `--authority`
+  and `--no-authority` are distinct overrides, and `--no-sign` bypasses a configured
+  signer rather than writing an attestation and ignoring it.
+- An `import-only` or `mirror` remote that also publishes a ledger envelope cannot reach
+  `refs/notes/reveries` through the envelope after the notes route quarantined it, in both
+  the absent and strict-ancestor cases. An archive refusal and a malformed role value both
+  fail closed without reaching the envelope route.
+- A remote whose name contains a slash is declarable and enforceable. `role set/show/clear`
+  accept it, writing the subsection key `reveries.remoteRole/team.vendor.role` because Git
+  rejects the flat form; a slash-free name keeps the flat key byte for byte. Init
+  convergence and `reveries remove` both see the subsection form, so a dangling slash role
+  is dropped rather than keeping `doctor` permanently `invalid`, and a key under the same
+  prefix that is not a role declaration is never read as one and never cleared.
+- A tracking ref for a slash remote resolves by longest exact `refs/remotes/<name>/`
+  prefix, so `refs/remotes/team/vendor/reveries-ledger` is judged by `team/vendor`'s role and
+  not `team`'s. The command layer and the library resolve it identically and reach the same
+  verdict: with `team` import-only and `team/vendor` undeclared, `ledger materialize`
+  promotes; with `team/vendor` import-only, both refuse and `refs/notes/reveries` is
+  byte-identical afterwards.
+
+## RVR-030: Make a quarantined candidate inspectable
 
 **Priority:** P1
-**Feasibility:** Prevention and tooling are feasible; global erasure is Boundary
-**Stage:** 4
-**Tracker:** [GitHub issue #18](https://github.com/phynics/reveries/issues/18)
+**Feasibility:** The write path was already correct; this is a reader and its documentation
+**Stage:** 2
+**Tracker:** [GitHub issue #36](https://github.com/phynics/reveries/issues/36)
 
 ### Problem
 
-Evidence can contain credentials, customer data, security details, or regulated information. Rewriting a remote ref cannot erase bytes from existing clones, bundles, mirrors, or caches.
-
-### Architecture
-
-Put the public evidence policy in `README.md`, protocol docs, and initialization guidance. Add pre-write checks at CLI and operation boundaries. Represent soft redaction as an immutable protocol fact. Put hard-redaction history rewriting and retention rebuilds in an explicit maintenance command. Keep confidential pointers separate from public records.
-
-### Goal
-
-Prevent secrets from entering evidence and describe redaction without claiming that distributed Git history can be erased everywhere.
-
-### Method
-
-Scan new narrative fields for secrets, high-entropy values, pasted logs, and personal data. Enforce size limits. Add signed soft-redaction facts that suppress normal projections while preserving a non-sensitive reason. Add hard-redaction tooling that creates a signed discontinuity checkpoint and mirror action report. Support only signed opaque pointers for confidential rationale.
-
-### Dependencies
-
-RVR-007 supplies immutable redaction facts. RVR-008 supplies retention rebuilds. RVR-009 supplies signatures. RVR-010 supplies field limits.
+A quarantined candidate is preserved at `refs/reveries/quarantine/<remote>/<oid>`, written
+correctly with `git update-ref`. But `git notes --ref=<that ref>` does not reject the name — it
+resolves `refs/notes/refs/reveries/quarantine/<remote>/<oid>` instead, reports no note, and exits
+successfully. The write and the read are wrong in the same direction, so they agree with each other
+and the failure is silent: an operator inspecting a quarantine during an incident concludes it is
+empty while the candidate is sitting there intact. A shadow ref can also exist and return plausible
+content, so the same command may appear to work in one repository and fail in another.
 
 ### Acceptance criteria
 
-- Documentation prohibits secrets.
-- Soft-redacted records do not render in normal delivery or search.
-- Hard redaction creates a verifiable checkpoint and mirror report.
-- No command claims to erase independent clones.
-- Confidential pointers are syntactically distinct from public evidence.
+- No documentation, runbook, or test tells an operator to read a quarantine with
+  `git notes --ref=`.
+- A supported inspection path exists that reports every preserved candidate and reads its
+  records.
+- The reader resolves a remote containing a slash to its whole name.
+- An empty quarantine is an ordinary reported state, not a failure.
+- A `refs/notes/…` shadow name is refused rather than silently read.
+- Inspecting a quarantine never moves canonical state.
 
-## RVR-019: Add evidence-diff review surfaces for PRs and IDEs
+### Proven
+
+- `git notes --ref=<quarantine>` exits 0 and reports nothing for a candidate whose bytes are
+  present and readable as Git objects; the defect is asserted directly, so the reason for the
+  reader cannot be quietly forgotten.
+- `reveries ledger quarantine list` reports every preserved candidate with the remote recovered
+  from the ref, and `show <ref>` returns the record bytes through the tree-reading accessor.
+- A remote named `team/vendor` keeps its whole name in the listing.
+- With no quarantine, `list` exits 0 and says so in both JSON and human form.
+- `show` refuses `refs/notes/<quarantine ref>` with a usage error naming the real namespace, and
+  refuses an absent ref by pointing at `list`.
+- The command layer builds no `git notes` argv at all, asserted at the source level, so the trap
+  cannot reappear through a second code path.
+- No file in the repository instructs a reader to use `git notes --ref=` on a `refs/reveries/`
+  ref.
+
+## RVR-031: Make the controlled-merge bot's App pin satisfiable
 
 **Priority:** P1
-**Feasibility:** Core diff engine and Adapter presentation
+**Feasibility:** The bot and its workflow are already in place; this is its configuration
 **Stage:** 3
-**Tracker:** [GitHub issue #19](https://github.com/phynics/reveries/issues/19)
+**Tracker:** [GitHub issue #25](https://github.com/phynics/reveries/issues/25)
 
 ### Problem
 
-Raw JSONL and command-line search are insufficient for routine review. Reviewers need evidence changes beside code changes.
+The bot required a successful `Reveries receive-check` whose `app.slug` was `reveries` and whose
+numeric ID came from an unset repository variable. The check is posted by a workflow in the
+repository on a `pull_request_target` trigger, so GitHub attributes it to the Actions app —
+slug `github-actions`, ID 15368 — and no `reveries` App is installed. The bot therefore required a
+check nothing could post and refused every merge. Pinning an App that does not exist is not a
+control; it is a permanently closed gate.
 
-### Architecture
-
-Add a host-neutral diff operation in `operations.ts` and stable JSON rendering in `cli.ts`. Reuse protocol projections and the snapshot loader. Keep GitHub checks and IDE views as read-only adapters. Generated review files are projections and never authority.
-
-### Goal
-
-Let a reviewer see what causal evidence changed, what remains unresolved, and which transition the candidate uses without reading raw note bodies.
-
-### Method
-
-Implement `reveries diff <base>..<candidate> --json`. Include new, continued, superseded, and retired decisions; transitions; unresolved obligations; signatures and trust; completeness; and evidence that does not apply to the candidate. Render the same JSON into GitHub checks and later IDE hover or CodeLens views.
-
-### Dependencies
-
-RVR-004 supplies transitions. RVR-009 supplies trust state. RVR-012 supplies snapshots. RVR-015 supplies completeness. RVR-003 consumes the output for hosted checks.
+Separately, the workflow defaulted `merge_method` to `squash`, the method that discards every
+per-commit session summary the pull request carried.
 
 ### Acceptance criteria
 
-- One JSON diff drives CLI, CI, and adapters.
-- Merge-group checks use actual candidate trees.
-- Rendering has deterministic size limits.
-- Read-only adapters do not mutate evidence.
-- Reviewers can see causal changes without reading JSONL.
+- The expected App slug and numeric ID are configurable from **repository configuration**, never
+  from a per-dispatch input, defaulting to the identity the check actually runs under.
+- No dispatch-time input may name an App identity.
+- A non-numeric App ID is refused rather than silently never matching a real check.
+- A check name alone never satisfies the gate; the App slug and numeric ID are both required.
+- The default merge method preserves the pull request's own commits and their summaries, and
+  squash and rebase are documented as lossy.
+- The bot holds no write access to `refs/notes/reveries`.
 
-## RVR-020: Add multi-user, failure, and scale conformance grades
+### Proven
 
-**Priority:** P0
-**Feasibility:** Core test infrastructure plus hosted Adapter fixtures
-**Stage:** 1
-**Tracker:** [GitHub issue #20](https://github.com/phynics/reveries/issues/20)
+- The default pin is `github-actions`/`15368`, matching what the ruleset requires
+  (`integration_id: 15368`) and what check runs report; the workflow's defaults and the script's
+  defaults agree, and the unset `vars.REVERIES_APP_ID` read is gone.
+- The override lives in `vars.REVERIES_REQUIRED_APP_SLUG`/`REVERIES_REQUIRED_APP_ID`, set by
+  repository administrators. A `workflow_dispatch` input was rejected: it would let whoever
+  dispatches the merge choose the App identity that authorises it. A negative check confirms the
+  guard test fails if such an input is reintroduced.
+- The script still validates the pin it is handed, so a misconfigured variable is refused rather
+  than silently never matching a real check.
 
-### Problem
+### Base binding
 
-The current release gate covers local behavior but not multi-user operation, hosted Git behavior, or verified automatic delivery. A passing local suite must not imply team or hosted readiness.
-
-### Architecture
-
-Extend `scripts/evaluate-local.mjs`, `scripts/conformance.mjs`, direct-Git acceptance, installer acceptance, and native-skill evidence into independent grade runners. Store named host, agent, repository size, record count, memory, latency, and failure evidence as test artifacts.
-
-### Goal
-
-Report readiness as a matrix with independent evidence. Prevent a local pass from implying team, hosted, or automatic-delivery claims.
-
-### Method
-
-Define four grades. `LOCAL` covers current protocol, CLI, direct-Git, installer, and single-repository checks. `TEAM` covers multiple clones and writers, invalid unions, CAS retries, push failures, force-push and deleted-branch cases, garbage collection, shallow and partial clones, termination, fuzzing, limits, and performance. `HOSTED` names the host and version, pull request type, fork behavior, merge method, merge queue, required checks, permissions, transport failures, and recovery. `AUTOMATIC DELIVERY` names the agent host and version and records native delivery evidence. Report a matrix instead of one `release_ready` boolean.
-
-### Dependencies
-
-RVR-001, RVR-002, RVR-008, RVR-010, RVR-012, RVR-015, and RVR-016 provide Stage 1 behavior to measure. RVR-003 and RVR-005 provide hosted fixtures.
-
-### Acceptance criteria
-
-- Every grade has named executable criteria.
-- No higher grade is inferred from a lower one.
-- Scale results publish repository size, record count, memory, and latency.
-- Hosted results name exact host versions and merge modes.
-- A multi-user pilot is required for stable `TEAM` status.
+- No GitHub API surface records the base a check validated, so the operator-supplied `base_tree`
+  input was **removed**: it was never a trust source, since typing the current base tree satisfied the
+  old comparison while a stale successful check remained.
+- The binding is an **artifact of the trusted run**, not a check run. Every Actions workflow shares
+  the `github-actions` App, so a same-repository pull request can post a look-alike check; naming a
+  real trusted run inside it proves nothing, because the forger supplies the payload. Artifacts belong
+  to one run and only that run can upload to them, which is the only source binding available once a
+  same-repo pull request is assumed able to read secrets and request permissions.
+- Recording it adds **no token permission**; the receive-check job keeps `contents: read` and
+  `pull-requests: read` and never posts a check run. The bot holds `actions: read` to download.
+- The privileged merge workflow is triggered only by `workflow_run` completion. That trigger has no
+  caller-selected ref and runs from the default branch. It receives the exact source run ID from the
+  event, re-fetches that run, and checks its repository, workflow path, `pull_request_target` event,
+  successful conclusion, and head before reading that run's artifact. A `pull_request` source run is
+  refused because its workflow code comes from the pull request rather than the base branch.
+- Missing, unreadable, expired, ambiguous, stale, and untrusted-source bindings are refused, as is a
+  fetch failure. Check-run content is never consulted.
+- The artifact reader treats the archive as hostile: a declared size over 4 MiB is refused before
+  decompression, an under-declared expansion is stopped by a cap passed into the decompressor, and
+  declared size plus CRC-32 must both match, so corrupt-but-parseable bytes cannot become an accepted
+  security claim.
+- The merge request carries `sha: pullRequest.head.sha`, so a head that moves after validation is
+  refused by GitHub (409) rather than merged unchecked. The bot does not retry that case.
+- The privileged job names the `reveries-merge` environment, which must be configured externally
+  with required reviewers and a protected-branch deployment policy. Merely naming the environment in
+  YAML does not create approval.
+- **The bot remains hard-disabled and has no merge permission.** `MERGE_ENABLED` is `false`, and the
+  workflow grants no `pull-requests: write`, until the source-run artifact protocol, strict ruleset,
+  protected environment, and head-SHA guard are independently reviewed and externally configured.
+- **Not yet deployed or observed.** #25 stays open until a real pull request produces a binding the
+  bot accepts and a moved base it refuses. The repository's live ruleset also still lacks
+  `strict_required_status_checks_policy`, and the `reveries-merge` environment has not been
+  configured, so the bot would refuse even once deployed.
