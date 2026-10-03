@@ -661,6 +661,84 @@ export class GitRepository {
     return blobId(object);
   }
 
+  /**
+   * Resolve a worktree path to its blob-or-tree subject (RVR-013). Directory
+   * paths resolve to tree objects; file paths resolve to blobs. The `index`
+   * revision resolves staged file blobs; staged trees resolve through
+   * `indexPathsForSubject`, which materializes the index tree. Raw object IDs
+   * are handled by the caller via `objectType`, never by this path resolver.
+   */
+  async resolveSubject(input: PathResolution): Promise<{ readonly object: ObjectId; readonly type: "blob" | "tree" }> {
+    if (input.path.length === 0 || input.path.includes("\0")) {
+      throw new Error("A Git path must be nonempty and cannot contain NUL");
+    }
+    if (input.revision === "index") {
+      const staged = await this.listIndex();
+      const match = staged.find((entry) => entry.path === input.path || entry.path.startsWith(`${input.path}/`));
+      if (match === undefined) {
+        throw new Error(`:${input.path} does not resolve to a staged blob or tree`);
+      }
+      if (match.path === input.path) {
+        return { object: match.object, type: "blob" };
+      }
+      const tree = await this.indexTree();
+      const oid = await this.subtreeForPath(tree, input.path);
+      if (oid === null) {
+        throw new Error(`:${input.path} does not resolve to a staged blob or tree`);
+      }
+      return { object: oid, type: "tree" };
+    }
+    const expression = `${input.revision}:${input.path}`;
+    const result = await this.run(["rev-parse", "--verify", expression]);
+    const object = parseObjectId(result.stdout, `git rev-parse ${expression}`);
+    const type = (await this.run(["cat-file", "-t", object])).stdout.trim();
+    if (type !== "blob" && type !== "tree") {
+      throw new Error(`${expression} does not resolve to a blob or tree`);
+    }
+    return { object, type };
+  }
+
+  /** The subtree OID at `path` below `tree`, or null when no such directory exists. */
+  private async subtreeForPath(tree: ObjectId, path: string): Promise<ObjectId | null> {
+    const segments = path.split("/").filter((segment) => segment.length > 0);
+    let current = tree;
+    for (const segment of segments) {
+      const children = await this.listTreeDirect(current);
+      const match = children.find((entry) => entry.type === "tree" && entry.path === segment);
+      if (match === undefined) return null;
+      current = match.object;
+    }
+    return current;
+  }
+
+  /** Immediate children of one tree object (non-recursive). */
+  private async listTreeDirect(tree: ObjectId): Promise<readonly TreeEntry[]> {
+    const result = await this.run(["ls-tree", "-z", tree]);
+    return result.stdout
+      .split("\0")
+      .filter((record) => record.length > 0)
+      .map((record) => {
+        const separator = record.indexOf("\t");
+        if (separator < 0) {
+          throw new Error("Malformed git ls-tree record");
+        }
+        const metadata = record.slice(0, separator).split(" ");
+        const [mode, type, objectValue] = metadata;
+        if (
+          mode === undefined ||
+          objectValue === undefined ||
+          (type !== "blob" && type !== "commit" && type !== "tree")
+        ) {
+          throw new Error("Malformed git ls-tree metadata");
+        }
+        const object = parseObjectId(objectValue, "git ls-tree");
+        const path = record.slice(separator + 1);
+        if (type === "blob") return { mode, type, object: blobId(object), path };
+        if (type === "commit") return { mode, type, object: commitId(object), path };
+        return { mode, type, object, path };
+      });
+  }
+
   async resolveCommit(revision: string): Promise<CommitId> {
     if (revision.length === 0 || revision.includes("\0")) {
       throw new Error("A revision must be nonempty and cannot contain NUL");
@@ -735,7 +813,7 @@ export class GitRepository {
     return type === "blob" || type === "tree" || type === "commit" || type === "tag" ? type : null;
   }
 
-  async objectExists(kind: "blob" | "commit", object: ObjectId): Promise<boolean> {
+  async objectExists(kind: "blob" | "tree" | "commit", object: ObjectId): Promise<boolean> {
     const result = await this.run(["cat-file", "-e", `${object}^{${kind}}`], { allowExitCodes: [0, 1, 128] });
     return result.exitCode === 0;
   }
@@ -1112,6 +1190,67 @@ export class GitRepository {
     return tree.filter((entry) => entry.type === "blob" && entry.object === object).map((entry) => entry.path);
   }
 
+  /**
+   * Every entry of a revision including intermediate trees (`ls-tree -r -t`).
+   * `listTree` stays blob-oriented for existing callers; tree-subject paths
+   * (RVR-013) need the tree entries it omits.
+   */
+  async listTreeIncludingTrees(revision: string | ObjectId): Promise<readonly TreeEntry[]> {
+    const result = await this.run(["ls-tree", "-r", "-t", "-z", revision]);
+    return result.stdout
+      .split("\0")
+      .filter((record) => record.length > 0)
+      .map((record) => {
+        const separator = record.indexOf("\t");
+        if (separator < 0) {
+          throw new Error("Malformed git ls-tree record");
+        }
+        const metadata = record.slice(0, separator).split(" ");
+        const [mode, type, objectValue] = metadata;
+        if (
+          mode === undefined ||
+          objectValue === undefined ||
+          (type !== "blob" && type !== "commit" && type !== "tree")
+        ) {
+          throw new Error("Malformed git ls-tree metadata");
+        }
+        const object = parseObjectId(objectValue, "git ls-tree");
+        const path = record.slice(separator + 1);
+        if (type === "blob") return { mode, type, object: blobId(object), path };
+        if (type === "commit") return { mode, type, object: commitId(object), path };
+        return { mode, type, object, path };
+      });
+  }
+
+  /** Every directory path at `revision` whose subtree OID equals `object`. */
+  async pathsForTree(object: ObjectId, revision: string | ObjectId = "HEAD"): Promise<readonly string[]> {
+    const tree = await this.listTreeIncludingTrees(revision);
+    const paths = tree.filter((entry) => entry.type === "tree" && entry.object === object).map((entry) => entry.path);
+    if (paths.length > 0) return paths;
+    // The revision root tree lists no paths under itself; report the stable
+    // display path "." instead of an empty list (RVR-013). Callers that need
+    // raw listing emptiness should read `listTreeIncludingTrees` directly.
+    try {
+      const name = String(revision);
+      const root = parseObjectId(
+        (await this.run(["rev-parse", "--verify", `${name}^{tree}`])).stdout,
+        `git rev-parse ${name}^{tree}`,
+      );
+      if (root === object) return ["."];
+    } catch {
+      // An unresolvable revision keeps the empty listing.
+    }
+    return paths;
+  }
+
+  /** Blob or tree paths for an annotated subject at `revision`. */
+  async pathsForSubject(object: ObjectId, revision: string | ObjectId = "HEAD"): Promise<readonly string[]> {
+    if (await this.treeExists(object)) {
+      return this.pathsForTree(object, revision);
+    }
+    return this.pathsForBlob(blobId(object), typeof revision === "string" ? revision : String(revision));
+  }
+
   async listIndex(): Promise<readonly TreeEntry[]> {
     const result = await this.run(["ls-files", "--stage", "-z"]);
     return result.stdout
@@ -1137,10 +1276,52 @@ export class GitRepository {
     return (await this.listIndex()).filter((entry) => entry.object === object).map((entry) => entry.path);
   }
 
+  /** The staged index tree OID (`git write-tree`). */
+  async indexTree(): Promise<ObjectId> {
+    return parseObjectId((await this.run(["write-tree"])).stdout, "git write-tree");
+  }
+
+  /** Staged directory paths whose subtree OID equals `object`. */
+  async indexPathsForTree(object: ObjectId): Promise<readonly string[]> {
+    return this.pathsForTree(object, await this.indexTree());
+  }
+
+  /** Staged blob or tree paths for an annotated subject. */
+  async indexPathsForSubject(object: ObjectId): Promise<readonly string[]> {
+    if (await this.treeExists(object)) {
+      return this.indexPathsForTree(object);
+    }
+    return this.indexPathsForBlob(blobId(object));
+  }
+
   async blobIsDurable(object: BlobId): Promise<boolean> {
     if ((await this.indexPathsForBlob(object)).length > 0) return true;
     const result = await this.run(["rev-list", "--objects", "--all"]);
     return result.stdout.split("\n").some((line) => line === object || line.startsWith(`${object} `));
+  }
+
+  /** True when a tree is staged or reachable from any commit's history. */
+  async treeIsDurable(object: ObjectId): Promise<boolean> {
+    if (!(await this.treeExists(object))) return false;
+    if ((await this.indexPathsForTree(object)).length > 0) return true;
+    // The staged root tree lists no paths under itself, so it needs the
+    // identity check; committed roots are covered by rev-list below.
+    try {
+      if ((await this.indexTree()) === object) return true;
+    } catch {
+      // An unreadable index simply falls through to history reachability.
+    }
+    const result = await this.run(["rev-list", "--objects", "--all"]);
+    return result.stdout.split("\n").some((line) => line === object || line.startsWith(`${object} `));
+  }
+
+  /** True when a blob-or-tree subject is staged or reachable from a commit. */
+  async subjectIsDurable(object: ObjectId): Promise<boolean> {
+    if (await this.treeExists(object)) {
+      return this.treeIsDurable(object);
+    }
+    if ((await this.objectType(object)) !== "blob") return false;
+    return this.blobIsDurable(blobId(object));
   }
 
   async commitWithNote(input: {

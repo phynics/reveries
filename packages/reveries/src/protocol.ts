@@ -5,6 +5,13 @@ export type Brand<T, Name extends string> = T & { readonly __brand: Name };
 export type ObjectId = Brand<string, "git-object-id">;
 export type BlobId = ObjectId & { readonly __blobBrand: "blob-id" };
 export type CommitId = ObjectId & { readonly __commitBrand: "commit-id" };
+/**
+ * An annotated content subject: a blob (file) or a tree (subtree).
+ * RVR-013 generalizes object evidence from blob-only to blob|tree while
+ * keeping every content-addressed identity byte-identical: the same
+ * canonical record carries the same `rv:` ID on either subject kind.
+ */
+export type SubjectId = ObjectId;
 export type ReverieId = Brand<`rv:${string}`, "reverie-id">;
 export type TransitionId = Brand<`tr:${string}`, "transition-id">;
 export type CorrectionId = Brand<`cr:${string}`, "correction-id">;
@@ -29,7 +36,7 @@ export type SourceRelation =
   | "implements"
   | "corroborated-by";
 
-export type SourceKind = "commit" | "blob" | "path" | "note" | "git-email" | "issue";
+export type SourceKind = "commit" | "blob" | "tree" | "path" | "note" | "git-email" | "issue";
 
 export type Source = {
   relation: SourceRelation;
@@ -64,7 +71,14 @@ export type ReverieInput = ReverieSemantic;
 
 export type Retirement = {
   reverie: ReverieId;
-  from_blob: BlobId;
+  /**
+   * The annotated predecessor subject this retirement releases.
+   * The wire key stays `from_blob` byte-for-byte for V1 compatibility; its
+   * value is a blob-or-tree subject ID (RVR-013). A changed causal statement
+   * receives a new reverie that supersedes the predecessor; a retirement
+   * records why the predecessor no longer applies.
+   */
+  from_blob: SubjectId;
   reason: string;
 };
 
@@ -800,7 +814,7 @@ const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
-const KINDS = new Set<SourceKind>(["commit", "blob", "path", "note", "git-email", "issue"]);
+const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
 const HOSTS = new Set(["pi", "claude", "opencode", "codex", "gemini"]);
 /** The exact key set of a canonical ledger manifest; anything else is rejected. */
 const LEDGER_MANIFEST_KEYS = new Set([
@@ -1895,7 +1909,7 @@ function validateSource(source: unknown, limits: Readonly<ResourceLimits> = DEFA
     if (value.at === undefined) throw new Error("path source requires an at commit");
     commitId(String(value.at));
   } else if (value.at !== undefined) throw new Error("source.at is valid only for a path source");
-  if (value.kind === "commit" || value.kind === "blob") objectId(value.ref);
+  if (value.kind === "commit" || value.kind === "blob" || value.kind === "tree") objectId(value.ref);
   else if (value.kind === "note") reverieId(value.ref);
   else if (value.kind === "git-email") validateEmail(value.ref, "source.ref", limits);
   else if (value.kind === "issue" && !ISSUE.test(value.ref)) throw new Error("invalid issue source reference");
@@ -1924,7 +1938,7 @@ function validateTransitionSummary(
   for (const id of record.reveries) reverieId(id);
   for (const retirement of record.retirements) {
     reverieId(retirement.reverie);
-    blobId(retirement.from_blob);
+    objectId(retirement.from_blob);
     trimNarrative(retirement.reason, "retirement.reason", limits);
   }
   trimNarrative(record.driving_event, "driving_event", limits);
@@ -2073,7 +2087,7 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
       for (const id of entry.reveries) reverieId(id);
       for (const retirement of entry.retirements) {
         reverieId(retirement.reverie);
-        blobId(retirement.from_blob);
+        objectId(retirement.from_blob);
         trimNarrative(retirement.reason, "retirement.reason", limits);
       }
     }
@@ -2213,11 +2227,12 @@ export function validateNote(
       );
     }
   }
-  // Tree notes carry transition summaries and commit notes may carry
-  // publication attestations; object-type placement beyond this is enforced
-  // by the snapshot validator, which knows each annotated object's type.
-  // Corrections, resolutions, and redactions are global facts that may ride
-  // on blob, tree, or commit notes within the snapshot placement rules.
+  // Tree notes carry transition summaries and reveries side by side (RVR-013),
+  // and commit notes may carry publication attestations; object-type placement
+  // beyond this is enforced by the snapshot validator, which knows each
+  // annotated object's type. Corrections, resolutions, and redactions are
+  // global facts that may ride on blob, tree, or commit notes within the
+  // snapshot placement rules.
   // A signature is a global fact about an annotated subject, so it may ride on
   // any note that also carries a record, just like a correction or redaction.
   if (summaries.length === 0 && inits.length === 0

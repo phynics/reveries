@@ -189,6 +189,18 @@ test("createTransition rejects malformed parents, results, and causal placeholde
   ), /maxParents/);
 });
 
+test("transition summaries reject malformed created_at timestamps", () => {
+  const record = createTransition(input(), metadata, sha1);
+  assert.throws(
+    () => validateNote([{ ...record, created_at: "2026-09-29 07:00:00" }], { verifyIds: false }),
+    /created_at must be a canonical UTC RFC 3339 timestamp/,
+  );
+  assert.throws(
+    () => createTransition(input(), { ...metadata, created_at: "yesterday" }, sha1),
+    /created_at must be a canonical UTC RFC 3339 timestamp/,
+  );
+});
+
 test("validateNote rejects malformed publication attestations", () => {
   const transition = createTransition(input(), metadata, sha1);
   const base = {

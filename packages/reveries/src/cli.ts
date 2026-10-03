@@ -105,7 +105,7 @@ class EditorCancelledError extends Error {}
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
-const KINDS = new Set<SourceKind>(["commit", "blob", "path", "note", "git-email", "issue"]);
+const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
 const HOSTS = new Set<SupportedHost>(["pi", "claude", "opencode", "codex", "gemini"]);
 const VERSION = "1.0.2";
 const HELP = `reveries <command>
@@ -115,8 +115,8 @@ Commands:
   init       Prepare project instructions, Git configuration, and hooks
   adopt      Verify the prepared files and create the adoption commit
   doctor     Diagnose the local installation and notes state (--fix repairs local state)
-  show       Show notes for a path, blob, or commit
-  record     Create, continue, or supersede a blob reverie
+  show       Show notes for a path, blob, tree, or commit
+  record     Create, continue, or supersede a blob-or-tree reverie
   summarize  Attach or replace a commit summary or initialization record
   check      Check staged, committed, or outgoing continuity and coverage
   search     Search current or historical engineering evidence
@@ -174,24 +174,30 @@ Examples:
   reveries doctor --fix
   reveries doctor --json
 `,
-  show: `Usage: reveries show <path|blob|commit> [--staged] [--json]
+  show: `Usage: reveries show <path|blob|tree|commit> [--staged] [--json]
 
-Show active and historical evidence for a Git object.
+Show active and historical evidence for a Git object. Directory paths and raw
+tree object IDs resolve to the exact subtree; the decision shown applies to
+every occurrence of that exact content.
 Examples:
   reveries show src/state.ts
   reveries show src/state.ts --staged
+  reveries show src/module
 `,
   record: `Usage: reveries record <new|supersede> <path> [--from <file|->] [causal options]
-       reveries record continue --from-blob <blob> --to-blob <blob> --id <reverie-id>
+       reveries record continue --from-blob <blob|tree> --to-blob <blob|tree> --id <reverie-id>
 
-Create or supersede a reverie. Missing metadata defaults to Git's user.email,
-the current UTC time, and --session, REVERIES_SESSION, or null.
+Create or supersede a reverie on a file blob or a directory tree. The decision
+applies universally to every occurrence of the exact recorded content: an
+unchanged move or copy carries the same evidence, while a descendant edit that
+changes the subtree requires an explicit continuity disposition.
 Options: --driving-event <text>, --decision <text>, --impact <text>,
          --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
          --source <relation:kind:ref[@at]>, --session <name>, --edit,
          --committed, --staged, --old <reverie-id>, --json
 Examples:
   reveries record new src/state.ts --driving-event "A transition failed" --decision "Guard it" --impact "All writers are checked"
+  reveries record new src/module --driving-event "Layout changed" --decision "Keep it" --impact "All checkouts agree"
   reveries record new src/state.ts --from draft.json --edit
   cat draft.json | reveries record new src/state.ts --from -
 `,
@@ -202,7 +208,7 @@ Attach a session summary. Missing metadata defaults to Git's user.email,
 the current UTC time, and --session, REVERIES_SESSION, or null.
 Options: --driving-event <text>, --decision <text>, --impact <text>,
          --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
-         --source <relation:kind:ref[@at]>, --reverie <id>, --retire <rv:id:blob:reason>,
+         --source <relation:kind:ref[@at]>, --reverie <id>, --retire <rv:id:subject:reason>,
          --session <name>, --edit, --because <reason>, --replace, --init, --json
 Examples:
   reveries summarize HEAD --from summary.json --edit
@@ -210,9 +216,14 @@ Examples:
 `,
   check: `Usage: reveries check [<commit>|--staged|--outgoing <remote>] [--successor old/path=new/path] [--json]
 
-Check continuity and summary coverage.
+Check continuity and summary coverage. --successor names an explicit
+predecessor/successor pair for a renamed file with --staged only; it is a
+local aid, not a publication proof. Committed checks take no successor map.
+A renamed-and-edited subtree with no same-path successor requires retirement
+(and optionally a new record) until RVR-014 lineage.
 Examples:
   reveries check --staged
+  reveries check --staged --successor old/file=new/file
   reveries check HEAD
   reveries check --outgoing origin
 `,
@@ -661,13 +672,15 @@ function flagSources(parsed: ParsedArguments): Source[] {
 function flagRetirements(parsed: ParsedArguments): Retirement[] {
   return (parsed.values.get("--retire") ?? []).map((value) => {
     const match = /^(rv:[^:]+):([^:]+):(.*)$/s.exec(value);
-    if (match === null) throw new UsageError("--retire must use rv:<id>:<blob>:<reason>");
-    const [, reverie, blob, reason] = match;
-    if (reverie === undefined || blob === undefined || reason === undefined) {
-      throw new UsageError("--retire must use rv:<id>:<blob>:<reason>");
+    if (match === null) throw new UsageError("--retire must use rv:<id>:<subject>:<reason>");
+    const [, reverie, subject, reason] = match;
+    if (reverie === undefined || subject === undefined || reason === undefined) {
+      throw new UsageError("--retire must use rv:<id>:<subject>:<reason>");
     }
     try {
-      return { reverie: reverieId(reverie), from_blob: blobId(blob), reason };
+      // The wire key stays `from_blob` for V1 compatibility; the value is a
+      // blob-or-tree subject ID (RVR-013).
+      return { reverie: reverieId(reverie), from_blob: objectId(subject), reason };
     } catch (error: unknown) {
       throw new UsageError(error instanceof Error ? error.message : String(error));
     }
@@ -1288,7 +1301,8 @@ function humanOutput(
     const record = asRecord(value?.record);
     const id = record === null ? "the reverie" : stringField(record, "id", "the reverie");
     const paths = stringList(value?.paths);
-    return `Recorded reverie ${id}${paths.length === 0 ? "" : ` for ${paths.join(", ")}`}.\n`;
+    const target = paths.length === 0 ? "" : ` for ${paths.join(", ")}`;
+    return `Recorded reverie ${id}${target}.\nThis decision applies to every occurrence of the exact recorded content.\n`;
   }
   if (command === "summarize") {
     return `Summarized commit ${stringField(value ?? {}, "commit", context.target ?? "unknown")}.\n`;
@@ -2952,8 +2966,8 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       if (action === "continue") {
         const parsed = parseArguments(argv.slice(2), ["--from-blob", "--to-blob", "--id"], ["--json"]);
         const result = await reveries.recordContinueToBlob({
-          fromBlob: blobId(one(parsed, "--from-blob", true) ?? ""),
-          toBlob: blobId(one(parsed, "--to-blob", true) ?? ""),
+          fromBlob: objectId(one(parsed, "--from-blob", true) ?? ""),
+          toBlob: objectId(one(parsed, "--to-blob", true) ?? ""),
           id: reverieId(one(parsed, "--id", true) ?? ""),
         });
         emit(io, json, `${command} ${action}`, result);
@@ -3009,6 +3023,9 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
           throw new UsageError("--successor must use old/path=new/path");
         }
         successors.set(mapping.slice(0, separator), mapping.slice(separator + 1));
+      }
+      if (!parsed.flags.has("--staged") && successors.size > 0) {
+        throw new UsageError("reveries check --successor applies to --staged only; committed and outgoing checks take no successor map (use ordinary check HEAD or outgoing)");
       }
       const result = parsed.flags.has("--staged")
         ? await reveries.checkStaged(successors)

@@ -122,7 +122,7 @@ export interface RecordNewInput extends RecordTarget {
 }
 
 export interface RecordResult {
-  readonly object: BlobId;
+  readonly object: ObjectId;
   readonly record: ReverieRecord;
   readonly paths: readonly string[];
 }
@@ -522,8 +522,8 @@ export interface PublishNotesResult {
 }
 
 interface DiffTransition {
-  readonly from: BlobId;
-  readonly to?: BlobId;
+  readonly from: ObjectId;
+  readonly to?: ObjectId;
   readonly oldPath?: string;
   readonly newPath?: string;
 }
@@ -871,8 +871,18 @@ export class Reveries {
     );
   }
 
+  /**
+   * Record a reverie on a blob-or-tree subject (RVR-013). The reverie ID is
+   * content-addressed and identical for either subject kind; the decision
+   * applies universally to every occurrence of the exact subject content,
+   * including unchanged moves and copies at other paths.
+   */
   async recordNew(input: RecordNewInput): Promise<RecordResult> {
-    const object = await this.repository.resolvePath(input);
+    const resolved = await this.repository.resolveSubject(input);
+    const object = resolved.object;
+    if (!(await this.repository.subjectIsDurable(object))) {
+      throw new Error(`Subject ${object} is neither staged nor reachable from a commit`);
+    }
     const semantic = `${semanticPayload(input.semantic)}\n`;
     const oid = await this.repository.hashObject(semantic);
     const record = createReverie(input.semantic, input.metadata, () => oid);
@@ -881,24 +891,29 @@ export class Reveries {
       object,
       record,
       paths: input.revision === "index"
-        ? await this.repository.indexPathsForBlob(object)
-        : await this.repository.pathsForBlob(object, input.revision),
+        ? await this.repository.indexPathsForSubject(object)
+        : await this.repository.pathsForSubject(object, input.revision),
     };
   }
 
   async recordContinue(input: {
-    readonly fromBlob: BlobId;
+    readonly fromBlob: ObjectId;
     readonly toPath: string;
     readonly toRevision: "HEAD" | "index" | string;
     readonly id: ReverieId;
   }): Promise<RecordResult> {
-    const object = await this.repository.resolvePath({ path: input.toPath, revision: input.toRevision });
-    return this.recordContinueToBlob({ fromBlob: input.fromBlob, toBlob: object, id: input.id, path: input.toPath });
+    const resolved = await this.repository.resolveSubject({ path: input.toPath, revision: input.toRevision });
+    return this.recordContinueToBlob({ fromBlob: input.fromBlob, toBlob: resolved.object, id: input.id, path: input.toPath });
   }
 
+  /**
+   * Continue an exact reverie record onto a successor subject. The legacy
+   * `fromBlob`/`toBlob` names are kept for V1 compatibility; both accept
+   * blob-or-tree subject IDs.
+   */
   async recordContinueToBlob(input: {
-    readonly fromBlob: BlobId;
-    readonly toBlob: BlobId;
+    readonly fromBlob: ObjectId;
+    readonly toBlob: ObjectId;
     readonly id: ReverieId;
     readonly path?: string;
   }): Promise<RecordResult> {
@@ -908,19 +923,19 @@ export class Reveries {
       (candidate): candidate is ReverieRecord => candidate.type === "reverie" && candidate.id === input.id,
     );
     if (record === undefined) {
-      throw new Error(`Reverie ${input.id} is not attached to predecessor blob ${fromBlob}`);
+      throw new Error(`Reverie ${input.id} is not attached to predecessor subject ${fromBlob}`);
     }
     const object = input.toBlob;
     const type = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
-    if (type !== "blob") throw new Error(`${object} is not a blob`);
-    if (!(await this.repository.blobIsDurable(object))) {
-      throw new Error(`Successor blob ${object} is neither staged nor reachable from a commit`);
+    if (type !== "blob" && type !== "tree") throw new Error(`${object} is not a blob or tree`);
+    if (!(await this.repository.subjectIsDurable(object))) {
+      throw new Error(`Successor subject ${object} is neither staged nor reachable from a commit`);
     }
     await this.appendRecord(object, record);
     return {
       object,
       record,
-      paths: input.path === undefined ? await this.repository.pathsForBlob(object) : [input.path],
+      paths: input.path === undefined ? await this.repository.pathsForSubject(object) : [input.path],
     };
   }
 
@@ -1382,8 +1397,8 @@ export class Reveries {
     }
     const [firstParent] = await this.commitParents(commit);
     const changedFrom = firstParent === undefined
-      ? new Set<BlobId>()
-      : new Set((await this.commitTransitions(firstParent, commit)).map((transition) => transition.from));
+      ? new Set<ObjectId>()
+      : new Set<ObjectId>((await this.commitTransitions(firstParent, commit)).map((transition) => transition.from));
     const entries: SummaryEntry[] = [];
     for (const source of input.sourceCommits) {
       const sourceCommit = await this.repository.resolveCommit(source);
@@ -1523,14 +1538,21 @@ export class Reveries {
   async checkStaged(explicitSuccessors: ReadonlyMap<string, string> = new Map()): Promise<CheckResult> {
     const transitions = [...await this.stagedTransitions()];
     for (const [oldPath, newPath] of explicitSuccessors) {
-      const from = await this.repository.resolvePath({ path: oldPath, revision: "HEAD" });
-      const to = await this.repository.resolvePath({ path: newPath, revision: "index" });
+      const from = await this.repository.resolveSubject({ path: oldPath, revision: "HEAD" });
+      const to = await this.repository.resolveSubject({ path: newPath, revision: "index" });
+      if (from.type !== "blob" || to.type !== "blob") {
+        throw new Error(
+          `reveries check --successor maps file (blob) paths only; a renamed-and-edited directory has no same-path successor: retire its decisions (and optionally record new ones) until RVR-014 lineage (old: ${oldPath}, new: ${newPath})`,
+        );
+      }
       const existing = transitions.findIndex((transition) => transition.oldPath === oldPath);
-      const mapped: DiffTransition = { from, to, oldPath, newPath };
+      const mapped: DiffTransition = { from: from.object, to: to.object, oldPath, newPath };
       if (existing < 0) transitions.push(mapped);
       else transitions.splice(existing, 1, mapped);
     }
-    return this.checkTransitions(transitions, emptySummary());
+    const summary = emptySummary();
+    const tree = await this.treeSubjectTransitions("HEAD", "HEAD", true);
+    return this.checkTransitions([...transitions, ...tree], summary);
   }
 
   async checkCommit(revision: string): Promise<CheckResult> {
@@ -1564,8 +1586,12 @@ export class Reveries {
     }
     const diagnostics: string[] = [];
     for (const parent of await this.commitParents(commit)) {
-      const transitions = await this.commitTransitions(parent, commit);
-      const result = await this.checkTransitions(transitions, summary);
+      const transitions = [...await this.commitTransitions(parent, commit)];
+      // Directory renames fail closed here: a renamed-and-edited tree with no
+      // same-path successor requires retirement until RVR-014 lineage, on
+      // every gate. Explicit maps stay a staged-only local aid for files.
+      const tree = await this.treeSubjectTransitions(parent, commit, false);
+      const result = await this.checkTransitions([...transitions, ...tree], summary);
       diagnostics.push(...result.diagnostics.map((diagnostic) => `${parent}: ${diagnostic}`));
     }
     return { ok: diagnostics.length === 0, diagnostics };
@@ -2090,10 +2116,13 @@ export class Reveries {
         }
         if (entry.objectType === "tree"
           && entry.records.some((record) =>
-            record.type !== "transition-summary"
+            record.type !== "reverie"
+            && record.type !== "transition-summary"
+            && record.type !== "correction"
+            && record.type !== "resolution"
             && record.type !== "redaction"
             && record.type !== "signature")) {
-          throw new Error(`Tree ${entry.object} has a non-transition protocol record`);
+          throw new Error(`Tree ${entry.object} has a non-tree protocol record`);
         }
         for (const record of entry.records) {
           if (record.type === "publication-attestation" && record.commit !== entry.object) {
@@ -2143,9 +2172,12 @@ export class Reveries {
   ): Promise<void> {
     for (const record of records) {
       for (const source of allSources(record)) {
-        if (source.kind === "commit" || source.kind === "blob") {
+        if (source.kind === "commit" || source.kind === "blob" || source.kind === "tree") {
           const object = objectId(source.ref);
-          if (!(await this.repository.objectExists(source.kind, object))) {
+          const exists = source.kind === "tree"
+            ? await this.repository.treeExists(object)
+            : await this.repository.objectExists(source.kind, object);
+          if (!exists) {
             throw await this.gradedSourceError(source.kind, source.ref, object);
           }
         } else if (source.kind === "path") {
@@ -2168,7 +2200,7 @@ export class Reveries {
    * Complete clones keep the exact historical message.
    */
   private async gradedSourceError(
-    kind: "commit" | "blob",
+    kind: "commit" | "blob" | "tree",
     ref: string,
     object: ObjectId,
   ): Promise<Error> {
@@ -2232,7 +2264,9 @@ export class Reveries {
     view: EvidenceSnapshotView,
     revision: string,
   ): Promise<readonly SnapshotNoteEntry[]> {
-    const tree = await this.repository.listTree(revision);
+    // Trees included: an unchanged subtree move keeps its OID reachable at a
+    // new path, so its evidence stays in scope without any disposition.
+    const tree = await this.repository.listTreeIncludingTrees(revision);
     const available = new Map(view.entries.map((entry) => [entry.object as string, entry]));
     const targets = new Map<string, SnapshotNoteEntry>();
     for (const item of tree) {
@@ -2242,6 +2276,12 @@ export class Reveries {
     const commit = await this.repository.resolveCommit(revision);
     const commitEntry = available.get(commit as string);
     if (commitEntry !== undefined) targets.set(commitEntry.object as string, commitEntry);
+    // `ls-tree -r -t` lists every nested subtree but never the revision root
+    // itself, so a reverie on the exact root tree would otherwise vanish from
+    // the current projection and search while still showing by raw OID.
+    const root = await this.repository.resultTreeForCommit(commit);
+    const rootEntry = available.get(root as string);
+    if (rootEntry !== undefined) targets.set(rootEntry.object as string, rootEntry);
     return [...targets.values()];
   }
 
@@ -4102,17 +4142,13 @@ export class Reveries {
     try {
       object = isFullObjectId(target)
         ? objectId(target)
-        : await this.repository.resolvePath({ path: target, revision });
+        : (await this.repository.resolveSubject({ path: target, revision })).object;
     } catch (error: unknown) {
       return this.gradedFailure(error);
     }
     try {
       const objectType = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
-      const paths = objectType !== "blob"
-        ? []
-        : revision === "index"
-          ? await this.repository.indexPathsForBlob(blobId(object))
-          : await this.repository.pathsForBlob(blobId(object), revision);
+      const paths = await this.displayPathsForSubject(object, objectType, revision);
       return { object, objectType, paths };
     } catch (error: unknown) {
       return this.gradedFailure(error, [object]);
@@ -4121,7 +4157,31 @@ export class Reveries {
 
   private async pathsForObject(object: ObjectId, revision: string): Promise<readonly string[]> {
     const type = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
-    return type === "blob" ? this.repository.pathsForBlob(blobId(object), revision) : [];
+    return this.displayPathsForSubject(object, type, revision);
+  }
+
+  /**
+   * Current display paths for a blob-or-tree subject. The revision root tree
+   * has no `ls-tree` listing path, so it reports the stable display path
+   * `.` instead of an empty list (RVR-013); every other subject keeps its
+   * exact listing paths.
+   */
+  private async displayPathsForSubject(
+    object: ObjectId,
+    objectType: string,
+    revision: string,
+  ): Promise<readonly string[]> {
+    if (objectType !== "blob" && objectType !== "tree") return [];
+    if (revision === "index") return this.repository.indexPathsForSubject(object);
+    const paths = await this.repository.pathsForSubject(object, revision);
+    if (paths.length > 0 || objectType !== "tree") return paths;
+    try {
+      const root = await this.repository.resultTreeForCommit(await this.repository.resolveCommit(revision));
+      if (root === object) return ["."];
+    } catch {
+      // A non-commit revision has no root display path.
+    }
+    return paths;
   }
 
   private async evidenceNotes(ref = "refs/notes/reveries"): Promise<readonly NoteListEntry[]> {
@@ -4272,16 +4332,80 @@ export class Reveries {
     return transitions;
   }
 
-  private async projectionFor(blob: BlobId): Promise<ActiveProjection> {
+  private async projectionFor(blob: ObjectId): Promise<ActiveProjection> {
     return (await this.strictRead(blob)).projection;
+  }
+
+  /**
+   * Tree-subject continuity pairs between two revisions (RVR-013). A
+   * descendant blob edit produces a new ancestor tree OID, so every
+   * annotated old ancestor tree needs an explicit disposition. Pairing is
+   * by identical directory path and never by similarity or by notes evidence
+   * on unrelated trees: an unchanged move or copy keeps the same OID
+   * reachable and needs no disposition, while a vanished directory path
+   * yields a successor-less pair that only a causal retirement clears
+   * (explicit lineage arrives with RVR-014).
+   *
+   * The revision root tree is paired explicitly because `ls-tree -r -t`
+   * lists nested subtrees but never the root itself; without this pair a
+   * reverie on the exact root tree would record and show but never oblige.
+   * Root transition summaries (RVR-004) co-locate on the same note
+   * unaffected: placement already allows both record kinds on trees.
+   *
+   * Membership comes from one `git notes list` snapshot, so unannotated
+   * directories cost no note reads (RVR-012).
+   */
+  private async treeSubjectTransitions(
+    oldRevision: string,
+    newRevision: string,
+    newIsIndex: boolean,
+  ): Promise<readonly DiffTransition[]> {
+    const oldRoot = await this.repository.resultTreeForCommit(await this.repository.resolveCommit(oldRevision));
+    const newTree = newIsIndex
+      ? await this.repository.indexTree()
+      : await this.repository.resultTreeForCommit(await this.repository.resolveCommit(newRevision));
+    const annotated = new Set((await this.evidenceNotes()).map((entry) => entry.object as string));
+    const transitions: DiffTransition[] = [];
+    const oldEntries = (await this.repository.listTreeIncludingTrees(oldRevision))
+      .filter((entry) => entry.type === "tree");
+    if (oldEntries.length !== 0) {
+      const newEntries = await this.repository.listTreeIncludingTrees(newTree);
+      const newOids = new Set(newEntries.map((entry) => entry.object as string));
+      // Same-path successors are trees only: replacing a directory with a file
+      // at the same path leaves a successor-less pair that requires retirement.
+      // Same-path successors are trees only: replacing a directory with a file
+      // at the same path leaves a successor-less pair that requires retirement.
+      const newByPath = new Map(
+        newEntries
+          .filter((entry) => entry.type === "tree")
+          .map((entry) => [entry.path, entry.object]),
+      );
+      const seen = new Set<string>();
+      for (const old of oldEntries) {
+        const from = old.object as string;
+        if (seen.has(from)) continue;
+        seen.add(from);
+        // Universal applicability: the exact subtree still exists somewhere.
+        if (newOids.has(from)) continue;
+        if (!annotated.has(from)) continue;
+        const successor = newByPath.get(old.path);
+        transitions.push(successor === undefined
+          ? { from: old.object }
+          : { from: old.object, to: successor });
+      }
+    }
+    if (oldRoot !== newTree && annotated.has(oldRoot as string)) {
+      transitions.push({ from: oldRoot, to: newTree });
+    }
+    return transitions;
   }
 
   private async checkTransitions(
     transitions: readonly DiffTransition[],
     summary: SessionSummary,
   ): Promise<CheckResult> {
-    const predecessors = new Map<BlobId, ActiveProjection>();
-    const successors = new Map<BlobId, ActiveProjection>();
+    const predecessors = new Map<ObjectId, ActiveProjection>();
+    const successors = new Map<ObjectId, ActiveProjection>();
     for (const transition of transitions) {
       if (await this.readEvidenceNote(transition.from) !== null) {
         predecessors.set(transition.from, await this.projectionFor(transition.from));

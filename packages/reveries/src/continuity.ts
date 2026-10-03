@@ -1,27 +1,42 @@
 import type { ActiveProjection } from "./projection.ts";
-import type { BlobId, ReverieId, SessionSummary } from "./protocol.ts";
+import type { BlobId, ReverieId, SessionSummary, SubjectId } from "./protocol.ts";
 
+/**
+ * A blob-only predecessor/successor pair. Kept for backward-compatible
+ * callers; new tree-aware paths use `SubjectTransition`.
+ */
 export type BlobTransition = {
   from: BlobId;
   to?: BlobId;
 };
 
+/**
+ * A blob-or-tree predecessor/successor pair (RVR-013). A byte-identical
+ * move or copy needs no disposition: the same subject OID stays reachable.
+ * A descendant edit produces a new ancestor tree OID and therefore an
+ * explicit continuity obligation on each annotated ancestor tree.
+ */
+export type SubjectTransition = {
+  from: SubjectId;
+  to?: SubjectId;
+};
+
 export type ContinuityInput = {
-  transitions: readonly BlobTransition[];
-  predecessors: ReadonlyMap<BlobId, ActiveProjection>;
-  successors: ReadonlyMap<BlobId, ActiveProjection>;
+  transitions: readonly SubjectTransition[];
+  predecessors: ReadonlyMap<SubjectId, ActiveProjection>;
+  successors: ReadonlyMap<SubjectId, ActiveProjection>;
   summary?: SessionSummary;
 };
 
 export type ContinuityDisposition =
-  | { kind: "continue"; id: ReverieId; from_blob: BlobId; to_blob: BlobId }
-  | { kind: "supersede"; old: ReverieId; replacement: ReverieId; from_blob: BlobId; to_blob: BlobId }
-  | { kind: "retire"; id: ReverieId; from_blob: BlobId; reason: string };
+  | { kind: "continue"; id: ReverieId; from_blob: SubjectId; to_blob: SubjectId }
+  | { kind: "supersede"; old: ReverieId; replacement: ReverieId; from_blob: SubjectId; to_blob: SubjectId }
+  | { kind: "retire"; id: ReverieId; from_blob: SubjectId; reason: string };
 
 export type ContinuityObligation = {
   id: ReverieId;
-  from_blob: BlobId;
-  to_blob?: BlobId;
+  from_blob: SubjectId;
+  to_blob?: SubjectId;
   reason: "missing-disposition" | "ambiguous-disposition";
 };
 
@@ -32,7 +47,7 @@ export type ContinuityReport = {
   conflicts: string[];
 };
 
-function retirementsFor(summary: SessionSummary | undefined, id: ReverieId, from: BlobId) {
+function retirementsFor(summary: SessionSummary | undefined, id: ReverieId, from: SubjectId) {
   return summary?.entries.flatMap((entry) => entry.retirements)
     .filter((retirement) => retirement.reverie === id && retirement.from_blob === from) ?? [];
 }
@@ -50,7 +65,7 @@ export function analyzeContinuity(input: ContinuityInput): ContinuityReport {
     const predecessor = input.predecessors.get(transition.from);
     if (!predecessor) continue;
     if (predecessor.cycles.length > 0 || predecessor.forks.length > 0 || (predecessor.conflicts?.length ?? 0) > 0) {
-      conflicts.push(`predecessor blob ${transition.from} has an invalid reverie projection`);
+      conflicts.push(`predecessor subject ${transition.from} has an invalid reverie projection`);
     }
     const successor = transition.to === undefined ? undefined : input.successors.get(transition.to);
     for (const old of predecessor.active) {

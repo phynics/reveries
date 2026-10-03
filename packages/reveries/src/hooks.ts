@@ -47,7 +47,7 @@ export type HookRepository = {
   resolvePath(input: { path: string; revision: "HEAD" | "index" | string }): Promise<BlobId>;
   readNote(object: ObjectId): Promise<string | null>;
   hashObject(input: string): Promise<ObjectId>;
-  objectExists(kind: "blob" | "commit", object: ObjectId): Promise<boolean>;
+  objectExists(kind: "blob" | "tree" | "commit", object: ObjectId): Promise<boolean>;
   listNotes(): Promise<readonly { readonly object: ObjectId }[]>;
   /**
    * Clone-shape detectors. Optional so lightweight fakes keep working; when
@@ -339,7 +339,7 @@ async function hookSourcePresence(
   source: Source,
   shape: CloneShape,
 ): Promise<SourcePresence> {
-  if (source.kind === "commit" || source.kind === "blob") {
+  if (source.kind === "commit" || source.kind === "blob" || source.kind === "tree") {
     if (await repository.objectExists(source.kind, objectId(source.ref))) return "present";
     if (shape.shallow || shape.promisor) return "incomplete";
     return "absent";

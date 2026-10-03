@@ -95,7 +95,7 @@ See the "Retire a reverie and summarize the commit" recipe in
 .agents/skills/using-reveries/references/direct-git.md and CONTRIBUTING.md.
 A commit summary added this way must exist before the receive check runs.`;
 
-const CONTINUITY_REMEDIATION = `Give every active decision on the changed blob an explicit disposition, then push the notes ref first:
+const CONTINUITY_REMEDIATION = `Give every active decision on the changed blob or tree subject an explicit disposition, then push the notes ref first:
 
     predecessor="$(git rev-parse 'HEAD:<path>')"
     successor="$(git rev-parse ':<path>')"
@@ -105,7 +105,12 @@ const CONTINUITY_REMEDIATION = `Give every active decision on the changed blob a
     git push origin refs/notes/reveries:refs/notes/reveries
 
 Continue the decision when its causal statement still holds, supersede it when
-the statement changed, or retire it in the commit session summary. See the
+the statement changed, or retire it in the commit session summary. A directory
+path resolves to its exact subtree; an unchanged move or copy keeps the same
+subtree object and needs no disposition. A renamed-and-edited directory has no
+same-path successor, so it requires retirement (and optionally a new record for
+the new composition) until RVR-014 lineage; continuing the record elsewhere
+does not satisfy the obligation. See the
 "Continue a reverie" recipe in .agents/skills/using-reveries/references/direct-git.md
 and CONTRIBUTING.md.`;
 
@@ -190,7 +195,7 @@ export function classifyReceiveDiagnostic(diagnostic: string): ReceiveFinding {
       remediation: SUMMARY_REMEDIATION,
     };
   }
-  if (/(?:rv:[0-9a-f]+ from [0-9a-f]+: (?:missing-disposition|ambiguous-disposition)|predecessor blob [0-9a-f]+ has an invalid reverie projection)/.test(rest)) {
+  if (/(?:rv:[0-9a-f]+ from [0-9a-f]+: (?:missing-disposition|ambiguous-disposition)|predecessor (?:blob|subject) [0-9a-f]+ has an invalid reverie projection)/.test(rest)) {
     return {
       code: "missing-continuity-disposition",
       grade: "strict",
@@ -240,7 +245,7 @@ function result(
 /**
  * The ledger envelope is evidence transport, not code. RVR-005 synthesizes each
  * checkpoint with a fixed identity and a fixed epoch date, so a checkpoint can
- * never carry a session summary and can never disposition a predecessor blob.
+ * never carry a session summary and can never disposition a predecessor subject.
  * Holding it to authored-commit coverage is a category error, not a stricter
  * policy, so it is excluded here exactly as `checkOutgoingUpdates` already
  * excludes it on the push side.
