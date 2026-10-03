@@ -114,8 +114,16 @@ async function adopted(
   await git(directory, "add", "state.txt");
   await git(directory, "commit", "-m", "initial");
   for (const remote of remotes) {
-    await execFileAsync("git", ["init", "--bare", join(root, `${remote}.git`)]);
-    await git(directory, "remote", "add", remote, join(root, `${remote}.git`));
+    const bare = join(root, `${remote}.git`);
+    await execFileAsync("git", ["init", "--bare", bare]);
+    if (remote.includes("/")) {
+      // Newer Git rejects nested names through `remote add`. Configure the
+      // remote subsection directly so tests retain their overlap coverage.
+      await git(directory, "config", `remote.${remote}.url`, bare);
+      await git(directory, "config", `remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
+    } else {
+      await git(directory, "remote", "add", remote, bare);
+    }
   }
   const reveries = await Reveries.open(directory);
   const commit = await git(directory, "rev-parse", "HEAD");
