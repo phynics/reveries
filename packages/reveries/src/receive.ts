@@ -543,6 +543,8 @@ export async function checkReceive(cwd: string, input: ReceiveCheckInput): Promi
         diagnostics.push(`${ledgerUpdate.ref}: the proposed envelope transports no usable notes commit`);
       } else {
         const reveries = await Reveries.openBareForReceive(cwd, boundary);
+        const evidenceCheck = await reveries.checkProposedEvidence();
+        diagnostics.push(...evidenceCheck.diagnostics.map((diagnostic) => `${ledgerUpdate.ref}: evidence: ${diagnostic}`));
         await appendCheck(diagnostics, reveries.verifyLedgerEnvelope(ledgerUpdate.newObject), ledgerUpdate.ref);
       }
     }

@@ -11,7 +11,9 @@ import { Reveries } from "../src/operations.ts";
 import {
   canonicalRecord,
   createCorrection,
+  createRedaction,
   createResolution,
+  createReverie,
   NOTES_REF,
   recordFactId,
 } from "../src/protocol.ts";
@@ -94,6 +96,82 @@ test("a redaction hides its target from show and search but keeps history", asyn
   assert.ok(!found.hits.some((hit) => hit.record.type === "reverie"));
   const foundAll = await reveries.searchWithCompleteness({ query: "credential", includeRedacted: true });
   assert.ok(foundAll.hits.some((hit) => hit.record.type === "reverie"));
+});
+
+test("recording rejects a likely credential before adding it to notes", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const fakeToken = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+
+  await assert.rejects(
+    reveries.recordNew({
+      path: "state.txt",
+      revision: "HEAD",
+      semantic: semantic(`Do not record this fake credential ${fakeToken}.`),
+      metadata,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /likely secret material/);
+      assert.equal(error.message.includes(fakeToken), false);
+      return true;
+    },
+  );
+  assert.deepEqual((await reveries.show({ target: "state.txt" })).records, []);
+});
+
+test("publication refuses legacy secret-bearing notes even after soft redaction", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const fakeToken = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+  const subject = await reveries.repository.resolvePath({ path: "state.txt", revision: "HEAD" });
+  const legacyRecord = createReverie(
+    semantic(`A historical record contains ${fakeToken}.`),
+    metadata,
+    (bytes) => hashBlobContent(bytes, "sha1"),
+  );
+  const hide = createRedaction(
+    { v: 1, target: legacyRecord.id, reason: "The historical narrative contains credential material." },
+    metadata,
+    (bytes) => hashBlobContent(bytes, "sha1"),
+  );
+  await reveries.repository.withNotesWrite(async (notes) => {
+    await notes.append(subject, canonicalRecord(legacyRecord));
+    await notes.append(subject, canonicalRecord(hide));
+  }, async (ref) => reveries.validateNotesSnapshot(await reveries.loadEvidenceSnapshot({ ref })));
+
+  const published = await reveries.publishNotes({ remote: "origin" });
+
+  assert.equal(published.ok, false);
+  assert.equal(published.attempts, 0);
+  assert.match(published.diagnostics.join("\n"), /publication is refused/);
+  assert.equal(published.diagnostics.join("\n").includes(fakeToken), false);
+  const shown = await reveries.show({ target: "state.txt" });
+  assert.ok(!shown.records.some((record) => record.type === "reverie" && record.id === legacyRecord.id));
+  const history = await reveries.history("state.txt");
+  assert.ok(history.flatMap((entry) => entry.records).some((record) => record.type === "reverie" && record.id === legacyRecord.id));
+});
+
+test("publication requires a signature before carrying an opaque confidential pointer", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const subject = await reveries.repository.resolvePath({ path: "state.txt", revision: "HEAD" });
+  const record = createReverie(
+    {
+      ...semantic("Keep the confidential rationale outside repository notes."),
+      sources: [{ relation: "derived-from", kind: "confidential-pointer", ref: `vault:v1:${"B".repeat(43)}` }],
+    },
+    metadata,
+    (bytes) => hashBlobContent(bytes, "sha1"),
+  );
+  await reveries.repository.withNotesWrite(async (notes) => {
+    await notes.append(subject, canonicalRecord(record));
+  }, async (ref) => reveries.validateNotesSnapshot(await reveries.loadEvidenceSnapshot({ ref })));
+
+  const published = await reveries.publishNotes({ remote: "origin" });
+
+  assert.equal(published.ok, false);
+  assert.match(published.diagnostics.join("\n"), /requires a signature/);
 });
 
 test("corrections only append: earlier canonical lines stay verbatim", async () => {

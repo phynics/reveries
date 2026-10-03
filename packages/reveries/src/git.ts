@@ -1473,6 +1473,72 @@ export class GitRepository {
     throw new NotesContentionError(NOTES_REF, maxAttempts, expectedTip, await this.notesTip());
   }
 
+  /**
+   * Build a root notes commit from sanitized bodies without inheriting the
+   * current notes history. The private candidate ref is removed on every exit;
+   * callers publish the returned commit with a separate compare-and-swap.
+   */
+  async createNotesSnapshotFromEmpty(
+    notes: readonly { readonly subject: ObjectId; readonly body: string }[],
+    validate: NotesRefValidator,
+  ): Promise<ObjectId> {
+    const temporaryRef = `${NOTES_TXN_REF_PREFIX}hard-redaction-${process.pid}-${randomUUID()}`;
+    try {
+      const transaction = new TemporaryNotesTransaction(this, temporaryRef);
+      const seen = new Set<ObjectId>();
+      for (const note of notes) {
+        if (seen.has(note.subject)) throw new Error(`Duplicate subject in rewritten notes snapshot: ${note.subject}`);
+        seen.add(note.subject);
+        if (note.body.length === 0) continue;
+        await transaction.replace(note.subject, note.body);
+      }
+      const candidate = await this.notesTip(temporaryRef);
+      if (candidate === null) throw new Error("A rewritten notes snapshot must contain at least one note");
+      await validate(temporaryRef);
+      return candidate;
+    } finally {
+      await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
+    }
+  }
+
+  /**
+   * Publish a hard-redaction snapshot and sever the local copies it supersedes.
+   *
+   * The transaction replaces the canonical notes and ledger refs, deletes the
+   * local retention refs, and deletes the remote-tracking and quarantine refs
+   * that still point at the removed history. It moves refs only: objects
+   * already fetched into a clone, a bundle, or a mirror stay there, so a caller
+   * must never report this as proof of erasure.
+   */
+  async replaceEvidenceRefsAfterHardRedaction(input: {
+    readonly notesCommit: ObjectId;
+    readonly ledgerCheckpoint: ObjectId;
+    readonly expectedNotes: ObjectId | null;
+    readonly expectedLedger: ObjectId | null;
+    readonly expectedRetentionObjects: ObjectId | null;
+    readonly expectedRetentionCommits: ObjectId | null;
+    readonly obsoleteRefs: readonly { readonly ref: string; readonly expected: ObjectId }[];
+  }): Promise<void> {
+    const updates: { ref: string; next: ObjectId | null; expected: ObjectId | null }[] = [
+      { ref: NOTES_REF, next: input.notesCommit, expected: input.expectedNotes },
+      { ref: LEDGER_REF, next: input.ledgerCheckpoint, expected: input.expectedLedger },
+      { ref: RETENTION_OBJECTS_REF, next: null, expected: input.expectedRetentionObjects },
+      { ref: RETENTION_COMMITS_REF, next: null, expected: input.expectedRetentionCommits },
+    ];
+    const allowedObsoleteRef = (ref: string): boolean =>
+      (ref.startsWith("refs/notes/remotes/") && ref.endsWith("/reveries"))
+      || (/^refs\/remotes\/.+\/reveries-ledger$/.test(ref))
+      || ref.startsWith("refs/reveries/quarantine/");
+    const names = new Set(updates.map(({ ref }) => ref));
+    for (const obsolete of input.obsoleteRefs) {
+      if (!allowedObsoleteRef(obsolete.ref)) throw new Error(`Ref is not a known disposable Reveries copy: ${obsolete.ref}`);
+      if (names.has(obsolete.ref)) throw new Error(`Duplicate ref in hard-redaction transaction: ${obsolete.ref}`);
+      names.add(obsolete.ref);
+      updates.push({ ref: obsolete.ref, next: null, expected: obsolete.expected });
+    }
+    await this.updateRefsAtomically(updates);
+  }
+
   /** Every live transaction ref under the disposable `reveries-txn` namespace. */
   async listTemporaryNotesRefs(): Promise<readonly TemporaryNotesRef[]> {
     const result = await this.run(

@@ -18,6 +18,8 @@ export type CorrectionId = Brand<`cr:${string}`, "correction-id">;
 export type ResolutionId = Brand<`rs:${string}`, "resolution-id">;
 export type RedactionId = Brand<`rd:${string}`, "redaction-id">;
 export type SignatureId = Brand<`sg:${string}`, "signature-id">;
+/** Opaque, non-bearer vault locator for confidential rationale held elsewhere. */
+export type ConfidentialPointer = Brand<`vault:v1:${string}`, "confidential-pointer">;
 /**
  * Occurrence-specific evidence (RVR-014). An occurrence is addressed, not
  * content-addressed, so it takes a prefix of its own: the same canonical
@@ -50,7 +52,7 @@ export type SourceRelation =
   | "implements"
   | "corroborated-by";
 
-export type SourceKind = "commit" | "blob" | "tree" | "path" | "note" | "git-email" | "issue";
+export type SourceKind = "commit" | "blob" | "tree" | "path" | "note" | "git-email" | "issue" | "confidential-pointer";
 
 export type Source = {
   relation: SourceRelation;
@@ -943,13 +945,14 @@ const REDACTION_ID = /^rd:[0-9a-f]{40}$|^rd:[0-9a-f]{64}$/;
 const SIGNATURE_ID = /^sg:[0-9a-f]{40}$|^sg:[0-9a-f]{64}$/;
 const OCCURRENCE_ID = /^oc:[0-9a-f]{40}$|^oc:[0-9a-f]{64}$/;
 const LINEAGE_ID = /^lg:[0-9a-f]{40}$|^lg:[0-9a-f]{64}$/;
+const CONFIDENTIAL_POINTER = /^vault:v1:[A-Za-z0-9_-]{43}$/;
 /** Every ID-bearing fact a signature may attest, in both repository formats. */
 const SIGNATURE_TARGET = /^(?:rv|tr|cr|rs|rd|oc|lg):[0-9a-f]{40}$|^(?:rv|tr|cr|rs|rd|oc|lg):[0-9a-f]{64}$/;
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
-const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
+const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue", "confidential-pointer"]);
 const HOSTS = new Set(["pi", "claude", "opencode", "codex", "gemini"]);
 /** The exact key set of a canonical ledger manifest; anything else is rejected. */
 const LEDGER_MANIFEST_KEYS = new Set([
@@ -1021,6 +1024,14 @@ export function occurrenceId(value: string): OccurrenceId {
 export function lineageId(value: string): LineageId {
   if (!LINEAGE_ID.test(value)) throw new Error(`Invalid lineage ID: ${value}`);
   return value as LineageId;
+}
+
+/** Parse the distinct wire syntax for an opaque confidential-evidence locator. */
+export function confidentialPointer(value: string): ConfidentialPointer {
+  if (!CONFIDENTIAL_POINTER.test(value)) {
+    throw new Error("Confidential pointers must use vault:v1:<43-character-base64url-id>");
+  }
+  return value as ConfidentialPointer;
 }
 
 export function factHeadId(value: string): FactHeadId {
@@ -2303,6 +2314,7 @@ function validateSource(source: unknown, limits: Readonly<ResourceLimits> = DEFA
   else if (value.kind === "note") reverieId(value.ref);
   else if (value.kind === "git-email") validateEmail(value.ref, "source.ref", limits);
   else if (value.kind === "issue" && !ISSUE.test(value.ref)) throw new Error("invalid issue source reference");
+  else if (value.kind === "confidential-pointer") confidentialPointer(value.ref);
 }
 
 function validateTransitionSummary(
@@ -2527,7 +2539,12 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
       checkArrayLength(entry.reveries, limits.maxReveries, "maxReveries", "entry.reveries");
       checkArrayLength(entry.retirements, limits.maxRetirements, "maxRetirements", "entry.retirements");
       for (const alternative of entry.alternatives) trimNarrative(alternative, "entry.alternatives item", limits);
-      for (const source of entry.sources) validateSource(source, limits);
+      for (const source of entry.sources) {
+        validateSource(source, limits);
+        if (source.kind === "confidential-pointer") {
+          throw new Error("Confidential pointers require an ID-bearing record; session summaries cannot carry them");
+        }
+      }
       for (const id of entry.reveries) reverieId(id);
       for (const retirement of entry.retirements) {
         reverieId(retirement.reverie);

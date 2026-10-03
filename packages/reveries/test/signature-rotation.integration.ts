@@ -14,7 +14,7 @@ import {
   type SignatureVerifier,
 } from "../src/git.ts";
 import { Reveries } from "../src/operations.ts";
-import { canonicalRecord, createReverie, type ReverieInput, type ReverieMetadata } from "../src/protocol.ts";
+import { canonicalRecord, createOccurrence, createLineage, createReverie, type ReverieInput, type ReverieMetadata } from "../src/protocol.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRepositories: string[] = [];
@@ -58,6 +58,41 @@ afterEach(async () => {
 });
 
 // --- Acceptance criterion 4: key rotation preserves semantic IDs ------------
+
+test("occurrence and lineage confidential pointers can be signed and verified", async () => {
+  const directory = await createRepository();
+  const pair = generateEd25519KeyPair();
+  const reveries = await Reveries.open(directory, {
+    signer: createLocalEd25519Signer({ signer: "alice@example.test", keyId: pair.keyId, privateKey: pair.privateKey }),
+    verifier: createLocalEd25519Verifier({ [pair.keyId]: pair.publicKey }),
+    trust: { keys: [{ key_id: pair.keyId, signer: "alice@example.test", revoked: false }] },
+  });
+  const parent = await reveries.repository.resolveCommit("HEAD");
+  const subject = await reveries.repository.resolvePath({ path: "state.txt", revision: "HEAD" });
+  await git(directory, "commit", "--allow-empty", "-m", "next");
+  const commit = await reveries.repository.resolveCommit("HEAD");
+  const causal = {
+    v: 1 as const,
+    driving_event: semantic.driving_event,
+    decision: semantic.decision,
+    impact: semantic.impact,
+    recurrence_control: null,
+    alternatives: [],
+    sources: [{ relation: "derived-from" as const, kind: "confidential-pointer" as const, ref: `vault:v1:${"B".repeat(43)}` }],
+  };
+  const occurrence = createOccurrence({ ...causal, occurrence: { commit, path: "state.txt", subject } }, metadata,
+    (bytes) => reveries.repository.hashObjectSync(bytes));
+  const lineage = createLineage({ ...causal, kind: "preserve", parent, commit,
+    from: [{ path: "state.txt", subject }], to: [{ path: "state.txt", subject }], transition: null }, metadata,
+    (bytes) => reveries.repository.hashObjectSync(bytes));
+  for (const [target, attachment] of [[occurrence, subject], [lineage, commit]] as const) {
+    await reveries.mutateNotes(async (notes) => notes.append(attachment, canonicalRecord(target)));
+    const signed = await reveries.signRecord({ target, subject: attachment, role: "author", metadata });
+    assert.equal(signed.state, "signed");
+    assert.ok(signed.record);
+    assert.equal(reveries.verifySignatureRecord(signed.record).state, "trusted");
+  }
+});
 
 test("rotating a signer key changes no decision ID and adds a second signature", async () => {
   const directory = await createRepository();

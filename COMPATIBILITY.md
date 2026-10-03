@@ -12,6 +12,33 @@ The neutral hook contract is implemented in `packages/reveries/src/hooks.ts`. Ho
 
 CORE means Skills, project instructions, direct Git operations, and manual maintenance are supported. Pi 0.84.1 has recorded Skill-routing and no-mutation search evidence in `evidence/pi-skills.json`. Automatic delivery is not claimed as verified for any host version until the complete native adapter conformance suite passes.
 
+## Evidence privacy compatibility
+
+Record creation rejects common credential patterns before it appends a note. The scanner is
+best-effort and cannot prove that evidence is secret-free; review evidence before recording it.
+Reveries-managed publication checks the complete notes snapshot, including soft-redacted records,
+and refuses likely secrets. A redaction does not make secret bytes safe to publish.
+
+Normal search and automatic model delivery omit soft-redacted targets. The history API keeps the
+original records so it can report immutable history; callers that render history must honor its
+redaction facts. Automatic delivery verifies redaction identities before filtering and omits opaque
+confidential-pointer values.
+
+`reveries redact hard` rewrites the canonical notes ref as a new root snapshot without the named facts,
+moves the ledger branch to a new genesis checkpoint, deletes the local retention refs and the stale
+remote-tracking and quarantine refs in one ref transaction, and reports the remote-side follow-up for
+every configured remote. Refs outside that known set are left to their owner. The command never
+contacts a remote and always states that deletion from independent copies is not guaranteed.
+Repeating the same redaction converges instead of rewriting again.
+
+Existing V1 records and source kinds keep their wire shape. The new `confidential-pointer` source
+kind uses `vault:v1:<43-character-base64url-id>` and is additive. Strict readers that do not recognize
+that kind reject pointer-bearing records, so repositories must upgrade strict readers before they
+publish one. A pointer is not rationale or an access token. It may appear only in an ID-bearing
+record with a signature over that record. A consumer may rely on its private rationale only after
+it verifies a trusted signature. Signature trust stores remain local and are not copied by clone or
+notes transport.
+
 ## Receive boundaries
 
 | Boundary | Adapter | Contract | Bypass control |
