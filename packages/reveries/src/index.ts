@@ -1,4 +1,5 @@
 export * from "./protocol.ts";
+export * from "./sensitive-evidence.ts";
 export {
   AtomicPushUnavailableError,
   GitCommandError,

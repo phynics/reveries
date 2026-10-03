@@ -118,7 +118,8 @@
             "path",
             "note",
             "git-email",
-            "issue"
+            "issue",
+            "confidential-pointer"
           ]
         },
         "ref": {
@@ -200,6 +201,26 @@
             "properties": {
               "ref": {
                 "$ref": "#/$defs/objectId"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "confidential-pointer"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "type": "string",
+                "pattern": "^vault:v1:[A-Za-z0-9_-]{43}$"
               }
             }
           }
