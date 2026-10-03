@@ -1,8 +1,10 @@
 import type {
   CommitId,
   CorrectionRecord,
+  LineageRecord,
   NoteRecord,
   ObjectId,
+  OccurrenceRecord,
   PublicationAttestation,
   RedactionRecord,
   ResolutionRecord,
@@ -127,10 +129,21 @@ export type FactGraphProjection = {
   summaryFork: boolean;
 };
 
-type FactNode = CorrectionRecord | ResolutionRecord | ReverieRecord;
+/**
+ * Every fact that can be corrected, resolved, or redacted. Occurrence and
+ * lineage records (RVR-014) are nodes here rather than nodes of their own
+ * graph: they carry no outgoing edges, so the existing projection already
+ * gives them duplicate detection, fork visibility, cycle detection, and
+ * conflict reporting without a second supersession mechanism.
+ */
+type FactNode = CorrectionRecord | ResolutionRecord | ReverieRecord | OccurrenceRecord | LineageRecord;
 
 function factNodeId(record: NoteRecord): string | null {
-  if (record.type === "reverie" || record.type === "correction" || record.type === "resolution") {
+  if (record.type === "reverie"
+    || record.type === "correction"
+    || record.type === "resolution"
+    || record.type === "occurrence"
+    || record.type === "lineage") {
     return record.id;
   }
   return null;
@@ -138,12 +151,31 @@ function factNodeId(record: NoteRecord): string | null {
 
 function factNodeEdges(record: FactNode): readonly string[] {
   if (record.type === "resolution") return record.resolves;
+  // Occurrence and lineage records are addressed or structural facts: nothing
+  // in them names an earlier fact, so a correction or resolution is the only way
+  // to change one.
+  if (record.type === "occurrence" || record.type === "lineage") return [];
   return record.supersedes;
 }
 
 function factNodeKey(record: FactNode): string {
   if (record.type === "reverie") {
     return `reverie\u0000${semanticKey(record)}`;
+  }
+  if (record.type === "occurrence") {
+    return `occurrence\u0000${JSON.stringify(record.occurrence)}`;
+  }
+  if (record.type === "lineage") {
+    return JSON.stringify({
+      v: record.v,
+      type: "lineage",
+      kind: record.kind,
+      parent: record.parent,
+      commit: record.commit,
+      from: record.from,
+      to: record.to,
+      transition: record.transition,
+    });
   }
   if (record.type === "correction") {
     return JSON.stringify({
@@ -190,7 +222,11 @@ export function projectFactGraph(records: readonly NoteRecord[]): FactGraphProje
   const conflictIds = new Set<string>();
   const seenKeys = new Map<string, string>();
   for (const record of records) {
-    if (record.type !== "reverie" && record.type !== "correction" && record.type !== "resolution") {
+    if (record.type !== "reverie"
+      && record.type !== "correction"
+      && record.type !== "resolution"
+      && record.type !== "occurrence"
+      && record.type !== "lineage") {
       continue;
     }
     const id = factNodeId(record);
@@ -329,8 +365,12 @@ export function factGraphDiagnostics(graph: FactGraphProjection): string[] {
   if (graph.cycles.some(factForkInvolvesNewKind)) {
     diagnostics.push("Supersession cycle detected");
   }
+  // A conflicting identity is corruption wherever it appears, so occurrence and
+  // lineage identities (RVR-014) join corrections here: two payloads claiming one
+  // `oc:`/`lg:` ID must fail closed rather than display as one record.
   const conflicts = (graph.conflicts ?? []).filter(
-    (id) => id.startsWith("cr:") || id.startsWith("rs:") || id.startsWith("rd:"),
+    (id) => id.startsWith("cr:") || id.startsWith("rs:") || id.startsWith("rd:")
+      || id.startsWith("oc:") || id.startsWith("lg:"),
   );
   if (conflicts.length > 0) diagnostics.push("Conflicting duplicate fact IDs detected");
   if (graph.summaryFork) diagnostics.push("Concurrent session summary fork detected");

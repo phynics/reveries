@@ -55,6 +55,8 @@ export type ReceiveCheckInput = {
 export type ReceiveFindingCode =
   | "missing-session-summary"
   | "missing-continuity-disposition"
+  | "ambiguous-lineage-pairing"
+  | "contradictory-lineage"
   | "missing-notes-publication"
   | "missing-transition-evidence"
   | "summary-from-pr-description"
@@ -107,12 +109,35 @@ const CONTINUITY_REMEDIATION = `Give every active decision on the changed blob o
 Continue the decision when its causal statement still holds, supersede it when
 the statement changed, or retire it in the commit session summary. A directory
 path resolves to its exact subtree; an unchanged move or copy keeps the same
-subtree object and needs no disposition. A renamed-and-edited directory has no
-same-path successor, so it requires retirement (and optionally a new record for
-the new composition) until RVR-014 lineage; continuing the record elsewhere
-does not satisfy the obligation. See the
+subtree object and needs no disposition. A renamed-and-edited subject has no
+same-path successor, so it requires either a durable lineage edge on that
+commit plus a per-decision disposition, or a retirement; continuing the record
+elsewhere does not satisfy the obligation, and neither does Git's rename
+similarity, which is never treated as the pairing. When one subject becomes
+several, every successor needs its own disposition: an edge that names the
+relation discharges nothing by itself. See the
 "Continue a reverie" recipe in .agents/skills/using-reveries/references/direct-git.md
 and CONTRIBUTING.md.`;
+
+const LINEAGE_PAIRING_REMEDIATION = `Two different successor sets are claimed for one predecessor subject. Keep the
+claim that is actually true and remove the other, then push the notes ref first:
+
+    git notes --ref=refs/notes/reveries show "<commit>" | grep '"type":"lineage"'
+    git push origin refs/notes/reveries:refs/notes/reveries
+
+An unchanged move or copy needs no pairing because the subject object is
+unchanged. A rename or rewrite needs exactly one explicit edge bound to the
+direct parent and result commit.`;
+
+const CONTRADICTORY_LINEAGE_REMEDIATION = `A lineage edge claims this exact commit while naming an endpoint that is not
+part of the change. Correct the edge to name the subjects this commit really
+changed, then push the notes ref first:
+
+    git notes --ref=refs/notes/reveries show "<commit>" | grep '"type":"lineage"'
+    git push origin refs/notes/reveries:refs/notes/reveries
+
+An edge may only pair subjects that this commit disturbs with subjects present
+in its result tree; similarity is never authority for the pairing.`;
 
 const NOTES_PUBLICATION_REMEDIATION = `Publish the notes ref alongside the code so the proposal carries its evidence:
 
@@ -203,6 +228,26 @@ export function classifyReceiveDiagnostic(diagnostic: string): ReceiveFinding {
       ...(commit === undefined ? {} : { commit }),
       detail: diagnostic,
       remediation: CONTINUITY_REMEDIATION,
+    };
+  }
+  if (/contradictory-lineage\b/.test(rest)) {
+    return {
+      code: "contradictory-lineage",
+      grade: "strict",
+      ...(ref === undefined ? {} : { ref }),
+      ...(commit === undefined ? {} : { commit }),
+      detail: diagnostic,
+      remediation: CONTRADICTORY_LINEAGE_REMEDIATION,
+    };
+  }
+  if (/ambiguous-pairing/.test(rest)) {
+    return {
+      code: "ambiguous-lineage-pairing",
+      grade: "strict",
+      ...(ref === undefined ? {} : { ref }),
+      ...(commit === undefined ? {} : { commit }),
+      detail: diagnostic,
+      remediation: LINEAGE_PAIRING_REMEDIATION,
     };
   }
   if (/\btransition\b/i.test(rest)) {

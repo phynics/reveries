@@ -9,6 +9,8 @@ import {
   createSignature,
   createCorrection,
   createLedgerManifest,
+  createLineage,
+  createOccurrence,
   createRedaction,
   createResolution,
   createReverie,
@@ -16,8 +18,12 @@ import {
   createEvidenceSnapshot,
   factGraphDiagnostics,
   LEDGER_REF,
+  lineageId,
+  lineagePayload,
   NOTES_REF,
   objectId,
+  occurrenceId,
+  occurrencePayload,
   parseLedgerManifest,
   parseNote,
   projectActiveReveries,
@@ -55,8 +61,17 @@ import {
   type FactTargetId,
   type LedgerManifest,
   ledgerManifestPayload,
+  type LineageEndpoint,
+  type LineageId,
+  type LineageInput,
+  type LineageKind,
+  type LineageRecord,
   type NoteRecord,
   type ObjectId,
+  type OccurrenceCoordinate,
+  type OccurrenceId,
+  type OccurrenceInput,
+  type OccurrenceRecord,
   type PublicationAttestation,
   type RedactionId,
   type RedactionInput,
@@ -78,6 +93,7 @@ import {
   type SignatureTrustReport,
   type SigningPolicy,
   type Source,
+  type SubjectId,
   type SummaryEntry,
   type TrustState,
   type TransitionCausal,
@@ -88,6 +104,8 @@ import {
   type TrustStore,
   reverieId,
 } from "./protocol.ts";
+import type { SubjectPairing } from "./continuity.ts";
+import { suggestLineage, type LineageSuggestion } from "./lineage.ts";
 import { projectTransitionAttestation } from "./projection.ts";
 import {
   GitRepository,
@@ -127,6 +145,83 @@ export interface RecordResult {
   readonly paths: readonly string[];
 }
 
+/**
+ * A record about one occurrence rather than about content (RVR-014). The
+ * caller names a path and a revision; the coordinate is resolved here so the
+ * stored record cannot claim a subject the repository does not have there.
+ */
+export interface RecordOccurrenceInput {
+  readonly path: string;
+  readonly revision: "HEAD" | "index" | string;
+  readonly semantic: OccurrenceInput;
+  readonly metadata: ReverieMetadata;
+}
+
+export interface OccurrenceResult {
+  readonly object: ObjectId;
+  readonly record: OccurrenceRecord;
+  readonly occurrence: OccurrenceCoordinate;
+  /** Every current path of the same subject, for the disclosure in the CLI. */
+  readonly paths: readonly string[];
+}
+
+/**
+ * A durable subject pairing (RVR-014). Endpoints are given as paths, never as
+ * hand-typed object IDs: the subject at each path is resolved in the revision
+ * the edge is bound to, so an edge cannot claim a pairing the repository does
+ * not contain.
+ */
+export interface RecordLineageInput {
+  readonly kind: LineageKind;
+  readonly parent: string;
+  readonly commit: string;
+  readonly from: readonly string[];
+  readonly to: readonly string[];
+  readonly transition?: TransitionId | null;
+  readonly semantic: {
+    readonly driving_event: string;
+    readonly decision: string;
+    readonly impact: string;
+    readonly recurrence_control: string | null;
+    readonly alternatives: string[];
+    readonly sources: Source[];
+  };
+  readonly metadata: ReverieMetadata;
+}
+
+export interface LineageResult {
+  readonly commit: CommitId;
+  readonly record: LineageRecord;
+  readonly from: readonly LineageEndpoint[];
+  readonly to: readonly LineageEndpoint[];
+}
+
+/**
+ * Whether a lineage edge may act as the pairing authority for one checked
+ * change (RVR-014).
+ *
+ * - `authoritative`: the edge is bound to exactly this parent and result
+ *   commit, and every endpoint it names is part of that change.
+ * - `history`: the edge describes some other change. It is evidence for path
+ *   history and never authority for a check.
+ * - `contradictory`: the edge claims this exact change while naming an
+ *   endpoint that is not part of it. Fail closed: a wrong pairing is worse
+ *   than a missing one.
+ */
+export type LineageAuthority = "authoritative" | "history" | "contradictory";
+
+export type LineageUse = {
+  readonly id: LineageId;
+  readonly authority: LineageAuthority;
+  readonly detail: string;
+};
+
+/** How a lineage edge was treated by one check, for evidence and for tests. */
+export interface LineageUseReport {
+  readonly used: readonly LineageUse[];
+  readonly historyOnly: readonly LineageId[];
+}
+
 export interface ShowInput {
   readonly target: string;
   readonly revision?: "HEAD" | "index" | string;
@@ -148,6 +243,32 @@ export interface ShowResult {
   readonly completeness: CompletenessInfo;
   /** Structural fact projection over the note, including redacted facts. */
   readonly factGraph: FactGraphProjection;
+  /**
+   * Occurrence records on this subject, split by whether they are about the
+   * occurrence on screen (RVR-014). Universal `active` output is unaffected.
+   */
+  readonly occurrences: readonly OccurrenceAnchor[];
+  /** Lineage edges that name this subject as a predecessor or successor. */
+  readonly lineage: readonly LineageRecord[];
+}
+
+/**
+ * One occurrence record as it relates to a particular occurrence being shown
+ * (RVR-014).
+ *
+ * The two groups are the display contract. `applicable` evidence is about the
+ * occurrence on screen: either it is anchored at exactly this coordinate, or
+ * explicit durable lineage derives this coordinate from its anchor. Anything
+ * else is `anchored` — real evidence about a different occurrence, reported
+ * with its own coordinate and never presented as if the shared blob made it
+ * universal.
+ */
+export interface OccurrenceAnchor {
+  readonly record: OccurrenceRecord;
+  readonly occurrence: OccurrenceCoordinate;
+  readonly applicable: boolean;
+  /** Why the record is not applicable here, when it is not. */
+  readonly reason: string | null;
 }
 
 export interface CheckResult {
@@ -424,6 +545,17 @@ export interface SearchHit {
   readonly object: ObjectId;
   readonly record: NoteRecord;
   readonly paths: readonly string[];
+  /**
+   * The coordinate an occurrence record is about (RVR-014), so a hit is never
+   * read as "applies everywhere this content occurs".
+   */
+  readonly occurrence?: OccurrenceCoordinate;
+  /**
+   * False when the occurrence's own coordinate no longer holds this subject in
+   * the searched revision. The record is still reported — with its anchor —
+   * but it is historical evidence, not a claim about the current paths.
+   */
+  readonly applicable?: boolean;
 }
 
 /**
@@ -463,8 +595,16 @@ export class IncompleteEvidenceError extends Error {
 
 export interface HistoryEntry {
   readonly commit: CommitId;
+  /** Legacy blob slot; `subject` and `subjectType` are authoritative for trees. */
   readonly blob: BlobId;
   readonly records: readonly NoteRecord[];
+  /** The subject found at `path` in `commit`, blob or tree (RVR-014). */
+  readonly subject?: ObjectId;
+  /** The path this entry describes, which follows a rename through lineage. */
+  readonly path?: string;
+  readonly subjectType?: string;
+  /** The durable edge that carried this coordinate from its predecessor. */
+  readonly viaLineage?: LineageId;
 }
 
 export interface HostedSummaryInput {
@@ -538,6 +678,17 @@ class NotesRefValidationError extends Error {
   }
 }
 
+/**
+ * The staged gate has no commit note to read, so it cannot see a durable
+ * lineage edge or a retirement. Rather than inventing a transient green, the
+ * diagnostic names the route that does close the obligation and the gates where
+ * that evidence exists.
+ */
+const STAGED_ROUTE_GUIDANCE = "Record this change, then record its lineage edge on that commit "
+  + "(reveries lineage record --parent <parent> --commit <commit> --from <path> --to <path>) together with "
+  + "a per-decision continuation, supersession, or causal retirement, and re-check the committed, "
+  + "outgoing, and receive gates.";
+
 function isFullObjectId(value: string): boolean {
   return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
 }
@@ -581,8 +732,113 @@ function syncConflictType(message: string): SyncConflictType {
   return "invalid-record";
 }
 
+/**
+ * One Git-detected similarity candidate. Only the suggestion surface parses
+ * these; the authoritative transition parser never sees a rename.
+ */
+type SimilarityCandidate = {
+  readonly from: { readonly path: string; readonly subject: SubjectId };
+  readonly to: { readonly path: string; readonly subject: SubjectId };
+  readonly score: number;
+};
+
+/**
+ * Parse `diff --raw -M` output into similarity candidates. Git's status field
+ * carries the score (`R095`, `C080`), which is kept as data rather than as a
+ * decision: the caller may only propose.
+ */
+export function parseSimilarityCandidates(raw: string): readonly SimilarityCandidate[] {
+  const fields = raw.split("\0");
+  const candidates: SimilarityCandidate[] = [];
+  let index = 0;
+  while (index < fields.length) {
+    const header = fields[index];
+    if (header === undefined || header.length === 0) break;
+    index += 1;
+    const parts = header.split(" ");
+    const oldValue = parts[2];
+    const newValue = parts[3];
+    const status = parts[4] ?? "";
+    if (oldValue === undefined || newValue === undefined) throw new Error("Malformed Git raw diff header");
+    const oldPath = fields[index];
+    const paired = /^([RC])\d*$/.test(status);
+    const newPath = paired ? fields[index + 1] : oldPath;
+    index += paired ? 2 : 1;
+    if (!paired || oldPath === undefined || newPath === undefined) continue;
+    if (zeroObject(oldValue) || zeroObject(newValue)) continue;
+    if (!isFullObjectId(oldValue) || !isFullObjectId(newValue)) {
+      throw new Error("Git diff returned an abbreviated object ID for a rename candidate");
+    }
+    const score = Number.parseInt(status.slice(1), 10);
+    candidates.push({
+      from: { path: normalizeCoordinatePath(oldPath), subject: objectId(oldValue) },
+      to: { path: normalizeCoordinatePath(newPath), subject: objectId(newValue) },
+      score: Number.isNaN(score) ? 100 : score,
+    });
+  }
+  return candidates;
+}
+
 function zeroObject(value: string): boolean {
   return /^0+$/.test(value);
+}
+
+/**
+ * The path as a coordinate stores it: repository-relative and without a
+ * leading `./`, so two spellings of one location cannot produce two
+ * coordinates that claim to be different occurrences.
+ */
+function normalizeCoordinatePath(path: string): string {
+  return path.replace(/^\.\//, "");
+}
+
+export function coordinateKey(commit: string, path: string, subject: string): string {
+  return `${commit}\u0000${normalizeCoordinatePath(path)}\u0000${subject}`;
+}
+/**
+ * How a coordinate relates to earlier ones, built from durable lineage edges:
+ * one entry per edge endpoint, pointing back at the coordinates that edge says
+ * this one came from.
+ */
+export type OccurrenceDerivation = ReadonlyMap<
+  string,
+  readonly { readonly coordinate: OccurrenceCoordinate; readonly lineage: LineageId }[]
+>;
+
+/**
+ * The edges that derive `anchor` into `from`, walking backwards through
+ * explicit lineage only. Empty means nothing derives it, which is the honest
+ * answer for a path that only ever shared a blob: no edge, no applicability.
+ *
+ * Every edge on every path from `from` back to `anchor` is reported, so a
+ * multi-hop chain names each link rather than only the farthest one.
+ */
+export function deriveLineage(
+  derivation: OccurrenceDerivation,
+  from: OccurrenceCoordinate,
+  anchor: OccurrenceCoordinate,
+): readonly LineageId[] {
+  const target = coordinateKey(anchor.commit, anchor.path, anchor.subject);
+  const settled = new Map<string, boolean>();
+  const used = new Set<LineageId>();
+  const walk = (coordinate: OccurrenceCoordinate): boolean => {
+    const key = coordinateKey(coordinate.commit, coordinate.path, coordinate.subject);
+    if (key === target) return true;
+    const known = settled.get(key);
+    if (known !== undefined) return known;
+    settled.set(key, false);
+    let found = false;
+    for (const step of derivation.get(key) ?? []) {
+      if (walk(step.coordinate)) {
+        used.add(step.lineage);
+        found = true;
+      }
+    }
+    settled.set(key, found);
+    return found;
+  };
+  walk(from);
+  return [...used].sort();
 }
 
 function allSources(record: NoteRecord): readonly Source[] {
@@ -655,6 +911,8 @@ export interface EvidenceSnapshotView {
   readonly byId: ReadonlyMap<ReverieId, { readonly record: NoteRecord; readonly object: ObjectId }>;
   readonly transitions: ReadonlyMap<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>;
   readonly attestations: ReadonlyMap<CommitId, readonly PublicationAttestation[]>;
+  /** Lineage edges indexed by the commit whose note carries them (RVR-014). */
+  readonly lineages: ReadonlyMap<CommitId, readonly LineageRecord[]>;
   readonly backlinks: ReadonlyMap<ReverieId, readonly ObjectId[]>;
   /** Structural fact projection across every entry: forks stay visible until resolved. */
   readonly factGraph: FactGraphProjection;
@@ -688,6 +946,7 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     byId: new Map(),
     transitions: new Map(),
     attestations: new Map(),
+    lineages: new Map(),
     backlinks: new Map(),
     factGraph: projectFactGraph([]),
     redacted: [],
@@ -753,6 +1012,21 @@ export class Reveries {
     private readonly proposedNotesTip?: ObjectId,
     private readonly signing: SigningOptions = {},
   ) {}
+
+  /**
+   * Lineage edges indexed by the commit whose note carries them, memoized per
+   * notes tip (RVR-014).
+   *
+   * An outgoing check asks for lineage once per parent per commit and every
+   * answer is the same. Keying the memo on the notes tip means one index serves a
+   * whole outgoing range and is discarded as soon as evidence changes, so the
+   * per-commit cost stays off the RVR-012 snapshot path without ever serving a
+   * stale edge.
+   */
+  private lineageIndex: {
+    readonly key: string;
+    readonly edges: ReadonlyMap<CommitId, readonly LineageRecord[]>;
+  } | null = null;
 
   static async open(cwd: string, signing: SigningOptions = {}): Promise<Reveries> {
     const repository = await GitRepository.open(cwd);
@@ -947,6 +1221,145 @@ export class Reveries {
     return this.recordNew({ ...input, semantic });
   }
 
+  /**
+   * Record evidence about one occurrence (RVR-014). The coordinate is resolved
+   * from the repository, not taken on trust: the record rides the note of the
+   * subject it names, so a wrong path fails here instead of becoming an
+   * unverifiable claim in the notes.
+   */
+  async recordOccurrence(input: RecordOccurrenceInput): Promise<OccurrenceResult> {
+    if (input.revision === "index") {
+      throw new Error(
+        "An occurrence coordinate needs a commit, and staged content has none: commit the change first, then record the occurrence at that commit",
+      );
+    }
+    const commit = await this.repository.resolveCommit(input.revision);
+    const resolved = await this.repository.resolveSubject({ path: input.path, revision: input.revision });
+    const occurrence: OccurrenceCoordinate = {
+      commit,
+      path: normalizeCoordinatePath(input.path),
+      subject: resolved.object,
+    };
+    const record = createOccurrence(
+      { ...input.semantic, occurrence },
+      input.metadata,
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    await this.mutateNotes(async (notes) => {
+      await notes.append(occurrence.subject, canonicalRecord(record));
+    });
+    return {
+      object: occurrence.subject,
+      record,
+      occurrence,
+      paths: input.revision === "index"
+        ? await this.repository.indexPathsForSubject(occurrence.subject)
+        : await this.repository.pathsForSubject(occurrence.subject, input.revision),
+    };
+  }
+
+  /**
+   * Record a durable subject pairing on the commit that establishes it
+   * (RVR-014). Every endpoint is resolved in the revision the edge names, and
+   * the edge is refused unless `parent` really is a direct parent of `commit`,
+   * because an unbound pairing could be applied to a change it does not
+   * describe.
+   */
+  async recordLineage(input: RecordLineageInput): Promise<LineageResult> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    const parent = await this.repository.resolveCommit(input.parent);
+    const direct = (await this.repository.run([
+      "show", "-s", "--format=%P", commit,
+    ])).stdout.trim().split(" ").filter((value) => value.length > 0);
+    if (!direct.includes(String(parent))) {
+      throw new Error(
+        `A lineage edge must bind the direct parent of ${commit}; ${parent} is not one of ${direct.join(", ") || "its parents"}`,
+      );
+    }
+    const from: LineageEndpoint[] = [];
+    for (const path of input.from) {
+      from.push(await this.lineageEndpoint(path, parent, "from"));
+    }
+    const to: LineageEndpoint[] = [];
+    for (const path of input.to) {
+      to.push(await this.lineageEndpoint(path, commit, "to"));
+    }
+    // Every predecessor must actually carry evidence: pairing an unannotated
+    // subject would create lineage about a decision that does not exist.
+    const annotated = new Set((await this.evidenceNotes()).map((entry) => String(entry.object)));
+    for (const endpoint of from) {
+      if (!annotated.has(String(endpoint.subject))) {
+        throw new Error(
+          `Lineage from endpoint ${endpoint.path} has no annotated evidence at ${parent}; record the decision before pairing it`,
+        );
+      }
+    }
+    // The edge must already satisfy the same authority rule the check will
+    // apply: every `from` occurrence disturbed by exactly this parent→commit
+    // change, every `to` occurrence present in its result. An unchanged move
+    // or copy disturbs nothing — the same subject is still reachable, so
+    // continuity already holds and no edge is needed — and recording one
+    // anyway would only fail later as contradictory-lineage. Refusing here
+    // names the real problem instead of deferring it to the check.
+    const changeTransitions = [
+      ...await this.commitTransitions(String(parent), String(commit)),
+      ...await this.treeSubjectTransitions(String(parent), String(commit), false),
+    ];
+    const disturbed = this.disturbedCoordinates(parent, changeTransitions);
+    const resultCoordinates = await this.coordinatesInCommit(commit);
+    const undisturbed = from.filter((endpoint) =>
+      !disturbed.has(coordinateKey(String(parent), endpoint.path, String(endpoint.subject))));
+    const absent = to.filter((endpoint) =>
+      !resultCoordinates.has(coordinateKey(String(commit), endpoint.path, String(endpoint.subject))));
+    if (undisturbed.length > 0 || absent.length > 0) {
+      throw new Error(
+        [
+          `A lineage edge may only pair occurrences this change disturbs with occurrences present in its result:`,
+          ...undisturbed.map((endpoint) =>
+            `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not disturbed by ${parent} to ${commit}; an unchanged move or copy needs no lineage edge`),
+          ...absent.map((endpoint) =>
+            `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not present in ${commit}`),
+        ].join(" "),
+      );
+    }
+    const record = createLineage(
+      {
+        v: 1,
+        kind: input.kind,
+        parent,
+        commit,
+        from,
+        to,
+        transition: input.transition ?? null,
+        ...input.semantic,
+      },
+      input.metadata,
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    if (record.transition !== null && !(await this.loadCachedEvidenceSnapshot({})).transitions.has(record.transition)) {
+      throw new Error(`Lineage transition ${record.transition} has no transition record`);
+    }
+    await this.mutateNotes(async (notes) => {
+      await notes.append(commit, canonicalRecord(record));
+    });
+    return { commit, record, from: record.from, to: record.to };
+  }
+
+  /**
+   * Resolve one endpoint of a lineage edge to the exact subject found at that
+   * path in its revision. A path that does not exist there fails the edge
+   * rather than silently naming an arbitrary subject.
+   */
+  private async lineageEndpoint(path: string, revision: CommitId, field: string): Promise<LineageEndpoint> {
+    let resolved;
+    try {
+      resolved = await this.repository.resolveSubject({ path, revision: String(revision) });
+    } catch (error: unknown) {
+      throw new Error(`Lineage ${field} endpoint ${path} does not resolve at ${revision}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { path: normalizeCoordinatePath(path), subject: resolved.object };
+  }
+
   async show(input: ShowInput): Promise<ShowResult> {
     const target = await this.resolveTarget(input.target, input.revision ?? "HEAD");
     const note = await this.readEvidenceNote(target.object);
@@ -964,6 +1377,8 @@ export class Reveries {
         paths: target.paths,
         completeness,
         factGraph: projectFactGraph([]),
+        occurrences: [],
+        lineage: await this.lineageTouching(target.object, input.includeRedacted === true),
       };
     }
     const parsed = parseNote(note, "tolerant", { verifyIds: false });
@@ -1013,6 +1428,7 @@ export class Reveries {
     if (suppressed > 0) {
       diagnostics.push(`${suppressed} redacted record(s) suppressed from display; history retains them`);
     }
+    const activeFacts = new Set(factGraph.active.map((record) => recordFactId(record)));
     const projection = projectActiveReveries(
       visibleRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
     );
@@ -1028,7 +1444,216 @@ export class Reveries {
       paths: target.paths,
       completeness,
       factGraph,
+      occurrences: await this.occurrenceAnchors(
+        target,
+        // A corrected or superseded occurrence is historical, so it is reported
+        // as history rather than as current evidence for this occurrence.
+        visibleRecords.filter((record): record is OccurrenceRecord =>
+          record.type === "occurrence" && activeFacts.has(record.id)),
+        input.revision ?? "HEAD",
+      ),
+      lineage: await this.lineageTouching(target.object, input.includeRedacted === true),
     };
+  }
+
+  /**
+   * Split the occurrence records on one subject into the ones that are about
+   * the occurrence on screen and the ones that are anchored elsewhere
+   * (RVR-014).
+   *
+   * A shared blob is exactly why this distinction matters: two paths holding
+   * one blob have different rationales, and reporting the `vendor/` decision as
+   * if it applied to `src/` because the object IDs match would be a false
+   * claim about applicability. Evidence about the current occurrence is
+   * applicable only when the anchor is this coordinate, or when explicit
+   * durable lineage derives this coordinate from the anchor. An unchanged
+   * descendant commit is therefore reported as anchored historical evidence —
+   * never silently re-applied to every occurrence.
+   */
+  private async occurrenceAnchors(
+    target: {
+      readonly object: ObjectId;
+      readonly paths: readonly string[];
+      readonly requestedPath: string | null;
+    },
+    records: readonly OccurrenceRecord[],
+    revision: string,
+  ): Promise<readonly OccurrenceAnchor[]> {
+    if (records.length === 0) return [];
+    const shownPaths = new Set(
+      (target.requestedPath === null ? target.paths : [target.requestedPath]).map(normalizeCoordinatePath),
+    );
+    let shownCommit: CommitId | null = null;
+    try {
+      shownCommit = revision === "index" ? null : await this.repository.resolveCommit(revision);
+    } catch {
+      shownCommit = null;
+    }
+    const { derivation } = shownCommit === null
+      ? { derivation: new Map() as OccurrenceDerivation }
+      : await this.occurrenceDerivation(shownCommit);
+    const anchors: OccurrenceAnchor[] = [];
+    for (const record of records) {
+      const coordinate = record.occurrence;
+      // The direct anchor: this record is about this path holding this subject.
+      if (shownCommit !== null
+        && String(coordinate.commit) === String(shownCommit)
+        && coordinate.subject === target.object
+        && shownPaths.has(normalizeCoordinatePath(coordinate.path))) {
+        anchors.push({ record, occurrence: coordinate, applicable: true, reason: null });
+        continue;
+      }
+      const shownPath = target.requestedPath ?? target.paths[0];
+      const shown: OccurrenceCoordinate | null = shownCommit === null || shownPath === undefined ? null : {
+        commit: shownCommit,
+        path: normalizeCoordinatePath(shownPath),
+        subject: target.object,
+      };
+      const via = shown === null ? [] : deriveLineage(derivation, shown, coordinate);
+      if (via.length > 0) {
+        anchors.push({
+          record,
+          occurrence: coordinate,
+          applicable: true,
+          reason: `carried forward by lineage ${via.join(", ")}`,
+        });
+        continue;
+      }
+      anchors.push({
+        record,
+        occurrence: coordinate,
+        applicable: false,
+        reason: `anchored at ${coordinate.path}@${coordinate.commit}; it describes that occurrence, not this one`,
+      });
+    }
+    return anchors.sort((left, right) => (left.record.id < right.record.id ? -1 : left.record.id > right.record.id ? 1 : 0));
+  }
+
+  /**
+   * Every durable edge in the snapshot as a backward map from a coordinate to
+   * the coordinates it derives from. Used for display and path history, never
+   * for a continuity verdict, which re-derives authority per checked change.
+   */
+  /** Every durable lineage edge in the evidence, indexed by its commit. */
+  private async lineageEdges(): Promise<ReadonlyMap<CommitId, readonly LineageRecord[]>> {
+    const tip = this.proposedNotesTip ?? await this.repository.notesTip(NOTES_REF);
+    const key = `${String(tip)}`;
+    if (this.lineageIndex?.key === key) return this.lineageIndex.edges;
+    const view = await this.evidenceView();
+    this.lineageIndex = { key, edges: view.lineages };
+    return view.lineages;
+  }
+
+  /**
+   * Every durable edge in the snapshot as a backward map from a coordinate to
+   * the coordinates it derives from. Used for display and path history, never
+   * for a continuity verdict, which re-derives authority per checked change.
+   *
+   * Coordinates are bound to the commit that established them, so after an
+   * unrelated later commit no key matches the reference revision. Each edge is
+   * therefore also carried forward by same-path OID identity: when the
+   * reference revision still holds the same subject at the same path, and the
+   * edge's commit is a real ancestor of it, the walk may step from the current
+   * coordinate back to the edge's coordinate under the same edge ID. Without
+   * this an unrelated commit would silently drop an explicit trail; with it a
+   * moved path keeps its history until the path itself moves on. Branches can
+   * never borrow each other's lineage: the ancestry check refuses that.
+   */
+  private async occurrenceDerivation(reference: CommitId | null): Promise<{
+    readonly derivation: OccurrenceDerivation;
+    readonly silent: ReadonlySet<string>;
+  }> {
+    const index = await this.lineageEdges();
+    const derivation = new Map<string, { coordinate: OccurrenceCoordinate; lineage: LineageId }[]>();
+    const silent = new Set<string>();
+    const stepId = (from: OccurrenceCoordinate, lineage: LineageId): string =>
+      `${coordinateKey(String(from.commit), from.path, String(from.subject))}\u0001${lineage}`;
+    const link = (
+      at: OccurrenceCoordinate,
+      from: OccurrenceCoordinate,
+      lineage: LineageId,
+      bridge: boolean,
+    ): void => {
+      const key = coordinateKey(String(at.commit), at.path, String(at.subject));
+      const previous = coordinateKey(String(from.commit), from.path, String(from.subject));
+      const list = derivation.get(key) ?? [];
+      if (!list.some((entry) =>
+        entry.lineage === lineage
+        && coordinateKey(
+          String(entry.coordinate.commit),
+          entry.coordinate.path,
+          String(entry.coordinate.subject),
+        ) === previous)) {
+        list.push({ coordinate: from, lineage });
+        if (bridge) silent.add(stepId(from, lineage));
+      }
+      derivation.set(key, list);
+    };
+    for (const edges of index.values()) {
+      for (const edge of edges) {
+        for (const endpoint of edge.to) {
+          const at: OccurrenceCoordinate = {
+            commit: edge.commit,
+            path: endpoint.path,
+            subject: endpoint.subject,
+          };
+          for (const source of edge.from) {
+            link(at, { commit: edge.parent, path: source.path, subject: source.subject }, edge.id, false);
+          }
+          if (reference !== null && String(edge.commit) !== String(reference)) {
+            try {
+              const ancestor = await this.repository.run(
+                ["merge-base", "--is-ancestor", String(edge.commit), String(reference)],
+                { allowExitCodes: [0, 1] },
+              );
+              if (ancestor.exitCode !== 0) continue;
+              const current = await this.repository.resolveSubject({
+                path: endpoint.path,
+                revision: String(reference),
+              });
+              if (current.object !== endpoint.subject) continue;
+              link(
+                {
+                  commit: reference,
+                  path: normalizeCoordinatePath(endpoint.path),
+                  subject: endpoint.subject,
+                },
+                at,
+                edge.id,
+                true,
+              );
+            } catch {
+              // The path moved on or is unreadable at the reference revision:
+              // no bridge, and no claim about where it went.
+            }
+          }
+        }
+      }
+    }
+    return { derivation, silent };
+  }
+
+  /** Lineage edges that name a subject on either side of the relation. */
+  private async lineageTouching(
+    subject: ObjectId,
+    includeRedacted = false,
+  ): Promise<readonly LineageRecord[]> {
+    const index = await this.lineageEdges();
+    // Redactions of lineage edges live on commit notes, beside the edges, so
+    // the note-local graph that filters `records` never sees them: only the
+    // global redacted set hides them here.
+    const redacted = includeRedacted ? new Set<string>() : new Set((await this.evidenceView()).redacted);
+    const touching: LineageRecord[] = [];
+    for (const edges of index.values()) {
+      for (const edge of edges) {
+        if (redacted.has(edge.id)) continue;
+        if (edge.from.some((endpoint) => endpoint.subject === subject)
+          || edge.to.some((endpoint) => endpoint.subject === subject)) {
+          touching.push(edge);
+        }
+      }
+    }
+    return touching.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
   }
 
   /**
@@ -1542,7 +2167,7 @@ export class Reveries {
       const to = await this.repository.resolveSubject({ path: newPath, revision: "index" });
       if (from.type !== "blob" || to.type !== "blob") {
         throw new Error(
-          `reveries check --successor maps file (blob) paths only; a renamed-and-edited directory has no same-path successor: retire its decisions (and optionally record new ones) until RVR-014 lineage (old: ${oldPath}, new: ${newPath})`,
+          `reveries check --successor maps file (blob) paths only, and it is a local aid rather than publication proof: a renamed-and-edited directory needs a durable lineage edge on the resulting commit (old: ${oldPath}, new: ${newPath})`,
         );
       }
       const existing = transitions.findIndex((transition) => transition.oldPath === oldPath);
@@ -1552,7 +2177,16 @@ export class Reveries {
     }
     const summary = emptySummary();
     const tree = await this.treeSubjectTransitions("HEAD", "HEAD", true);
-    return this.checkTransitions([...transitions, ...tree], summary);
+    // No commit exists yet, so there is no durable lineage edge and no session
+    // summary to read: the staged gate stays fail-closed and says which route
+    // actually closes the obligation. `--successor` is a local aid for files and
+    // is never evidence that publication will pass.
+    return this.checkTransitions(
+      [...transitions, ...tree],
+      summary,
+      [],
+      STAGED_ROUTE_GUIDANCE,
+    );
   }
 
   async checkCommit(revision: string): Promise<CheckResult> {
@@ -1587,11 +2221,16 @@ export class Reveries {
     const diagnostics: string[] = [];
     for (const parent of await this.commitParents(commit)) {
       const transitions = [...await this.commitTransitions(parent, commit)];
-      // Directory renames fail closed here: a renamed-and-edited tree with no
-      // same-path successor requires retirement until RVR-014 lineage, on
-      // every gate. Explicit maps stay a staged-only local aid for files.
+      // Directory renames pair through durable lineage when one exists, and stay
+      // fail-closed without one: same-path identity is the only pairing inferred
+      // automatically, and similarity is never inferred at all.
       const tree = await this.treeSubjectTransitions(parent, commit, false);
-      const result = await this.checkTransitions([...transitions, ...tree], summary);
+      const disturbed = this.disturbedCoordinates(parent, [...transitions, ...tree]);
+      const lineage = await this.classifyLineage({ commit, parent, disturbed });
+      for (const use of lineage.used.filter((entry) => entry.authority === "contradictory")) {
+        diagnostics.push(`contradictory-lineage ${use.id} for ${commit}: ${use.detail}`);
+      }
+      const result = await this.checkTransitions([...transitions, ...tree], summary, lineage.pairings);
       diagnostics.push(...result.diagnostics.map((diagnostic) => `${parent}: ${diagnostic}`));
     }
     return { ok: diagnostics.length === 0, diagnostics };
@@ -1629,6 +2268,17 @@ export class Reveries {
     return { ok: diagnostics.length === 0, diagnostics };
   }
 
+  /**
+   * Validate a proposed notes tip as evidence, on the receiver side and before
+   * any authority is derived from it.
+   *
+   * Shape, identity, and sources are checked per note, and the addressed
+   * records are checked against the repository as well: an occurrence must
+   * still resolve at its coordinate, and a lineage edge must bind a direct
+   * parent whose endpoints hold the subjects it names. That second layer is
+   * what keeps a hand-written record from steering a check, and it runs on the
+   * proposed tip rather than the ref the receiver already holds.
+   */
   async checkProposedEvidence(): Promise<CheckResult> {
     if (this.proposedNotesTip === undefined) {
       throw new Error("Proposed evidence is available only to a receive checker");
@@ -1641,7 +2291,41 @@ export class Reveries {
         diagnostics.push(`${entry.object}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    for (const diagnostic of await this.addressedEvidenceDiagnostics()) {
+      diagnostics.push(diagnostic);
+    }
     return { ok: diagnostics.length === 0, diagnostics };
+  }
+
+  /**
+   * Coordinates of every occurrence and lineage record in the proposed
+   * evidence, checked against the repository. Coordinates, not objects: a
+   * record may name a real subject at a path that does not hold it.
+   */
+  private async addressedEvidenceDiagnostics(): Promise<readonly string[]> {
+    const view = await this.evidenceView();
+    const diagnostics: string[] = [];
+    for (const entry of view.entries) {
+      for (const record of entry.records) {
+        if (record.type === "occurrence") {
+          try {
+            await this.validateCoordinate(record.occurrence);
+          } catch (error: unknown) {
+            diagnostics.push(
+              `Occurrence ${record.id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          continue;
+        }
+        if (record.type !== "lineage") continue;
+        try {
+          await this.validateLineageRecord(record);
+        } catch (error: unknown) {
+          diagnostics.push(`Lineage ${record.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+    return diagnostics;
   }
 
   async checkOutgoing(remote: string): Promise<CheckResult> {
@@ -1763,37 +2447,58 @@ export class Reveries {
     return { hits: await this.searchWithView(view, input), completeness };
   }
 
+  /**
+   * Path history for one path.
+   *
+   * `git log -- path` alone stops at a rename, so the evidence trail of a
+   * subject that moved and changed ends there. Explicit durable lineage is
+   * therefore followed as well: every entry is reported with the path it really
+   * had, and the edge that carried it. Lineage is the only thing followed here
+   * — similarity is never consulted — and every edge that exists is history,
+   * so this walk needs no change-authority decision.
+   */
   async history(path: string, options: HistoryOptions = {}): Promise<readonly HistoryEntry[]> {
     if (options.allowIncomplete !== true && await this.repository.isShallowRepository()) {
       const completeness = await this.assessCompleteness({});
       throw new IncompleteEvidenceError(
         completeness.grade === "complete"
           ? {
-            grade: "shallow-boundary",
-            reasons: [
-              "the repository is shallow: history before the boundary is unavailable locally",
-              ...completeness.reasons,
-            ],
-            authoritative: false,
-          }
+              grade: "shallow-boundary",
+              reasons: [
+                "the repository is shallow: history before the boundary is unavailable locally",
+                ...completeness.reasons,
+              ],
+              authoritative: false,
+            }
           : completeness,
       );
     }
     const log = await this.repository.run(["log", "--format=%H", "--", path]);
     const history: HistoryEntry[] = [];
     const seen = new Set<string>();
+    let latestOccurrence: OccurrenceCoordinate | null = null;
     for (const value of log.stdout.trim().split("\n").filter((line) => line.length > 0)) {
       const commit = commitId(value);
       try {
-        const blob = await this.repository.resolvePath({ path, revision: commit });
-        const key = `${commit}:${blob}`;
+        const resolved = await this.repository.resolveSubject({ path, revision: String(commit) });
+        const key = coordinateKey(String(commit), path, String(resolved.object));
         if (seen.has(key)) continue;
         seen.add(key);
-        const note = await this.readEvidenceNote(blob);
+        const note = await this.readEvidenceNote(resolved.object);
+        latestOccurrence ??= {
+          commit,
+          path: normalizeCoordinatePath(path),
+          subject: resolved.object,
+        };
         history.push({
           commit,
-          blob,
+          // `blob` is retained for API compatibility. For a tree path,
+          // `subject` and `subjectType` below carry the actual subject.
+          blob: blobId(resolved.object),
           records: note === null ? [] : parseNote(note, "tolerant", { verifyIds: false }).records,
+          subject: resolved.object,
+          path,
+          subjectType: resolved.type,
         });
       } catch (error: unknown) {
         if (options.allowIncomplete !== true
@@ -1802,7 +2507,101 @@ export class Reveries {
         }
       }
     }
+    let start = latestOccurrence;
+    try {
+      const head = await this.repository.resolveCommit("HEAD");
+      const current = await this.repository.resolveSubject({ path, revision: "HEAD" });
+      // When the path still exists at HEAD, start there so explicit preserve
+      // bridges carry the edge through unrelated descendant commits. When it
+      // has been deleted, keep the newest coordinate that actually existed in
+      // the path's own log instead of trying to resolve a missing HEAD:path.
+      start = {
+        commit: head,
+        path: normalizeCoordinatePath(path),
+        subject: current.object,
+      };
+    } catch {
+      // A deleted or never-present path has no HEAD coordinate. Its most recent
+      // extant coordinate from the log is still a valid starting point for the
+      // explicit lineage walk.
+    }
+    const walk = await this.occurrenceDerivation(start?.commit ?? null);
+    if (start !== null) {
+      history.push(...await this.lineageHistory(walk.derivation, walk.silent, start, seen));
+    }
     return history;
+  }
+
+  /**
+   * Follow explicit lineage backwards from a path at its current revision,
+   * appending the earlier coordinates a rename-plus-edit, split, or join would
+   * otherwise hide. Ordering stays deterministic: commit descending, then path.
+   *
+   * A path that no longer resolves at the reference revision (deleted, or
+   * moved on) contributes nothing here: the `git log` walk above already
+   * reported the commits that touched it, and there is no current coordinate
+   * to walk backwards from.
+   */
+  private async lineageHistory(
+    derivation: OccurrenceDerivation,
+    silent: ReadonlySet<string>,
+    start: OccurrenceCoordinate,
+    seen: Set<string>,
+  ): Promise<readonly HistoryEntry[]> {
+    const view = await this.loadCachedEvidenceSnapshot({});
+    if (view.lineages.size === 0) return [];
+    const startKey = coordinateKey(String(start.commit), start.path, String(start.subject));
+    // Collect every coordinate the edges derive this one from. The start itself
+    // is left out: `git log` already reported it. Bridge steps are
+    // traversal-only for the same reason: they name the coordinate the walk
+    // already stands on, so emitting them would duplicate the entry the
+    // current revision (or an earlier edge step) already produced.
+    const earlier: { coordinate: OccurrenceCoordinate; lineage: LineageId }[] = [];
+    const visited = new Set<string>([startKey]);
+    const queue: OccurrenceCoordinate[] = [start];
+    while (queue.length > 0) {
+      const coordinate = queue.shift() as OccurrenceCoordinate;
+      for (const step of derivation.get(coordinateKey(
+        String(coordinate.commit),
+        coordinate.path,
+        String(coordinate.subject),
+      )) ?? []) {
+        const previous = coordinateKey(
+          String(step.coordinate.commit),
+          step.coordinate.path,
+          String(step.coordinate.subject),
+        );
+        if (visited.has(previous)) continue;
+        visited.add(previous);
+        if (!silent.has(`${previous}\u0001${step.lineage}`)) earlier.push(step);
+        queue.push(step.coordinate);
+      }
+    }
+    const entries: HistoryEntry[] = [];
+    for (const step of earlier) {
+      const coordinate = step.coordinate;
+      if (seen.has(`${coordinate.commit}:${coordinate.subject}`)) continue;
+      seen.add(`${coordinate.commit}:${coordinate.subject}`);
+      let subjectType = "blob";
+      try {
+        subjectType = (await this.repository.run(["cat-file", "-t", coordinate.subject])).stdout.trim();
+      } catch {
+        continue;
+      }
+      const note = await this.readEvidenceNote(coordinate.subject);
+      entries.push({
+        commit: coordinate.commit,
+        blob: blobId(coordinate.subject),
+        records: note === null ? [] : parseNote(note, "tolerant", { verifyIds: false }).records,
+        subject: coordinate.subject,
+        path: coordinate.path,
+        subjectType,
+        viaLineage: step.lineage,
+      });
+    }
+    return entries.sort((left, right) => (left.commit === right.commit
+      ? String(left.path).localeCompare(String(right.path))
+      : left.commit < right.commit ? 1 : -1));
   }
 
   /**
@@ -1921,6 +2720,20 @@ export class Reveries {
             }
             continue;
           }
+          if (record.type === "occurrence") {
+            const expected = `oc:${hashBlobContent(`${occurrencePayload(record)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Occurrence ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
+          if (record.type === "lineage") {
+            const expected = `lg:${hashBlobContent(`${lineagePayload(record, limits)}\n`, format)}`;
+            if (expected !== record.id) {
+              throw new Error(`Lineage ID mismatch for ${record.id}; expected ${expected}`);
+            }
+            continue;
+          }
           if (record.type !== "reverie") continue;
           const expected = `rv:${hashBlobContent(`${semanticPayload(record)}\n`, format)}`;
           if (expected !== record.id) {
@@ -1986,6 +2799,7 @@ export class Reveries {
     );
     const transitions = new Map<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>();
     const attestationLists = new Map<CommitId, PublicationAttestation[]>();
+    const lineageLists = new Map<CommitId, LineageRecord[]>();
     for (const entry of entries) {
       for (const record of entry.records) {
         if (record.type === "transition-summary") {
@@ -1994,10 +2808,15 @@ export class Reveries {
           const list = attestationLists.get(record.commit) ?? [];
           list.push(record);
           attestationLists.set(record.commit, list);
+        } else if (record.type === "lineage") {
+          const list = lineageLists.get(record.commit) ?? [];
+          list.push(record);
+          lineageLists.set(record.commit, list);
         }
       }
     }
     const attestations = new Map<CommitId, readonly PublicationAttestation[]>(attestationLists);
+    const lineages = new Map<CommitId, readonly LineageRecord[]>(lineageLists);
     const globalRecords = entries.flatMap((entry) => entry.records);
     const factGraph = projectFactGraph(globalRecords);
     const redacted = [...factGraph.redacted];
@@ -2031,6 +2850,7 @@ export class Reveries {
       byId,
       transitions,
       attestations,
+      lineages,
       backlinks,
       factGraph,
       redacted,
@@ -2098,6 +2918,7 @@ export class Reveries {
         // disqualifies the subject as a transition result or publication.
         if (entry.objectType === "blob" && entry.records.some((record) =>
           record.type !== "reverie"
+          && record.type !== "occurrence"
           && record.type !== "correction"
           && record.type !== "resolution"
           && record.type !== "redaction"
@@ -2106,6 +2927,7 @@ export class Reveries {
         }
         if (entry.objectType === "commit" && entry.records.some((record) =>
           record.type === "reverie"
+          || record.type === "occurrence"
           || record.type === "correction"
           || record.type === "resolution")) {
           throw new Error(`Commit ${entry.object} has a file reverie record`);
@@ -2117,6 +2939,7 @@ export class Reveries {
         if (entry.objectType === "tree"
           && entry.records.some((record) =>
             record.type !== "reverie"
+            && record.type !== "occurrence"
             && record.type !== "transition-summary"
             && record.type !== "correction"
             && record.type !== "resolution"
@@ -2127,6 +2950,25 @@ export class Reveries {
         for (const record of entry.records) {
           if (record.type === "publication-attestation" && record.commit !== entry.object) {
             throw new Error(`Attestation for ${record.commit} is attached to ${entry.object}`);
+          }
+          // A lineage edge belongs to the change it describes, so it rides the
+          // note of that exact commit, beside that commit's session summary.
+          if (record.type === "lineage" && record.commit !== entry.object) {
+            throw new Error(`Lineage edge for commit ${record.commit} is attached to ${entry.object}`);
+          }
+          // An occurrence rides the note of the subject it names, and its
+          // coordinate must still resolve to that subject. Without this a
+          // record could claim a path that never held this content.
+          if (record.type === "occurrence") {
+            if (record.occurrence.subject !== entry.object) {
+              throw new Error(
+                `Occurrence ${record.id} names subject ${record.occurrence.subject} but is attached to ${entry.object}`,
+              );
+            }
+            await this.validateCoordinate(record.occurrence);
+          }
+          if (record.type === "lineage") {
+            await this.validateLineageRecord(record);
           }
         }
         if (entry.objectType !== "blob" && entry.objectType !== "commit" && entry.objectType !== "tree"
@@ -2237,6 +3079,15 @@ export class Reveries {
 
   private async searchWithView(view: EvidenceSnapshotView, input: SearchInput): Promise<readonly SearchHit[]> {
     const revision = input.revision ?? "HEAD";
+    let revisionCommit: CommitId | null = null;
+    try {
+      if (revision !== "index") revisionCommit = await this.repository.resolveCommit(revision);
+    } catch {
+      revisionCommit = null;
+    }
+    const occurrenceWalk = revisionCommit === null
+      ? { derivation: new Map() as OccurrenceDerivation, silent: new Set<string>() }
+      : await this.occurrenceDerivation(revisionCommit);
     const allowed = input.all === true
       ? new Set(view.entries.map((entry) => entry.object as string))
       : new Set((await this.snapshotTargets(view, revision)).map((entry) => entry.object as string));
@@ -2250,11 +3101,29 @@ export class Reveries {
         if (input.query !== undefined && !searchText(record).includes(input.query.toLocaleLowerCase())) continue;
         if (input.source !== undefined && !allSources(record).some((source) => source.ref === input.source)) continue;
         if (input.author !== undefined && recordAuthor(record) !== input.author) continue;
-        hits.push({
-          object: entry.object,
-          record,
-          paths: await this.pathsForObject(entry.object, revision),
-        });
+        const paths = await this.pathsForObject(entry.object, revision);
+        hits.push(record.type === "occurrence"
+          ? {
+              object: entry.object,
+              record,
+              paths,
+              occurrence: record.occurrence,
+              applicable: revisionCommit !== null && paths.some((path) => {
+                const current: OccurrenceCoordinate = {
+                  commit: revisionCommit as CommitId,
+                  path: normalizeCoordinatePath(path),
+                  subject: entry.object,
+                };
+                const anchor = record.occurrence;
+                if (String(anchor.commit) === String(current.commit)
+                  && normalizeCoordinatePath(anchor.path) === current.path
+                  && anchor.subject === current.subject) {
+                  return true;
+                }
+                return deriveLineage(occurrenceWalk.derivation, current, anchor).length > 0;
+              }),
+            }
+          : { object: entry.object, record, paths });
       }
     }
     return hits;
@@ -4137,8 +5006,15 @@ export class Reveries {
     readonly object: ObjectId;
     readonly objectType: string;
     readonly paths: readonly string[];
+    /**
+     * The path the caller named, when they named one. A subject can occur at
+     * several paths, and applicability is per occurrence, so the display layer
+     * needs to know which of them is on screen.
+     */
+    readonly requestedPath: string | null;
   }> {
     let object: ObjectId;
+    const requestedPath = isFullObjectId(target) ? null : normalizeCoordinatePath(target);
     try {
       object = isFullObjectId(target)
         ? objectId(target)
@@ -4149,7 +5025,7 @@ export class Reveries {
     try {
       const objectType = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
       const paths = await this.displayPathsForSubject(object, objectType, revision);
-      return { object, objectType, paths };
+      return { object, objectType, paths, requestedPath };
     } catch (error: unknown) {
       return this.gradedFailure(error, [object]);
     }
@@ -4228,6 +5104,20 @@ export class Reveries {
         }
         continue;
       }
+      if (record.type === "occurrence") {
+        const expected = `oc:${await this.repository.hashObject(`${occurrencePayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          throw new Error(`Occurrence ID mismatch for ${record.id}; expected ${expected}`);
+        }
+        continue;
+      }
+      if (record.type === "lineage") {
+        const expected = `lg:${await this.repository.hashObject(`${lineagePayload(record)}\n`)}`;
+        if (expected !== record.id) {
+          throw new Error(`Lineage ID mismatch for ${record.id}; expected ${expected}`);
+        }
+        continue;
+      }
       if (record.type !== "reverie") continue;
       const expected = `rv:${await this.repository.hashObject(`${semanticPayload(record)}\n`)}`;
       if (expected !== record.id) {
@@ -4251,6 +5141,91 @@ export class Reveries {
     if (projection.forks.length > 0) diagnostics.push("Unresolved supersession fork detected");
     if ((projection.conflicts?.length ?? 0) > 0) diagnostics.push("Conflicting duplicate reverie IDs detected");
     return diagnostics;
+  }
+
+  /**
+   * An occurrence coordinate is only evidence if the repository still supports
+   * it: at `commit`, `path` must hold exactly `subject`. A coordinate Git
+   * cannot resolve fails closed here, and a missing object inside an incomplete
+   * clone is reported as incompleteness rather than as a broken claim.
+   */
+  private async validateCoordinate(coordinate: OccurrenceCoordinate): Promise<void> {
+    let resolved;
+    try {
+      resolved = await this.repository.resolveSubject({
+        path: coordinate.path,
+        revision: String(coordinate.commit),
+      });
+    } catch (error: unknown) {
+      await this.gradedFailure(error, [coordinate.commit, coordinate.subject]);
+      throw new Error(
+        `Occurrence coordinate ${coordinate.path}@${coordinate.commit} does not resolve: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (resolved.object !== coordinate.subject) {
+      throw new Error(
+        `Occurrence coordinate ${coordinate.path}@${coordinate.commit} holds ${resolved.object}, not ${coordinate.subject}`,
+      );
+    }
+  }
+
+  /**
+   * A lineage edge is checked against the repository before it can influence
+   * any verdict: the parent must be a direct parent of the commit, every
+   * endpoint must resolve in the revision it names, and every predecessor must
+   * carry evidence. Anything else is a claim about a change this edge does not
+   * describe, so it fails closed rather than being stored and ignored.
+   */
+  private async validateLineageRecord(record: LineageRecord): Promise<void> {
+    const parents = (await this.repository.run([
+      "show", "-s", "--format=%P", String(record.commit),
+    ])).stdout.trim().split(" ").filter((value) => value.length > 0);
+    if (!parents.includes(String(record.parent))) {
+      throw new Error(
+        `Lineage ${record.id} binds parent ${record.parent}, which is not a direct parent of commit ${record.commit}`,
+      );
+    }
+    for (const endpoint of record.from) {
+      await this.validateLineageEndpoint(endpoint, record.parent, record, "from");
+    }
+    for (const endpoint of record.to) {
+      await this.validateLineageEndpoint(endpoint, record.commit, record, "to");
+    }
+    if (record.transition !== null) {
+      const view = await this.loadCachedEvidenceSnapshot({});
+      if (!view.transitions.has(record.transition)) {
+        throw new Error(`Lineage ${record.id} names transition ${record.transition}, which has no transition record`);
+      }
+    }
+  }
+
+  private async validateLineageEndpoint(
+    endpoint: LineageEndpoint,
+    revision: CommitId,
+    record: LineageRecord,
+    field: string,
+  ): Promise<void> {
+    let resolved;
+    try {
+      resolved = await this.repository.resolveSubject({ path: endpoint.path, revision: String(revision) });
+    } catch (error: unknown) {
+      await this.gradedFailure(error, [revision, endpoint.subject]);
+      throw new Error(
+        `Lineage ${record.id} ${field} endpoint ${endpoint.path} does not resolve at ${revision}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (resolved.object !== endpoint.subject) {
+      throw new Error(
+        `Lineage ${record.id} ${field} endpoint ${endpoint.path} holds ${resolved.object} at ${revision}, not ${endpoint.subject}`,
+      );
+    }
+    if (field !== "from") return;
+    const annotated = (await this.readEvidenceNote(endpoint.subject)) !== null;
+    if (!annotated) {
+      throw new Error(
+        `Lineage ${record.id} pairs ${endpoint.path}, which has no annotated evidence to pair`,
+      );
+    }
   }
 
   private async validateNotesRef(ref: string): Promise<void> {
@@ -4277,9 +5252,17 @@ export class Reveries {
     return view.init;
   }
 
+  /**
+   * Staged blob transitions. Rename detection is deliberately absent: `-M`
+   * would let Git's similarity score decide that a renamed-and-edited blob is
+   * the predecessor of the new one, and a copied record would then discharge
+   * the obligation without anyone asserting the relation. An unchanged rename
+   * keeps the same blob OID, so it is filtered below by the subject still being
+   * reachable and never needs a pairing.
+   */
   private async stagedTransitions(): Promise<readonly DiffTransition[]> {
     const result = await this.repository.run([
-      "diff", "--cached", "--raw", "-z", "--abbrev=64", "-M", "HEAD",
+      "diff", "--cached", "--raw", "-z", "--abbrev=64", "HEAD",
     ]);
     const successorBlobs = new Set((await this.repository.listIndex()).map((entry) => entry.object));
     return this.parseTransitions(result.stdout).filter(
@@ -4287,9 +5270,15 @@ export class Reveries {
     );
   }
 
+  /**
+   * Committed blob transitions for one parent, without similarity pairing. A
+   * renamed-and-edited blob is a deletion plus an addition, so the annotated
+   * predecessor has no successor until an explicit durable lineage edge or a
+   * causal retirement says what happened to it.
+   */
   private async commitTransitions(parent: string, commit: string): Promise<readonly DiffTransition[]> {
     const result = await this.repository.run([
-      "diff-tree", "--raw", "-z", "--abbrev=64", "-r", "-M", "--no-commit-id", parent, commit,
+      "diff-tree", "--raw", "-z", "--abbrev=64", "-r", "--no-commit-id", parent, commit,
     ]);
     const successorBlobs = new Set((await this.repository.listTree(commit)).map((entry) => entry.object));
     return this.parseTransitions(result.stdout).filter(
@@ -4343,8 +5332,8 @@ export class Reveries {
    * by identical directory path and never by similarity or by notes evidence
    * on unrelated trees: an unchanged move or copy keeps the same OID
    * reachable and needs no disposition, while a vanished directory path
-   * yields a successor-less pair that only a causal retirement clears
-   * (explicit lineage arrives with RVR-014).
+   * yields a successor-less pair that a durable lineage edge (RVR-014) or a
+   * causal retirement must resolve.
    *
    * The revision root tree is paired explicitly because `ls-tree -r -t`
    * lists nested subtrees but never the root itself; without this pair a
@@ -4390,38 +5379,238 @@ export class Reveries {
         if (!annotated.has(from)) continue;
         const successor = newByPath.get(old.path);
         transitions.push(successor === undefined
-          ? { from: old.object }
-          : { from: old.object, to: successor });
+          ? { from: old.object, oldPath: old.path }
+          : { from: old.object, to: successor, oldPath: old.path, newPath: old.path });
       }
     }
     if (oldRoot !== newTree && annotated.has(oldRoot as string)) {
-      transitions.push({ from: oldRoot, to: newTree });
+      transitions.push({ from: oldRoot, to: newTree, oldPath: ".", newPath: "." });
     }
     return transitions;
+  }
+
+  /**
+   * Suggest lineage candidates for a change using Git's similarity detection
+   * (RVR-014).
+   *
+   * This is the only place in the product that asks Git to detect renames, and
+   * nothing here can discharge an obligation: the rows are unconfirmed
+   * proposals, and the authoritative matcher deliberately runs with rename
+   * detection off. Turning a suggestion into evidence requires recording a
+   * lineage edge and a per-decision disposition.
+   */
+  async suggestLineage(input: {
+    readonly staged?: boolean;
+    readonly revision?: string;
+  } = {}): Promise<{
+    readonly suggestions: readonly LineageSuggestion[];
+    readonly parent: CommitId | null;
+    readonly commit: CommitId | null;
+  }> {
+    const staged = input.staged === true;
+    let parent: CommitId | null = null;
+    let commit: CommitId | null = null;
+    let raw: string;
+    if (staged) {
+      const head = await this.repository.resolveCommit("HEAD");
+      raw = (await this.repository.run([
+        "diff", "--cached", "--raw", "-z", "--abbrev=64", "-M50%", "-C50%", "HEAD",
+      ])).stdout;
+      parent = head;
+      commit = null;
+    } else {
+      const revision = input.revision ?? "HEAD";
+      commit = await this.repository.resolveCommit(revision);
+      const parents = await this.commitParents(commit);
+      parent = parents[0] ?? null;
+      if (parent === null) return { suggestions: [], parent: null, commit };
+      raw = (await this.repository.run([
+        "diff-tree", "--raw", "-z", "--abbrev=64", "-r", "-M50%", "-C50%", "--no-commit-id", String(parent), String(commit),
+      ])).stdout;
+    }
+    const annotated = new Set((await this.evidenceNotes()).map((entry) => String(entry.object)));
+    const suggestions: LineageSuggestion[] = [];
+    for (const candidate of parseSimilarityCandidates(raw)) {
+      // A proposal about content nobody decided anything about is noise.
+      if (!annotated.has(String(candidate.from.subject))) continue;
+      suggestions.push(...suggestLineage({
+        from: candidate.from,
+        to: candidate.to,
+        score: candidate.score,
+      }));
+    }
+    return { suggestions, parent, commit };
   }
 
   private async checkTransitions(
     transitions: readonly DiffTransition[],
     summary: SessionSummary,
+    pairings: readonly SubjectPairing[] = [],
+    guidance: string | null = null,
   ): Promise<CheckResult> {
     const predecessors = new Map<ObjectId, ActiveProjection>();
     const successors = new Map<ObjectId, ActiveProjection>();
+    const subjects = new Set<ObjectId>();
     for (const transition of transitions) {
-      if (await this.readEvidenceNote(transition.from) !== null) {
-        predecessors.set(transition.from, await this.projectionFor(transition.from));
-      }
-      if (transition.to !== undefined) {
-        successors.set(transition.to, await this.projectionFor(transition.to));
+      subjects.add(transition.from);
+      if (transition.to !== undefined) subjects.add(transition.to);
+    }
+    for (const pairing of pairings) {
+      subjects.add(pairing.from);
+      for (const successor of pairing.to) subjects.add(successor);
+    }
+    for (const subject of subjects) {
+      if (await this.readEvidenceNote(subject) !== null) {
+        const projection = await this.projectionFor(subject);
+        predecessors.set(subject, projection);
+        successors.set(subject, projection);
       }
     }
-    const report = analyzeContinuity({ transitions, predecessors, successors, summary });
+    const report = analyzeContinuity({ transitions, pairings, predecessors, successors, summary });
     const diagnostics = [
       ...report.conflicts,
-      ...report.obligations.map(
-        (obligation) => `${obligation.id} from ${obligation.from_blob}: ${obligation.reason}`,
-      ),
+      ...report.obligations.map((obligation) => {
+        const where = obligation.missing_at === undefined || obligation.missing_at.length === 0
+          ? ""
+          : ` (no disposition at ${obligation.missing_at.join(", ")})`;
+        const route = obligation.to_blob === undefined && guidance !== null ? ` ${guidance}` : "";
+        return `${obligation.id} from ${obligation.from_blob}: ${obligation.reason}${where}${route}`;
+      }),
     ];
     return { ok: report.ok, diagnostics };
+  }
+
+  /**
+   * Classify every lineage edge that claims this exact parent→commit change
+   * (RVR-014), and turn the authoritative ones into successor sets.
+   *
+   * An edge is bound to a direct parent and a result commit, so authority
+   * cannot be borrowed: an edge for another commit, another parent, or an
+   * endpoint that is not part of this change is history or a contradiction,
+   * never a pairing. Edges are read from the note of the commit they describe,
+   * because that is the only place placement allows them.
+   */
+  async classifyLineage(input: {
+    readonly commit: CommitId;
+    readonly parent: CommitId;
+    /**
+     * Coordinates this change disturbs, as `parent\0path\0subject`. A
+     * subject OID alone is not enough: the same object at another path is a
+     * different occurrence, so an edge may only claim the path it names.
+     */
+    readonly disturbed: ReadonlySet<string>;
+  }): Promise<{
+    readonly pairings: SubjectPairing[];
+    readonly used: LineageUse[];
+    readonly historyOnly: LineageId[];
+  }> {
+    // Every known edge is classified, not only the ones on this commit: an edge
+    // that describes another change is history, and saying so is the honest
+    // answer. The authority pass itself reads only this commit's edges.
+    const index = await this.lineageEdges();
+    const edges: LineageRecord[] = [...(index.get(input.commit) ?? [])];
+    const historyOnly: LineageId[] = [];
+    const pairings: SubjectPairing[] = [];
+    const used: LineageUse[] = [];
+    // Every other edge in the evidence is history: it describes a different
+    // change and can never authorize this one.
+    for (const [commit, recorded] of index) {
+      if (String(commit) === String(input.commit)) continue;
+      for (const edge of recorded) historyOnly.push(edge.id);
+    }
+    if (edges.length === 0) return { pairings, used, historyOnly };
+    const resultCoordinates = await this.coordinatesInCommit(input.commit);
+    for (const edge of edges) {
+      if (String(edge.commit) !== String(input.commit)) {
+        historyOnly.push(edge.id);
+        continue;
+      }
+      if (String(edge.parent) !== String(input.parent)) {
+        historyOnly.push(edge.id);
+        continue;
+      }
+      const undisturbed = edge.from.filter((endpoint) =>
+        !input.disturbed.has(coordinateKey(String(edge.parent), endpoint.path, String(endpoint.subject))));
+      const absent = edge.to.filter((endpoint) =>
+        !resultCoordinates.has(coordinateKey(String(edge.commit), endpoint.path, String(endpoint.subject))));
+      if (undisturbed.length > 0 || absent.length > 0) {
+        used.push({
+          id: edge.id,
+          authority: "contradictory",
+          detail: [
+            ...undisturbed.map((endpoint) =>
+              `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not a subject this commit disturbs`),
+            ...absent.map((endpoint) =>
+              `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not present in ${input.commit}`),
+          ].join("; "),
+        });
+        continue;
+      }
+      const to = edge.to.map((endpoint) => endpoint.subject).sort();
+      for (const endpoint of edge.from) {
+        pairings.push({ from: endpoint.subject, to, lineage: edge.id });
+      }
+      used.push({
+        id: edge.id,
+        authority: "authoritative",
+        detail: `pairs ${edge.from.map((endpoint) => endpoint.path).join(", ")} with ${edge.to.length === 0 ? "no successor" : edge.to.map((endpoint) => endpoint.path).join(", ")}`,
+      });
+    }
+    return { pairings, used, historyOnly };
+  }
+
+  /**
+   * The evidence view every lineage-aware read uses.
+   *
+   * A receive checker evaluates a *proposed* notes tip, so it must read the
+   * edges from that candidate rather than from the ref the receiver currently
+   * holds. Otherwise the gate would rule on continuity using yesterday's
+   * evidence and reject a push that the proposed notes actually justify — which
+   * is precisely the local-green/remote-red failure this protocol refuses to
+   * have.
+   */
+  private async evidenceView(): Promise<EvidenceSnapshotView> {
+    if (this.proposedNotesTip === undefined) return this.loadCachedEvidenceSnapshot({});
+    const limits = resolveLimits();
+    const listed = await this.repository.listNotesAt(this.proposedNotesTip);
+    const bodies = await this.repository.readNotesBatch(listed, {});
+    return this.buildSnapshotView(this.proposedNotesTip, listed, bodies, limits, false);
+  }
+
+  /**
+   * Every coordinate a commit's tree holds: each path and the blob or tree
+   * found there, plus the root tree at `.`.
+   *
+   * Paths matter as much as objects. Two paths can hold the same object, and an
+   * edge that names the right object at the wrong path is a claim about a
+   * different occurrence, so authority is matched on the whole coordinate.
+   */
+  private async coordinatesInCommit(commit: CommitId): Promise<ReadonlySet<string>> {
+    const coordinates = new Set<string>();
+    try {
+      for (const entry of await this.repository.listTreeIncludingTrees(commit)) {
+        coordinates.add(coordinateKey(String(commit), entry.path, String(entry.object)));
+      }
+      const root = await this.repository.resultTreeForCommit(commit);
+      coordinates.add(coordinateKey(String(commit), ".", String(root)));
+    } catch {
+      // An unreadable tree leaves the set empty, which makes every edge
+      // contradictory rather than authoritative: fail closed.
+    }
+    return coordinates;
+  }
+
+  /** Coordinates of the annotated predecessors a change disturbs. */
+  private disturbedCoordinates(
+    parent: CommitId,
+    transitions: readonly DiffTransition[],
+  ): Set<string> {
+    const disturbed = new Set<string>();
+    for (const transition of transitions) {
+      if (transition.oldPath === undefined) continue;
+      disturbed.add(coordinateKey(String(parent), transition.oldPath, String(transition.from)));
+    }
+    return disturbed;
   }
 }
 import { access, readFile, stat } from "node:fs/promises";

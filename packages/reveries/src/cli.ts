@@ -35,9 +35,11 @@ import {
   type TrustStoreKey,
 } from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
+import { SUGGESTION_NOTICE, suggestionCommand } from "./lineage.ts";
 import { Reveries, type PushUpdate, type SigningOptions } from "./operations.ts";
 import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
 import {
+  LINEAGE_KINDS,
   REMOTE_ROLES,
   SIGNATURE_ROLES,
   canonicalRecord,
@@ -54,11 +56,14 @@ import {
   REMOTE_ROLE_CONFIG_PATTERN,
   rolePromotion,
   reverieId,
+  transitionId,
   validateNote,
   type FactTargetId,
+  type LineageKind,
   type LedgerManifest,
   type NoteRecord,
   type ObjectId,
+  type OccurrenceInput,
   type ReverieInput,
   type ReverieMetadata,
   type ReverieRecord,
@@ -117,6 +122,8 @@ Commands:
   doctor     Diagnose the local installation and notes state (--fix repairs local state)
   show       Show notes for a path, blob, tree, or commit
   record     Create, continue, or supersede a blob-or-tree reverie
+  occurrence Record evidence about one occurrence of a subject
+  lineage    Record a durable subject pairing, or suggest candidates
   summarize  Attach or replace a commit summary or initialization record
   check      Check staged, committed, or outgoing continuity and coverage
   search     Search current or historical engineering evidence
@@ -201,6 +208,40 @@ Examples:
   reveries record new src/state.ts --from draft.json --edit
   cat draft.json | reveries record new src/state.ts --from -
 `,
+  occurrence: `Usage: reveries occurrence record <path> [--at <revision>] [--from <file|->] [causal options]
+
+Record a decision about one occurrence of a subject: a revision, a path inside
+it, and the exact blob or tree found there. Universal reveries apply to every
+occurrence of their content; this record applies to this one only. Two paths
+holding the same blob may therefore carry different rationale.
+Options: --driving-event <text>, --decision <text>, --impact <text>,
+         --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
+         --source <relation:kind:ref[@at]>, --session <name>, --at <revision>,
+         --edit, --json
+Examples:
+  reveries occurrence record vendor/left-pad.js --at HEAD --driving-event "Vendored copy" --decision "Treat it as generated" --impact "Edits are overwritten"
+  reveries occurrence record src/left-pad.js --at HEAD --driving-event "Hand written" --decision "Maintain it here" --impact "Tests depend on it"
+`,
+  lineage: `Usage: reveries lineage record --kind <preserve|split|merge|derive|retire> --commit <commit> --from <path>... --to <path>... [--parent <commit>] [--transition <tr:id>] [causal options]
+       reveries lineage suggest [<commit>|--staged] [--json]
+
+record attaches a durable subject pairing to the commit that establishes it.
+The edge says which subjects are related and why; it discharges nothing. Every
+decision on a predecessor still needs its own continuation on each successor, a
+supersession, or a causal retirement. --parent defaults to the commit's first
+parent, which is what binds the edge to that exact change.
+
+suggest reports Git's similarity candidates as unconfirmed suggestions. A
+suggestion is never evidence: recording an edge, and a per-decision
+disposition, is what closes an obligation.
+Options: --driving-event <text>, --decision <text>, --impact <text>,
+         --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
+         --source <relation:kind:ref[@at]>, --session <name>, --staged, --json
+Examples:
+  reveries lineage suggest --staged
+  reveries lineage record --kind preserve --commit HEAD --from src/module --to lib/module --driving-event "Moved" --decision "Same intent" --impact "Paths change"
+  reveries lineage record --kind split --commit HEAD --parent HEAD~1 --from lib/util.js --to lib/a.js --to lib/b.js --driving-event "Split" --decision "Two concerns" --impact "Callers update"
+`,
   summarize: `Usage: reveries summarize <commit> [--from <file|->] [causal options] [--replace]
        reveries summarize <commit> --from <reveries-init.json> --init
 
@@ -219,8 +260,9 @@ Examples:
 Check continuity and summary coverage. --successor names an explicit
 predecessor/successor pair for a renamed file with --staged only; it is a
 local aid, not a publication proof. Committed checks take no successor map.
-A renamed-and-edited subtree with no same-path successor requires retirement
-(and optionally a new record) until RVR-014 lineage.
+A renamed-and-edited subject with no same-path successor requires a durable
+lineage edge on the commit plus a per-decision disposition, or a retirement.
+Similarity is never treated as the pairing.
 Examples:
   reveries check --staged
   reveries check --staged --successor old/file=new/file
@@ -717,6 +759,78 @@ function overlaySources(value: unknown, parsed: ParsedArguments): Source[] {
   return [...existing, ...flagSources(parsed)];
 }
 
+async function parseOccurrenceDraft(
+  raw: unknown,
+  reveries: Reveries,
+  io: CliIo,
+  parsed: ParsedArguments,
+): Promise<{
+  readonly semantic: OccurrenceInput;
+  readonly metadata: ReverieMetadata;
+}> {
+  const value = expectObject(raw, "occurrence draft");
+  if (value.type !== undefined && value.type !== "occurrence") {
+    throw new UsageError("occurrence draft type must be occurrence");
+  }
+  const semantic: OccurrenceInput = {
+    v: value.v === undefined || value.v === 1 ? 1 : (() => { throw new UsageError("v must be 1"); })(),
+    // The coordinate is resolved from the repository, so a draft may omit it.
+    occurrence: value.occurrence === undefined
+      ? { commit: commitId("0".repeat(40)), path: ".", subject: objectId("0".repeat(40)) }
+      : {
+          commit: commitId(expectString(expectObject(value.occurrence, "occurrence").commit, "occurrence.commit")),
+          path: expectString(expectObject(value.occurrence, "occurrence").path, "occurrence.path"),
+          subject: objectId(expectString(expectObject(value.occurrence, "occurrence").subject, "occurrence.subject")),
+        },
+    driving_event: expectString(one(parsed, "--driving-event") ?? value.driving_event, "driving_event"),
+    decision: expectString(one(parsed, "--decision") ?? value.decision, "decision"),
+    impact: expectString(one(parsed, "--impact") ?? value.impact, "impact"),
+    recurrence_control: overlayRecurrence(value.recurrence_control, parsed),
+    alternatives: overlayAlternatives(value.alternatives, parsed),
+    sources: overlaySources(value.sources, parsed),
+  };
+  const metadata = await parseMetadata(value, reveries, io, parsed);
+  return { semantic, metadata };
+}
+
+async function parseLineageDraft(
+  raw: unknown,
+  reveries: Reveries,
+  io: CliIo,
+  parsed: ParsedArguments,
+): Promise<{
+  readonly semantic: {
+    readonly driving_event: string;
+    readonly decision: string;
+    readonly impact: string;
+    readonly recurrence_control: string | null;
+    readonly alternatives: string[];
+    readonly sources: Source[];
+  };
+  readonly metadata: ReverieMetadata;
+}> {
+  const value = expectObject(raw, "lineage draft");
+  if (value.type !== undefined && value.type !== "lineage") throw new UsageError("lineage draft type must be lineage");
+  const semantic = {
+    driving_event: expectString(one(parsed, "--driving-event") ?? value.driving_event, "driving_event"),
+    decision: expectString(one(parsed, "--decision") ?? value.decision, "decision"),
+    impact: expectString(one(parsed, "--impact") ?? value.impact, "impact"),
+    recurrence_control: overlayRecurrence(value.recurrence_control, parsed),
+    alternatives: overlayAlternatives(value.alternatives, parsed),
+    sources: overlaySources(value.sources, parsed),
+  };
+  const metadata = await parseMetadata(value, reveries, io, parsed);
+  return { semantic, metadata };
+}
+
+function parseLineageKind(value: string | undefined): LineageKind {
+  if (value === undefined) throw new UsageError("lineage record requires --kind");
+  if (!LINEAGE_KINDS.includes(value as LineageKind)) {
+    throw new UsageError(`--kind must be one of ${LINEAGE_KINDS.join(", ")}`);
+  }
+  return value as LineageKind;
+}
+
 async function parseMetadata(
   value: Record<string, unknown>,
   reveries: Reveries,
@@ -1027,6 +1141,34 @@ function formatRecord(record: unknown, indent = "  "): string[] {
       `${indent}  Impact: ${stringField(value, "impact")}`,
     ];
   }
+  if (value.type === "occurrence") {
+    const occurrence = asRecord(value.occurrence) ?? {};
+    return [
+      `${indent}${stringField(value, "id")} (occurrence at ${stringField(occurrence, "path")} @ ${stringField(occurrence, "commit").slice(0, 12)}): ${stringField(value, "decision")}`,
+      `${indent}  Event: ${stringField(value, "driving_event")}`,
+      `${indent}  Impact: ${stringField(value, "impact")}`,
+    ];
+  }
+  if (value.type === "lineage") {
+    const endpoints = (input: unknown): string => {
+      const entries = Array.isArray(input) ? input : [];
+      return entries
+        .map((entry) => {
+          const item = asRecord(entry) ?? {};
+          return `${stringField(item, "path")}@${String(stringField(item, "subject", "")).slice(0, 12)}`;
+        })
+        .join(", ");
+    };
+    const to = endpoints(value.to);
+    return [
+      `${indent}${stringField(value, "id")}: ${stringField(value, "kind")} ${endpoints(value.from)}${to === "" ? " -> (no successor)" : ` -> ${to}`}`,
+      `${indent}  Bound to parent ${String(stringField(value, "parent", "")).slice(0, 12)} -> commit ${String(stringField(value, "commit", "")).slice(0, 12)}`,
+      `${indent}  Event: ${stringField(value, "driving_event")}`,
+      `${indent}  Decision: ${stringField(value, "decision")}`,
+      `${indent}  Impact: ${stringField(value, "impact")}`,
+      `${indent}  This pairing discharges nothing: each decision on a predecessor still needs a continuation on every successor, a supersession, or a retirement.`,
+    ];
+  }
   if (value.type === "session-summary") {
     const entries = Array.isArray(value.entries) ? value.entries : [];
     return [
@@ -1072,6 +1214,12 @@ const DEDICATED_DOCTOR_PREFIXES: readonly string[] = [
  * envelope, `stale` is a healthy repository that has not rebuilt it over its
  * newest notes, and only `invalid` is damage.
  */
+function endpointPaths(value: unknown): string {
+  return (Array.isArray(value) ? value : [])
+    .map((entry) => stringField(asRecord(entry) ?? {}, "path"))
+    .join(", ");
+}
+
 function describeLedger(block: unknown): string | null {
   const ledger = asRecord(block);
   if (ledger === null) return null;
@@ -1208,12 +1356,80 @@ function humanOutput(
     const records = Array.isArray(value?.records) ? value.records : [];
     const active = Array.isArray(value?.active) ? value.active : [];
     const historical = Array.isArray(value?.historical) ? value.historical : [];
+    const occurrences = Array.isArray(value?.occurrences) ? value.occurrences : [];
+    const lineage = Array.isArray(value?.lineage) ? value.lineage : [];
+    const occurrenceLine = (entry: unknown): string[] => {
+      const item = asRecord(entry) ?? {};
+      const record = item.record;
+      const reason = item.reason === null || item.reason === undefined ? "" : ` [${String(item.reason)}]`;
+      return record === undefined
+        ? []
+        : [...(reason.trim() === "" ? [] : [`  ${reason.trim()}`]), ...formatRecord(record, "  ")];
+    };
+    const endpointPaths = (value: unknown): string => (Array.isArray(value) ? value : [])
+      .map((entry) => stringField(asRecord(entry) ?? {}, "path"))
+      .join(", ");
     if (records.length === 0) return `No Reveries evidence is attached to ${target}.\n`;
     return [
       `Evidence for ${target}:`,
-      ...(active.length === 0 ? [] : ["Active decisions:", ...active.flatMap((record) => formatRecord(record))]),
+      ...(active.length === 0 ? [] : ["Active decisions (every occurrence of this exact content):", ...active.flatMap((record) => formatRecord(record))]),
       ...(historical.length === 0 ? [] : ["Historical decisions:", ...historical.flatMap((record) => formatRecord(record))]),
-      ...(active.length + historical.length > 0 ? [] : records.flatMap((record) => formatRecord(record))),
+      ...(active.length + historical.length > 0
+        ? []
+        : records
+            .filter((record) => (asRecord(record) ?? {}).type !== "occurrence"
+              && (asRecord(record) ?? {}).type !== "lineage")
+            .flatMap((record) => formatRecord(record))),
+      // Occurrence records are about one coordinate. Only the applicable ones
+      // are presented as evidence for this occurrence; the rest are listed with
+      // their own anchor so a shared blob never reads as a universal claim.
+      ...(occurrences.length === 0 ? [] : [
+        "Occurrence evidence:",
+        ...occurrences.flatMap((entry) => {
+          const item = asRecord(entry) ?? {};
+          return item.applicable === true
+            ? [" Applicable here:", ...occurrenceLine(entry)]
+            : [" Anchored elsewhere (not evidence for this occurrence):", ...occurrenceLine(entry)];
+        }),
+      ]),
+      ...(lineage.length === 0 ? [] : ["Lineage:", ...lineage.flatMap((record) => formatRecord(record))]),
+      "",
+    ].join("\n");
+  }
+  if (command === "occurrence record") {
+    const occurrence = asRecord(value?.occurrence) ?? {};
+    const paths = stringList(value?.paths);
+    return [
+      `Recorded occurrence ${stringField(asRecord(value?.record) ?? {}, "id")} for ${stringField(occurrence, "path")} @ ${stringField(occurrence, "commit").slice(0, 12)}.`,
+      "This record applies to that occurrence only, not to every occurrence of the same content.",
+      ...(paths.length === 0 ? [] : [`The same content also occurs at: ${paths.join(", ")}. Those occurrences are not covered by this record.`]),
+      "",
+    ].join("\n");
+  }
+  if (command === "lineage record") {
+    const from = endpointPaths(value?.from);
+    const to = endpointPaths(value?.to);
+    return [
+      `Recorded lineage ${stringField(asRecord(value?.record) ?? {}, "id")}: ${stringField(asRecord(value?.record) ?? {}, "kind")} ${from}${to === "" ? " -> (no successor)" : ` -> ${to}`}.`,
+      "This pairing discharges nothing on its own: every decision on a predecessor still needs a continuation on each successor, a supersession, or a causal retirement.",
+      "",
+    ].join("\n");
+  }
+  if (command === "lineage suggest") {
+    const suggestions = Array.isArray(value?.suggestions) ? value.suggestions : [];
+    const notice = stringField(value ?? {}, "notice", SUGGESTION_NOTICE);
+    if (suggestions.length === 0) return `No lineage suggestions.\n${notice}\n`;
+    return [
+      `${suggestions.length} lineage suggestion(s); none is evidence:`,
+      ...suggestions.flatMap((entry) => {
+        const item = asRecord(entry) ?? {};
+        return [
+          `  ${stringField(item, "kind")} ${stringField(item, "score")}%: ${stringField(asRecord(item.from) ?? {}, "path")} -> ${stringField(asRecord(item.to) ?? {}, "path")}`,
+          `    confirmed: false`,
+          `    ${stringField(item, "record")}`,
+        ];
+      }),
+      notice,
       "",
     ].join("\n");
   }
@@ -1265,8 +1481,14 @@ function humanOutput(
         const item = asRecord(hit);
         if (item === null) return [];
         const paths = stringList(item.paths);
+        const record = asRecord(item.record);
         return [
           `- ${paths.length === 0 ? String(item.object) : paths.join(", ")} (${String(item.object)})`,
+          ...(record?.type === "occurrence"
+            ? [item.applicable === true
+                ? "  Occurrence applies only at its recorded coordinate (or through explicit lineage)."
+                : "  Occurrence is anchored historical evidence, not applicable at this revision."]
+            : []),
           ...formatRecord(item.record, "  "),
         ];
       }),
@@ -2974,6 +3196,76 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
         return 0;
       }
       throw new UsageError("record action must be new, continue, or supersede");
+    }
+    if (command === "occurrence") {
+      const action = argv[1];
+      if (action !== "record") throw new UsageError("occurrence action must be record");
+      const parsed = parseArguments(
+        argv.slice(2),
+        ["--from", "--session", "--at", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
+        ["--staged", "--json", "--no-recurrence-control", "--edit"],
+      );
+      const path = requirePositional(parsed, 0, "path");
+      const at = one(parsed, "--at");
+      if (parsed.flags.has("--staged")) {
+        throw new UsageError(
+          "occurrence record describes a committed coordinate, so --staged is not accepted: commit the change first, then record it with --at <commit>",
+        );
+      }
+      const revision = at ?? "HEAD";
+      const draftSource = await prepareDraft(await readDraft(one(parsed, "--from"), io), parsed.flags.has("--edit"), io);
+      const result = await usePreparedDraft(draftSource, async (raw) => {
+        const draft = await parseOccurrenceDraft(raw, reveries, io, parsed);
+        return reveries.recordOccurrence({ path, revision, ...draft });
+      });
+      emit(io, json, "occurrence record", result);
+      return 0;
+    }
+    if (command === "lineage") {
+      const action = argv[1];
+      if (action === "suggest") {
+        const parsed = parseArguments(argv.slice(2), [], ["--staged", "--json"]);
+        const result = await reveries.suggestLineage({
+          staged: parsed.flags.has("--staged"),
+          ...(parsed.positionals[0] === undefined ? {} : { revision: parsed.positionals[0] }),
+        });
+        emit(io, json, "lineage suggest", {
+          ...result,
+          suggestions: result.suggestions.map((suggestion) => ({
+            ...suggestion,
+            record: suggestionCommand(suggestion, result.commit ?? "HEAD"),
+          })),
+          notice: SUGGESTION_NOTICE,
+        }, [], {});
+        return 0;
+      }
+      if (action !== "record") throw new UsageError("lineage action must be record or suggest");
+      const parsed = parseArguments(
+        argv.slice(2),
+        ["--kind", "--commit", "--parent", "--from", "--to", "--transition", "--from-file", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
+        ["--json", "--no-recurrence-control", "--edit"],
+      );
+      const commit = one(parsed, "--commit", true);
+      if (commit === undefined) throw new UsageError("lineage record requires --commit");
+      const from = parsed.values.get("--from") ?? [];
+      const to = parsed.values.get("--to") ?? [];
+      if (from.length === 0) throw new UsageError("lineage record requires at least one --from path");
+      const draftSource = await prepareDraft(await readDraft(one(parsed, "--from-file"), io), parsed.flags.has("--edit"), io);
+      const result = await usePreparedDraft(draftSource, async (raw) => {
+        const draft = await parseLineageDraft(raw, reveries, io, parsed);
+        const transitionValue = one(parsed, "--transition");
+        return reveries.recordLineage({
+          kind: parseLineageKind(one(parsed, "--kind")),
+          commit,
+          parent: one(parsed, "--parent") ?? `${commit}~1`,
+          from,
+          to,
+          transition: transitionValue === undefined ? null : transitionId(transitionValue),
+          ...draft,
+        });
+      });
+      emit(io, json, "lineage record", result);
+      return 0;
     }
     if (command === "summarize") {
       const parsed = parseArguments(

@@ -18,13 +18,27 @@ export type CorrectionId = Brand<`cr:${string}`, "correction-id">;
 export type ResolutionId = Brand<`rs:${string}`, "resolution-id">;
 export type RedactionId = Brand<`rd:${string}`, "redaction-id">;
 export type SignatureId = Brand<`sg:${string}`, "signature-id">;
+/**
+ * Occurrence-specific evidence (RVR-014). An occurrence is addressed, not
+ * content-addressed, so it takes a prefix of its own: the same canonical
+ * decision about two occurrences of one blob must be two distinct records.
+ */
+export type OccurrenceId = Brand<`oc:${string}`, "occurrence-id">;
+/**
+ * A durable subject pairing (RVR-014). It is an immutable structural fact
+ * about two sets of repository coordinates, never a decision about content.
+ */
+export type LineageId = Brand<`lg:${string}`, "lineage-id">;
 
 /**
  * Heads a correction or resolution edge may name: reveries and the new
  * immutable fact kinds. Transition facts keep their RVR-004 identity and
  * fail-closed duplicate handling; they are never superseded, only redacted.
+ * Occurrence and lineage records are nodes here (RVR-014): they carry no
+ * outgoing edges of their own, so reusing this graph keeps them correctable
+ * and conflict-visible instead of inventing a parallel supersession graph.
  */
-export type FactHeadId = ReverieId | CorrectionId | ResolutionId;
+export type FactHeadId = ReverieId | OccurrenceId | LineageId | CorrectionId | ResolutionId;
 /** Every fact a soft redaction may suppress from normal display. */
 export type FactTargetId = FactHeadId | TransitionId;
 
@@ -288,6 +302,117 @@ export type RedactionRecord = RedactionSemantic & ReverieMetadata & {
 };
 
 export type RedactionInput = RedactionSemantic;
+
+/**
+ * One concrete occurrence of a subject: a revision, the path inside it, and
+ * the exact blob or tree object found there (RVR-014). This triple is the
+ * coordinate an occurrence record or a lineage endpoint is anchored to, and
+ * it is what makes "the same blob in `src/` and in `vendor/`" two addressable
+ * things rather than one universal fact.
+ */
+export type OccurrenceCoordinate = {
+  commit: CommitId;
+  path: string;
+  subject: SubjectId;
+};
+
+export type OccurrenceSemantic = {
+  v: 1;
+  /** The occurrence this evidence is about. Part of the record identity. */
+  occurrence: OccurrenceCoordinate;
+  driving_event: string;
+  decision: string;
+  impact: string;
+  recurrence_control: string | null;
+  alternatives: string[];
+  sources: Source[];
+};
+
+/**
+ * Occurrence-specific evidence: a decision that holds for exactly one
+ * occurrence and not for every occurrence of that content.
+ *
+ * The coordinate participates in the identity, so two occurrences of one blob
+ * can carry different rationale, and a universal reverie is untouched: this is
+ * opt-in narrowing, never a replacement. The record rides the note of
+ * `occurrence.subject`, so the note is content-addressed while the evidence
+ * inside it is path- and revision-specific. There is no `supersedes` field:
+ * a mistaken occurrence is corrected through the existing correction and
+ * resolution records, never by rewriting this one.
+ */
+export type OccurrenceRecord = OccurrenceSemantic & ReverieMetadata & {
+  type: "occurrence";
+  id: OccurrenceId;
+};
+
+export type OccurrenceInput = OccurrenceSemantic;
+
+/**
+ * One endpoint of a lineage edge: a path and the subject found there in the
+ * edge's `parent` (for `from`) or `commit` (for `to`).
+ */
+export type LineageEndpoint = {
+  path: string;
+  subject: SubjectId;
+};
+
+/**
+ * The N-to-M relations a lineage edge may assert.
+ *
+ * - `preserve`: 1 to 1, the same intent at a new place.
+ * - `split`: 1 to N, one subject became several.
+ * - `merge`: N to 1, several subjects became one.
+ * - `derive`: N to M with N ≥ 1 and M ≥ 1, the general case (including 2:3),
+ *   used when neither a pure split nor a pure merge describes the change.
+ * - `retire`: 1 to 0, the occurrence ended with no successor.
+ *
+ * `derive` is what makes a true N-to-M relation representable without
+ * pretending it was a split or a merge. Its fan-out is bounded like every other
+ * protocol dimension: `maxLineageRefs` caps the endpoints on one edge, so a
+ * wide relation stays a bounded fact rather than an unbounded one.
+ */
+export type LineageKind = "preserve" | "split" | "merge" | "derive" | "retire";
+
+export const LINEAGE_KINDS: readonly LineageKind[] = ["preserve", "split", "merge", "derive", "retire"];
+
+export type LineageSemantic = {
+  v: 1;
+  kind: LineageKind;
+  /** The direct parent revision whose state `from` describes. */
+  parent: CommitId;
+  /** The commit that establishes this relation; also the annotated subject. */
+  commit: CommitId;
+  from: LineageEndpoint[];
+  to: LineageEndpoint[];
+  /** The RVR-004 tree transition this relation belongs to, when one exists. */
+  transition: TransitionId | null;
+  driving_event: string;
+  decision: string;
+  impact: string;
+  recurrence_control: string | null;
+  alternatives: string[];
+  sources: Source[];
+};
+
+/**
+ * A durable, explicit pairing between occurrences (RVR-014).
+ *
+ * The edge says only *which subjects are related and why*. It never carries a
+ * decision, so it discharges nothing on its own: for every active decision on
+ * a `from` subject, each `to` subject still needs its own continuation,
+ * supersession, or a causal retirement. This is what keeps an edge from
+ * becoming a back door around per-decision continuity.
+ *
+ * It rides the note of `commit`, beside that commit's session summary, so an
+ * edge is bound to the exact parent→commit change it describes and travels
+ * with publication of that commit's evidence.
+ */
+export type LineageRecord = LineageSemantic & ReverieMetadata & {
+  type: "lineage";
+  id: LineageId;
+};
+
+export type LineageInput = LineageSemantic;
 
 /**
  * Signed payload domains (RVR-009). The domain is inside the signed payload, so
@@ -658,7 +783,9 @@ export type NoteRecord =
   | CorrectionRecord
   | ResolutionRecord
   | RedactionRecord
-  | SignatureRecord;
+  | SignatureRecord
+  | OccurrenceRecord
+  | LineageRecord;
 
 export type Diagnostic = {
   line?: number;
@@ -692,6 +819,10 @@ export type ResourceLimits = {
   maxResolves: number;
   maxSignatures: number;
   maxSignaturesPerTarget: number;
+  /** RVR-014: occurrence records on one note. */
+  maxOccurrences: number;
+  /** RVR-014: `from`/`to` endpoints on one lineage edge. */
+  maxLineageRefs: number;
 };
 
 export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
@@ -715,6 +846,8 @@ export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxResolves: 64,
   maxSignatures: 64,
   maxSignaturesPerTarget: 16,
+  maxOccurrences: 64,
+  maxLineageRefs: 64,
 });
 
 export class LimitExceededError extends Error {
@@ -808,8 +941,10 @@ const CORRECTION_ID = /^cr:[0-9a-f]{40}$|^cr:[0-9a-f]{64}$/;
 const RESOLUTION_ID = /^rs:[0-9a-f]{40}$|^rs:[0-9a-f]{64}$/;
 const REDACTION_ID = /^rd:[0-9a-f]{40}$|^rd:[0-9a-f]{64}$/;
 const SIGNATURE_ID = /^sg:[0-9a-f]{40}$|^sg:[0-9a-f]{64}$/;
+const OCCURRENCE_ID = /^oc:[0-9a-f]{40}$|^oc:[0-9a-f]{64}$/;
+const LINEAGE_ID = /^lg:[0-9a-f]{40}$|^lg:[0-9a-f]{64}$/;
 /** Every ID-bearing fact a signature may attest, in both repository formats. */
-const SIGNATURE_TARGET = /^(?:rv|tr|cr|rs|rd):[0-9a-f]{40}$|^(?:rv|tr|cr|rs|rd):[0-9a-f]{64}$/;
+const SIGNATURE_TARGET = /^(?:rv|tr|cr|rs|rd|oc|lg):[0-9a-f]{40}$|^(?:rv|tr|cr|rs|rd|oc|lg):[0-9a-f]{64}$/;
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
@@ -878,8 +1013,20 @@ export function signatureId(value: string): SignatureId {
   return value as SignatureId;
 }
 
+export function occurrenceId(value: string): OccurrenceId {
+  if (!OCCURRENCE_ID.test(value)) throw new Error(`Invalid occurrence ID: ${value}`);
+  return value as OccurrenceId;
+}
+
+export function lineageId(value: string): LineageId {
+  if (!LINEAGE_ID.test(value)) throw new Error(`Invalid lineage ID: ${value}`);
+  return value as LineageId;
+}
+
 export function factHeadId(value: string): FactHeadId {
   if (REVERIE_ID.test(value)) return value as ReverieId;
+  if (OCCURRENCE_ID.test(value)) return value as OccurrenceId;
+  if (LINEAGE_ID.test(value)) return value as LineageId;
   if (CORRECTION_ID.test(value)) return value as CorrectionId;
   if (RESOLUTION_ID.test(value)) return value as ResolutionId;
   throw new Error(`Invalid fact head ID: ${value}`);
@@ -900,7 +1047,9 @@ export function recordFactId(record: NoteRecord): string | null {
     || record.type === "transition-summary"
     || record.type === "correction"
     || record.type === "resolution"
-    || record.type === "redaction") {
+    || record.type === "redaction"
+    || record.type === "occurrence"
+    || record.type === "lineage") {
     return record.id;
   }
   return null;
@@ -1458,6 +1607,204 @@ function canonicalRetirement(retirement: Retirement): Retirement {
 }
 
 /**
+ * A repository path as an occurrence coordinate uses it. `.` is the root tree
+ * display path and stays legal; an absolute path, a `..` segment, or NUL is
+ * not a coordinate Git can resolve, so it is refused here rather than becoming
+ * an unverifiable claim.
+ */
+function occurrencePath(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${field} must be a nonempty repository path`);
+  }
+  if (value.includes("\0")) throw new Error(`${field} cannot contain NUL`);
+  if (value.startsWith("/")) throw new Error(`${field} must be relative to the repository root`);
+  if (value.split("/").some((segment) => segment === "..")) {
+    throw new Error(`${field} cannot contain a ".." segment`);
+  }
+  return value;
+}
+
+function normalizeCoordinate(value: OccurrenceCoordinate, field: string): OccurrenceCoordinate {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  return {
+    commit: commitId(String(value.commit)),
+    path: occurrencePath(value.path, `${field}.path`),
+    subject: objectId(String(value.subject)),
+  };
+}
+
+function normalizeOccurrenceSemantic(input: OccurrenceSemantic): OccurrenceSemantic {
+  if (input.v !== 1) throw new Error("v must be exactly 1");
+  const recurrence = input.recurrence_control === null
+    ? null
+    : recurrenceText(input.recurrence_control, "recurrence_control");
+  return {
+    v: 1,
+    occurrence: normalizeCoordinate(input.occurrence, "occurrence"),
+    driving_event: trimText(input.driving_event, "driving_event"),
+    decision: trimText(input.decision, "decision"),
+    impact: trimText(input.impact, "impact"),
+    recurrence_control: recurrence,
+    alternatives: sortedUnique(input.alternatives),
+    sources: sortedUniqueSources(input.sources),
+  };
+}
+
+/**
+ * Exact bytes hashed for an occurrence identity: version, the coordinate, and
+ * normalized causal content. The coordinate is inside the hash on purpose —
+ * that is what makes two occurrences of one blob two records instead of one
+ * universal claim. Author metadata stays outside, so an amend keeps the ID.
+ */
+export function occurrencePayload(record: OccurrenceSemantic): string {
+  return JSON.stringify(normalizeOccurrenceSemantic(record));
+}
+
+export function createOccurrence(
+  input: OccurrenceInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): OccurrenceRecord {
+  const resolved = resolveLimits(limits);
+  const semantic = normalizeOccurrenceSemantic(input);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `oc:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as OccurrenceId;
+  const record: OccurrenceRecord = {
+    ...semantic,
+    type: "occurrence",
+    id,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+function endpointSort(left: LineageEndpoint, right: LineageEndpoint): number {
+  return compareUtf8(`${left.path}\u0000${left.subject}`, `${right.path}\u0000${right.subject}`);
+}
+
+function normalizeEndpoints(
+  endpoints: readonly LineageEndpoint[],
+  field: string,
+  limits: Readonly<ResourceLimits>,
+): LineageEndpoint[] {
+  if (!Array.isArray(endpoints)) throw new Error(`${field} must be an array`);
+  checkArrayLength(endpoints, limits.maxLineageRefs, "maxLineageRefs", field);
+  const normalized = endpoints.map((endpoint) => {
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) {
+      throw new Error(`${field} item must be an object`);
+    }
+    return {
+      path: occurrencePath(endpoint.path, `${field} path`),
+      subject: objectId(String(endpoint.subject)),
+    };
+  });
+  normalized.sort(endpointSort);
+  for (let index = 1; index < normalized.length; index += 1) {
+    const previous = normalized[index - 1] as LineageEndpoint;
+    const current = normalized[index] as LineageEndpoint;
+    if (previous.path === current.path && previous.subject === current.subject) {
+      throw new Error(`${field} lists the same endpoint twice: ${current.path}`);
+    }
+  }
+  return normalized;
+}
+
+function lineageKind(value: unknown): LineageKind {
+  if (typeof value !== "string" || !LINEAGE_KINDS.includes(value as LineageKind)) {
+    throw new Error(`lineage kind must be one of ${LINEAGE_KINDS.join(", ")}; found ${String(value)}`);
+  }
+  return value as LineageKind;
+}
+
+/**
+ * The declared shape of each kind. `derive` is the open N-to-M case, so a
+ * relation that is neither a pure split nor a pure merge is still exactly
+ * representable instead of being forced into the wrong word.
+ */
+function checkLineageShape(kind: LineageKind, from: number, to: number): void {
+  if (from < 1) throw new Error("lineage from must name at least one occurrence");
+  if (kind === "retire") {
+    if (to !== 0) throw new Error(`a retire lineage edge must have no successor, found ${to}`);
+    if (from !== 1) throw new Error(`a retire lineage edge must name exactly one occurrence, found ${from}`);
+    return;
+  }
+  if (to < 1) throw new Error(`a ${kind} lineage edge must name at least one successor`);
+  if (kind === "preserve" && (from !== 1 || to !== 1)) {
+    throw new Error(`a preserve lineage edge must be one to one, found ${from} to ${to}`);
+  }
+  if (kind === "split" && (from !== 1 || to < 2)) {
+    throw new Error(`a split lineage edge must be one to many, found ${from} to ${to}`);
+  }
+  if (kind === "merge" && (from < 2 || to !== 1)) {
+    throw new Error(`a merge lineage edge must be many to one, found ${from} to ${to}`);
+  }
+}
+
+function normalizeLineageSemantic(input: LineageSemantic, limits: Readonly<ResourceLimits>): LineageSemantic {
+  if (input.v !== 1) throw new Error("v must be exactly 1");
+  const kind = lineageKind(input.kind);
+  const from = normalizeEndpoints(input.from, "lineage.from", limits);
+  const to = normalizeEndpoints(input.to, "lineage.to", limits);
+  checkLineageShape(kind, from.length, to.length);
+  const recurrence = input.recurrence_control === null
+    ? null
+    : recurrenceText(input.recurrence_control, "recurrence_control");
+  return {
+    v: 1,
+    kind,
+    parent: commitId(String(input.parent)),
+    commit: commitId(String(input.commit)),
+    from,
+    to,
+    transition: input.transition === null ? null : transitionId(String(input.transition)),
+    driving_event: trimText(input.driving_event, "driving_event"),
+    decision: trimText(input.decision, "decision"),
+    impact: trimText(input.impact, "impact"),
+    recurrence_control: recurrence,
+    alternatives: sortedUnique(input.alternatives),
+    sources: sortedUniqueSources(input.sources),
+  };
+}
+
+/**
+ * Exact bytes hashed for a lineage identity: version, kind, the bound
+ * parent→commit pair, both sorted endpoint sets, the optional transition link,
+ * and normalized causal content. Endpoints are sorted, so the order an author
+ * lists them in cannot change the ID.
+ */
+export function lineagePayload(record: LineageSemantic, limits: Partial<ResourceLimits> = {}): string {
+  return JSON.stringify(normalizeLineageSemantic(record, resolveLimits(limits)));
+}
+
+export function createLineage(
+  input: LineageInput,
+  metadata: ReverieMetadata,
+  hashObject: HashObject,
+  limits: Partial<ResourceLimits> = {},
+): LineageRecord {
+  const resolved = resolveLimits(limits);
+  const semantic = normalizeLineageSemantic(input, resolved);
+  validateTimestamp(metadata.created_at, "created_at");
+  const id = `lg:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as LineageId;
+  const record: LineageRecord = {
+    ...semantic,
+    type: "lineage",
+    id,
+    author_email: trimRef(metadata.author_email, "author_email", resolved),
+    session: metadata.session === null ? null : trimRef(metadata.session, "session", resolved),
+    created_at: metadata.created_at,
+  };
+  validateRecord(record, hashObject, resolved);
+  return record;
+}
+
+/**
  * The exact bytes hashed for a signature identity: the whole attestation
  * except its own ID. Including the signature bytes is deliberate, so two
  * different signers over the same target are two distinct records rather than
@@ -1861,6 +2208,47 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
       created_at: record.created_at,
     };
   }
+  if (record.type === "occurrence") {
+    const semantic = normalizeOccurrenceSemantic(record);
+    return {
+      v: 1,
+      type: "occurrence",
+      id: record.id,
+      occurrence: semantic.occurrence,
+      driving_event: semantic.driving_event,
+      decision: semantic.decision,
+      impact: semantic.impact,
+      recurrence_control: semantic.recurrence_control,
+      alternatives: semantic.alternatives,
+      sources: semantic.sources,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
+  if (record.type === "lineage") {
+    const semantic = normalizeLineageSemantic(record, DEFAULT_LIMITS);
+    return {
+      v: 1,
+      type: "lineage",
+      id: record.id,
+      kind: semantic.kind,
+      parent: semantic.parent,
+      commit: semantic.commit,
+      from: semantic.from,
+      to: semantic.to,
+      transition: semantic.transition,
+      driving_event: semantic.driving_event,
+      decision: semantic.decision,
+      impact: semantic.impact,
+      recurrence_control: semantic.recurrence_control,
+      alternatives: semantic.alternatives,
+      sources: semantic.sources,
+      author_email: trimText(record.author_email, "author_email"),
+      session: record.session === null ? null : trimText(record.session, "session"),
+      created_at: record.created_at,
+    };
+  }
   return {
     v: 1,
     type: "reveries-init",
@@ -1889,6 +2277,8 @@ function asRecord(value: unknown): NoteRecord {
   if (record.type === "resolution") return record as unknown as ResolutionRecord;
   if (record.type === "redaction") return record as unknown as RedactionRecord;
   if (record.type === "signature") return record as unknown as SignatureRecord;
+  if (record.type === "occurrence") return record as unknown as OccurrenceRecord;
+  if (record.type === "lineage") return record as unknown as LineageRecord;
   throw new Error(`unknown record type: ${String(record.type)}`);
 }
 
@@ -1964,6 +2354,60 @@ function validateAttestation(
   validateEmail(record.author_email, "author_email", limits);
   if (record.session !== null) trimRef(record.session, "session", limits);
   validateTimestamp(record.created_at, "created_at");
+}
+
+function validateOccurrence(
+  record: OccurrenceRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!OCCURRENCE_ID.test(record.id)) throw new Error("invalid occurrence ID");
+  normalizeCoordinate(record.occurrence, "occurrence");
+  if (!Array.isArray(record.alternatives) || !Array.isArray(record.sources)) {
+    throw new Error("occurrence arrays are required");
+  }
+  checkArrayLength(record.alternatives, limits.maxAlternatives, "maxAlternatives", "alternatives");
+  checkArrayLength(record.sources, limits.maxSources, "maxSources", "sources");
+  for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
+  for (const source of record.sources) validateSource(source, limits);
+  trimNarrative(record.driving_event, "driving_event", limits);
+  trimNarrative(record.decision, "decision", limits);
+  trimNarrative(record.impact, "impact", limits);
+  if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control", limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `oc:${hashObject(Buffer.from(`${occurrencePayload(record)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`occurrence ID mismatch: expected ${expected}, got ${record.id}`);
+  }
+}
+
+function validateLineage(
+  record: LineageRecord,
+  hashObject?: HashObject,
+  limits: Readonly<ResourceLimits> = DEFAULT_LIMITS,
+): void {
+  if (!LINEAGE_ID.test(record.id)) throw new Error("invalid lineage ID");
+  normalizeLineageSemantic(record, limits);
+  if (!Array.isArray(record.alternatives) || !Array.isArray(record.sources)) {
+    throw new Error("lineage arrays are required");
+  }
+  checkArrayLength(record.alternatives, limits.maxAlternatives, "maxAlternatives", "alternatives");
+  checkArrayLength(record.sources, limits.maxSources, "maxSources", "sources");
+  for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
+  for (const source of record.sources) validateSource(source, limits);
+  trimNarrative(record.driving_event, "driving_event", limits);
+  trimNarrative(record.decision, "decision", limits);
+  trimNarrative(record.impact, "impact", limits);
+  if (record.recurrence_control !== null) recurrenceText(record.recurrence_control, "recurrence_control", limits);
+  validateEmail(record.author_email, "author_email", limits);
+  if (record.session !== null) trimRef(record.session, "session", limits);
+  validateTimestamp(record.created_at, "created_at");
+  if (hashObject) {
+    const expected = `lg:${hashObject(Buffer.from(`${lineagePayload(record, limits)}\n`, "utf8"))}`;
+    if (expected !== record.id) throw new Error(`lineage ID mismatch: expected ${expected}, got ${record.id}`);
+  }
 }
 
 function validateFactNarrative(
@@ -2118,6 +2562,14 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
     validateSignature(record, hashObject, limits);
     return;
   }
+  if (record.type === "occurrence") {
+    validateOccurrence(record, hashObject, limits);
+    return;
+  }
+  if (record.type === "lineage") {
+    validateLineage(record, hashObject, limits);
+    return;
+  }
   if (record.protocol !== 1 || record.notes_ref !== NOTES_REF) throw new Error("invalid Reveries initialization record");
   if (!Array.isArray(record.publishing_remotes) || !Array.isArray(record.hosts)) throw new Error("initialization arrays are required");
   for (const remote of record.publishing_remotes) trimRef(remote, "publishing remote", limits);
@@ -2210,6 +2662,15 @@ export function validateNote(
     "maxSignatures",
     "signatures",
   );
+  // RVR-014: occurrence records are addressed evidence, so a bounded number of
+  // them may share one content-addressed note; a lineage edge is bounded by
+  // its endpoint count instead (see `normalizeEndpoints`).
+  checkArrayLength(
+    records.filter((record) => record.type === "occurrence"),
+    limits.maxOccurrences,
+    "maxOccurrences",
+    "occurrences",
+  );
   // A target may be attested by several roles and several keys, so the per-target
   // budget is a fan-out bound rather than a duplicate check: it stops one record
   // from accumulating unbounded attestations.
@@ -2242,10 +2703,14 @@ export function validateNote(
       && record.type !== "correction"
       && record.type !== "resolution"
       && record.type !== "redaction"
-      && record.type !== "signature")) {
+      && record.type !== "signature"
+      && record.type !== "occurrence"
+      && record.type !== "lineage")) {
     throw new Error("blob note contains a non-reverie record");
   }
   const byId = new Map<ReverieId, string>();
+  const occurrencesById = new Map<OccurrenceId, string>();
+  const lineagesById = new Map<LineageId, string>();
   const transitionsById = new Map<TransitionId, string>();
   const correctionsById = new Map<CorrectionId, string>();
   const resolutionsById = new Map<ResolutionId, string>();
@@ -2303,6 +2768,22 @@ export function validateNote(
       const previous = signaturesById.get(record.id);
       checkDuplicate(previous, payload, `conflicting duplicate signature ID: ${record.id}`);
       signaturesById.set(record.id, payload);
+      continue;
+    }
+    if (record.type === "occurrence") {
+      chargeGraph(1, "occurrence graph");
+      const payload = occurrencePayload(record);
+      const previous = occurrencesById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate occurrence ID: ${record.id}`);
+      occurrencesById.set(record.id, payload);
+      continue;
+    }
+    if (record.type === "lineage") {
+      chargeGraph(1 + record.from.length + record.to.length, "lineage graph");
+      const payload = lineagePayload(record, limits);
+      const previous = lineagesById.get(record.id);
+      checkDuplicate(previous, payload, `conflicting duplicate lineage ID: ${record.id}`);
+      lineagesById.set(record.id, payload);
       continue;
     }
     if (record.type !== "reverie") continue;
