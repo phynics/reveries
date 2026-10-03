@@ -94,3 +94,13 @@ test("the evidence-import caller stays on pull_request_target with read-only per
   assert.match(text, /pull-requests: read/);
   assert.doesNotMatch(text, /node scripts\/import-fork-evidence\.mjs/);
 });
+
+test("the evidence-import action resolves its script path to an existing repository file", async () => {
+  const actionDir = new URL("./.github/actions/reveries-evidence-import/", root);
+  const text = await readFile(new URL("action.yml", actionDir), "utf8");
+  const match = text.match(/github\.action_path\s*\}\}\s*\/(\.\.\/)+scripts\/import-fork-evidence\.mjs/);
+  assert.ok(match, "action must reference the repo-root scripts directory");
+  const resolved = new URL("../../../scripts/import-fork-evidence.mjs", actionDir);
+  const { stat } = await import("node:fs/promises");
+  await stat(resolved);
+});
