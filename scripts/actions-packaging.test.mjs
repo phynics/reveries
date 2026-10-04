@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+import { parse as parseYaml } from "yaml";
 
 const root = new URL("..", import.meta.url);
 
@@ -104,3 +105,24 @@ test("the evidence-import action resolves its script path to an existing reposit
   const { stat } = await import("node:fs/promises");
   await stat(resolved);
 });
+
+// RVR-027 portability guard: the runner evaluates `${{ }}` expressions
+// anywhere in an action manifest, including the top-level `name` and
+// `description`. The `github` context is not available at manifest-load time,
+// so an expression there fails the whole action with "Unrecognized
+// named-value: 'github'" before any step runs. Keep load-time metadata to
+// plain text; expressions belong in inputs, env, and run steps.
+for (const name of ["reveries-receive-check", "reveries-post-merge", "reveries-evidence-import"]) {
+  test(`${name} keeps load-time metadata free of Actions expressions`, async () => {
+    const manifest = parseYaml(await action(name));
+    for (const field of ["name", "description"]) {
+      const value = manifest[field];
+      if (value === undefined) continue;
+      assert.doesNotMatch(
+        String(value),
+        /\$\{\{/,
+        `${name} action.yml ${field} must not contain a ${{ }} expression: the github context is unavailable when GitHub loads the manifest`,
+      );
+    }
+  });
+}

@@ -6,9 +6,9 @@ description: >-
   objects only and never checked out. The caller job must grant
   contents: write (branch rulesets do not cover refs/notes/reveries), check
   out the pushed revision with fetch-depth 0 and persist-credentials: false,
-  and serialise runs with a concurrency group per branch
-  (reveries-post-merge-${{ github.ref }}, cancel-in-progress: false); the
-  compare-and-swap lease remains the real guard against concurrent writers.
+  and serialise runs with a per-branch concurrency group whose
+  cancel-in-progress is false; the compare-and-swap lease remains the real
+  guard against concurrent writers.
 
 inputs:
   target-directory:
