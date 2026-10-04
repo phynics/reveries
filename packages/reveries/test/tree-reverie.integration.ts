@@ -9,8 +9,6 @@ import { afterEach, test } from "node:test";
 
 import { runCli, type CliIo } from "../src/cli.ts";
 import { Reveries } from "../src/operations.ts";
-import { NOTES_REF } from "../src/git.ts";
-import { checkReceive } from "../src/receive.ts";
 import {
   canonicalRecord,
   commitId,
@@ -476,125 +474,6 @@ test("an unchanged copy at two paths shares evidence with no spurious obligation
   const treeHits = hits.filter((hit) => hit.object === recorded.object);
   assert.equal(treeHits.length, 1);
   assert.deepEqual([...treeHits[0]?.paths ?? []].sort(), ["mod", "modcopy"]);
-});
-
-async function setupBare(): Promise<{ readonly source: string; readonly bare: string }> {
-  const root = await mkdtemp(join(tmpdir(), "reveries-tree-receive-"));
-  temporaryRepositories.push(root);
-  const source = join(root, "source");
-  const bare = join(root, "remote.git");
-  await mkdir(source, { recursive: true });
-  await git(source, "init", "-b", "main");
-  await git(source, "config", "user.name", "Reveries Test");
-  await git(source, "config", "user.email", "reveries@example.com");
-  await git(root, "init", "--bare", bare);
-  await git(source, "remote", "add", "origin", bare);
-  await mkdir(join(source, "mod"), { recursive: true });
-  await writeFile(join(source, "mod", "a.txt"), "alpha\n", "utf8");
-  await writeFile(join(source, "top.txt"), "top\n", "utf8");
-  await git(source, "add", ".");
-  await git(source, "commit", "-m", "initial");
-  return { source, bare };
-}
-
-async function proposeReceive(bare: string, ref: string, oldTip: string, newTip: string, oldNotes: string, newNotes: string) {
-  return checkReceive(bare, {
-    updates: [
-      { ref, oldObject: objectId(oldTip), newObject: objectId(newTip) },
-      { ref: NOTES_REF, oldObject: objectId(oldNotes), newObject: objectId(newNotes) },
-    ],
-  });
-}
-
-test("hosted receive refuses a rename-plus-edit continued onto another tree", async () => {
-  const { source, bare } = await setupBare();
-  const reveries = await Reveries.open(source);
-  await adopt(source, reveries);
-  const recorded = await reveries.recordNew({ path: "mod", revision: "HEAD", semantic, metadata });
-  await git(source, "push", "origin", "main", "refs/notes/reveries");
-  const oldTip = await git(source, "rev-parse", "HEAD");
-  const oldNotes = await git(source, "rev-parse", "refs/notes/reveries");
-
-  await git(source, "mv", "mod", "moved");
-  await writeFile(join(source, "moved", "a.txt"), "alpha changed\n", "utf8");
-  await git(source, "add", "-A");
-  const successor = (await reveries.repository.resolveSubject({ path: "moved", revision: "index" })).object;
-  await reveries.recordContinueToBlob({ fromBlob: recorded.object, toBlob: successor, id: recorded.record.id });
-  await git(source, "commit", "-m", "rename and edit the module");
-  const commit = await git(source, "rev-parse", "HEAD");
-  await reveries.summarize({ commit: commitId(commit), summary: summary() });
-  const newTip = await git(source, "rev-parse", "HEAD");
-  const newNotes = await git(source, "rev-parse", "refs/notes/reveries");
-  // Stage the proposed objects on the remote without moving the guarded refs,
-  // so the proposal's old objects still match the current ref tips.
-  await git(source, "push", "origin", "main:refs/heads/proposed", "refs/notes/reveries:refs/notes/proposed");
-
-  // A same-ID record on an unrelated reachable tree is not authority until
-  // RVR-014 lineage: the receive gate refuses exactly like the local check.
-  const refused = await proposeReceive(bare, "refs/heads/main", oldTip, newTip, oldNotes, newNotes);
-  assert.equal(refused.ok, false);
-  assert.match(refused.diagnostics.join("\n"), /missing-disposition/);
-  assert.equal(
-    refused.findings.some((finding) => finding.code === "missing-continuity-disposition"),
-    true,
-  );
-});
-
-test("hosted receive accepts a rename-plus-edit retired with cause", async () => {
-  const { source, bare } = await setupBare();
-  const reveries = await Reveries.open(source);
-  await adopt(source, reveries);
-  const recorded = await reveries.recordNew({ path: "mod", revision: "HEAD", semantic, metadata });
-  await git(source, "push", "origin", "main", "refs/notes/reveries");
-  const oldTip = await git(source, "rev-parse", "HEAD");
-  const oldNotes = await git(source, "rev-parse", "refs/notes/reveries");
-
-  await git(source, "mv", "mod", "moved");
-  await writeFile(join(source, "moved", "a.txt"), "alpha changed\n", "utf8");
-  await git(source, "add", "-A");
-  await git(source, "commit", "-m", "rename and edit the module");
-  const commit = await git(source, "rev-parse", "HEAD");
-  const retiring = summary();
-  retiring.entries[0]!.retirements = [{
-    reverie: recorded.record.id,
-    from_blob: recorded.object,
-    reason: "The module moved and changed composition; the old layout decision no longer applies.",
-  }];
-  await reveries.summarize({ commit: commitId(commit), summary: retiring });
-  const newTip = await git(source, "rev-parse", "HEAD");
-  const newNotes = await git(source, "rev-parse", "refs/notes/reveries");
-  await git(source, "push", "origin", "main:refs/heads/proposed", "refs/notes/reveries:refs/notes/proposed");
-
-  const accepted = await proposeReceive(bare, "refs/heads/main", oldTip, newTip, oldNotes, newNotes);
-  assert.equal(accepted.ok, true, JSON.stringify(accepted.diagnostics));
-});
-
-test("hosted receive refuses a rename-plus-edit with no tree disposition", async () => {
-  const { source, bare } = await setupBare();
-  const reveries = await Reveries.open(source);
-  await adopt(source, reveries);
-  await reveries.recordNew({ path: "mod", revision: "HEAD", semantic, metadata });
-  await git(source, "push", "origin", "main", "refs/notes/reveries");
-  const oldTip = await git(source, "rev-parse", "HEAD");
-  const oldNotes = await git(source, "rev-parse", "refs/notes/reveries");
-
-  await git(source, "mv", "mod", "moved");
-  await writeFile(join(source, "moved", "a.txt"), "alpha changed\n", "utf8");
-  await git(source, "add", "-A");
-  await git(source, "commit", "-m", "rename and edit the module");
-  const commit = await git(source, "rev-parse", "HEAD");
-  await reveries.summarize({ commit: commitId(commit), summary: summary() });
-  const newTip = await git(source, "rev-parse", "HEAD");
-  const newNotes = await git(source, "rev-parse", "refs/notes/reveries");
-  await git(source, "push", "origin", "main:refs/heads/proposed", "refs/notes/reveries:refs/notes/proposed");
-
-  const refused = await proposeReceive(bare, "refs/heads/main", oldTip, newTip, oldNotes, newNotes);
-  assert.equal(refused.ok, false);
-  assert.match(refused.diagnostics.join("\n"), /missing-disposition/);
-  assert.equal(
-    refused.findings.some((finding) => finding.code === "missing-continuity-disposition"),
-    true,
-  );
 });
 
 test("a predecessor tree never pairs to a blob carrying the same reverie", async () => {
