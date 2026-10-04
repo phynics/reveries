@@ -741,7 +741,9 @@ test("doctor reports retention coverage and the subjects a vault misses", async 
   assert.equal(uncovered.retention.policy, "active");
   assert.equal(uncovered.retention.state, "incomplete");
   assert.deepEqual([...uncovered.retention.missing], [recorded.object]);
-  assert.match(uncovered.diagnostics.join(" "), /Retention policy active does not keep 1 annotated subject/);
+  // An incomplete vault is rebuildable, so it is a notice and never damage.
+  assert.doesNotMatch(uncovered.diagnostics.join(" "), /Retention policy active does not keep/);
+  assert.match(uncovered.notices.join(" "), /Retention policy active does not keep 1 annotated subject/);
   assert.match(uncovered.notices.join(" "), /Retention: policy active; incomplete; 0 of 1 annotated subject/);
 
   await reveries.retain();

@@ -354,6 +354,30 @@ test("usage errors include command-specific help", async () => {
   assert.match(output.stderr(), /reveries help record/i);
 });
 
+test("help snapshot lists only the lean command surface", async () => {
+  const listed = captureIo("/tmp");
+  assert.equal(await runCli(["help"], listed.io), 0);
+  const help = listed.stdout();
+  const commands = [...help.matchAll(/^ {2}(\S+)\s{2,}\S/gm)].map((match) => match[1] ?? "");
+  assert.deepEqual(
+    [...commands].sort(),
+    ["doctor", "help", "history", "init", "link", "push", "record", "retain", "search", "show", "sync"].sort(),
+  );
+
+  // Every command the lean core removed must be absent from the index and must
+  // not answer with usage. A leftover name would promise a command that no
+  // longer exists.
+  const removed = [
+    "summarize", "check", "adopt", "hooks", "ledger", "sign", "authority",
+    "redact", "transition", "receive", "quarantine", "repair", "mirror", "import",
+  ];
+  for (const command of removed) {
+    assert.doesNotMatch(help, new RegExp(`^ {2}${command}\\b`, "m"), `help still lists removed command ${command}`);
+    const topic = captureIo("/tmp");
+    assert.equal(await runCli(["help", command], topic.io), 3, `help for removed command ${command}`);
+  }
+});
+
 test("every command the help index lists has usage of its own", async () => {
   const listed = captureIo("/tmp");
   assert.equal(await runCli(["help"], listed.io), 0);

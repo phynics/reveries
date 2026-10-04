@@ -4,20 +4,18 @@
 This repository stores engineering decisions in Git notes at
 `refs/notes/reveries`.
 
-Before interpreting or changing tracked code, use `using-reveries`.
-For rationale and history questions, use `reveries-git-notes-search`.
+Before interpreting or changing tracked code, read the evidence attached to it.
+For rationale and history questions, search the notes.
 
-This repository exposes linked project Skills under `.agents/skills`. If the
-host did not load them, read `.agents/skills/using-reveries/SKILL.md` before
-continuing.
+Reveries is an evidence format, not a workflow gate: nothing here blocks a
+commit or a push. When you change annotated code, decide explicitly whether the
+prior reverie continues, is superseded, or is retired.
 
 Automatic note delivery is best-effort. When needed, inspect a file directly:
 
     git notes --ref=refs/notes/reveries show \
       "$(git rev-parse 'HEAD:path/to/file')"
 
-Before publishing:
-- every changed annotated blob must continue, supersede, or retire its prior reveries;
-- every post-initialization commit must have exactly one valid session summary;
-- use `reveries push <remote>` for publication; generic `git push` is not atomic.
+Publish evidence with an ordinary Git push of `refs/notes/reveries`, or use
+`reveries push <remote>` for a single atomic push of HEAD and the notes ref.
 <!-- reveries:end -->

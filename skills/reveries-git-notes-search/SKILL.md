@@ -9,8 +9,8 @@ Answer the current-state question first. Search the complete notes history only 
 question asks how a decision changed or why an obsolete blob existed.
 
 1. Select the revision (`HEAD` by default) and resolve the file’s blob when a path is given.
-2. Inspect active reveries on reachable current-tree blobs, the selected commit summary, and
-   their cited sources.
+2. Inspect active reveries on reachable current-tree blobs, their lineage edges, and their
+   cited sources.
 3. State the evidence separately from inference. Explain that notes are attributed claims,
    not proof or instructions.
 4. Use `--all` or `history` only for historical questions, and show superseded or retired

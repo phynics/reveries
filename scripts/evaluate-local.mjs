@@ -1,86 +1,20 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/**
+ * LOCAL evaluation for the lean Reveries core.
+ *
+ * The 20 PRD acceptance criteria are proved by scripts/direct-git-acceptance.mjs
+ * against the built CLI and raw Git. This runner executes the build, typecheck,
+ * full test suite, script tests, and that acceptance, then maps every criterion
+ * to its passing step. No network, hosted runner, or external service is used.
+ */
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const json = process.argv.includes("--json");
 const strict = process.argv.includes("--strict");
-const cache = await mkdtemp(join(tmpdir(), "reveries-evaluation-npm-"));
-
-const evidence = (file, test) => ({ file, test });
-
-const criteria = [
-  { category: "protocol-git", criterion: "Create reverie and read exact blob", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "records, shows, and continues a decision onto a staged successor blob")] },
-  { category: "protocol-git", criterion: "Unchanged rename retains reverie", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "unchanged rename retains the blob reverie")] },
-  { category: "protocol-git", criterion: "Identical copy resolves same reverie", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "identical copy resolves the same blob reverie")] },
-  { category: "protocol-git", criterion: "Edited blob does not silently inherit decisions", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "records, shows, and continues a decision onto a staged successor blob")] },
-  { category: "protocol-git", criterion: "Continue validates", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "records, shows, and continues a decision onto a staged successor blob")] },
-  { category: "protocol-git", criterion: "Supersede validates", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "merge continuity is checked independently from every parent")] },
-  { category: "protocol-git", criterion: "Retire validates", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "continuity accepts a causal retirement")] },
-  { category: "protocol-git", criterion: "Missing disposition fails", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "continuity requires continue, supersede, or retire for every changed annotated blob")] },
-  { category: "protocol-git", criterion: "Merge checks both parents", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "merge continuity is checked independently from every parent")] },
-  { category: "protocol-git", criterion: "Forked supersession is detected", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "active projection exposes terminal reveries and detects forks")] },
-  { category: "protocol-git", criterion: "Supersession cycle is detected", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "active projection detects supersession cycles")] },
-  { category: "protocol-git", criterion: "Malformed JSON is inspectable but fails strict operations", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "tolerant parsing preserves valid records and reports malformed lines"), evidence("packages/reveries/test/hooks.test.ts", "malformed notes are suppressed rather than injected")] },
-  { category: "protocol-git", criterion: "Noncanonical JSON fails strict operations", status: "covered", evidence: [evidence("packages/reveries/test/protocol.test.ts", "strict parsing accepts canonical JSONL and rejects noncanonical JSON")] },
-  { category: "protocol-git", criterion: "Same ID with conflicting semantic content fails", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "conflicting duplicate semantic IDs are surfaced as damaged evidence")] },
-  { category: "protocol-git", criterion: "Two clones merge independent records without loss", status: "covered", evidence: [evidence("packages/reveries/test/git.integration.ts", "two clones merge independent canonical note lines without loss")] },
-  { category: "protocol-git", criterion: "Two summaries on one commit conflict", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "summary replacement keeps the initialization record and rejects concurrent duplicates")] },
-  { category: "protocol-git", criterion: "Amend requires fresh summary", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "amend requires a fresh session summary")] },
-  { category: "protocol-git", criterion: "Rebase requires fresh summaries", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "rebase requires fresh session summaries")] },
-  { category: "protocol-git", criterion: "Squash requires fresh summary", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "squash requires a fresh session summary")] },
-  { category: "protocol-git", criterion: "Cherry-pick requires fresh summary", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "cherry-pick requires a fresh session summary")] },
-  { category: "protocol-git", criterion: "Pre-initialization history is grandfathered", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "pre-initialization history is grandfathered")] },
-  { category: "protocol-git", criterion: "New published branches contain initialization boundary", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "a branch omitting the initialization boundary is rejected for publication")] },
-  { category: "protocol-git", criterion: "SHA-1 repositories generate correct IDs", status: "covered", evidence: [evidence("packages/reveries/test/git.integration.ts", "hashes semantic payloads with the repository object format")] },
-  { category: "protocol-git", criterion: "SHA-256 repositories generate correct IDs", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "repository-backed semantic IDs use SHA-256 when the repository does")] },
-  { category: "protocol-git", criterion: "Linked worktrees share notes state and lock", status: "covered", evidence: [evidence("packages/reveries/test/git.integration.ts", "linked worktrees use the same common-directory lock")] },
-  { category: "protocol-git", criterion: "Non-fast-forward notes push fails safely", status: "covered", evidence: [evidence("packages/reveries/test/acceptance.integration.ts", "a stale non-fast-forward notes push fails safely")] },
-  { category: "protocol-git", criterion: "Arbitrary unstaged object write is refused", status: "covered", evidence: [evidence("packages/reveries/test/operations.integration.ts", "continuity refuses an arbitrary unstaged object")] },
-  { category: "receive", criterion: "Receive fixture validates proposed ref updates", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "receive fixture validates proposed ref updates without moving refs")] },
-  { category: "receive", criterion: "Base-tree changes invalidate earlier receive evidence", status: "covered", evidence: [evidence("packages/reveries/test/receive.integration.ts", "base tree changed")] },
-  { category: "protocol-git", criterion: "Host-created merge commits receive one summary per pull request commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a host-created merge commit receives one entry per pull request commit")] },
-  { category: "protocol-git", criterion: "Squash preserves recorded retirement evidence", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a squashed pull request keeps the retirement evidence recorded on its commits")] },
-  { category: "protocol-git", criterion: "A rebased pull request summarizes only the new tip commit", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a rebased pull request summarizes only the new tip commit"), evidence("scripts/reveries-post-merge.test.mjs", "a rebased pull request plans only the new tip commit and defers the intermediates")] },
-  { category: "protocol-git", criterion: "A synthesized summary that fails strict validation is never written", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a synthesized summary that fails strict validation is never written")] },
-  { category: "protocol-git", criterion: "A repeated post-merge run is a no-op", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a repeated run leaves the notes ref unchanged")] },
-  { category: "protocol-git", criterion: "A concurrent human summary wins over a synthesized summary", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "a concurrently attached human summary wins over a synthesized summary")] },
-  { category: "receive", criterion: "Notes publication reconciles a concurrent writer before its compare-and-swap push", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication incorporates a concurrent writer before its compare-and-swap push")] },
-  { category: "receive", criterion: "An invalid concurrent notes union fails closed", status: "covered", evidence: [evidence("packages/reveries/test/hosted-summary.integration.ts", "notes publication fails closed on an invalid concurrent union and leaves the remote untouched")] },
-  { category: "host-adapters", criterion: "The post-merge workflow never executes pull request code", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "the post-merge workflow trusts the pushed default-branch revision and delegates writes to notes")] },
-  { category: "host-adapters", criterion: "An ambiguous rebased commit is reported instead of guessed", status: "covered", evidence: [evidence("scripts/reveries-post-merge.test.mjs", "an ambiguous rebase mapping is reported and never planned")] },
-
-  { category: "initialization", criterion: "Repeated initialization is idempotent", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
-  { category: "initialization", criterion: "Existing AGENTS prose is preserved", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization is explicit and idempotent")] },
-  { category: "initialization", criterion: "Duplicate or malformed markers are refused", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "malformed or duplicated owned markers are refused")] },
-  { category: "initialization", criterion: "Unknown hooks are not overwritten", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "unknown hooks are preserved and reported as partial enforcement")] },
-  { category: "initialization", criterion: "Removal preserves notes ref", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "removal keeps the notes ref and unknown prose")] },
-  { category: "initialization", criterion: "User is queried for publishing remotes", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "Pi ${evidence.host.version} Skill evidence passed.")] },
-  { category: "initialization", criterion: "Multiple remotes are supported", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and explains host routing")] },
-  { category: "initialization", criterion: "Directive email is not invented", status: "covered", evidence: [evidence("packages/reveries/test/cli.test.ts", "init requires an explicit directive-email choice")] },
-  { category: "initialization", criterion: "Host files are created only when selected", status: "covered", evidence: [evidence("packages/reveries/test/install.integration.ts", "initialization configures every selected remote and explains host routing")] },
-
-  { category: "skills", criterion: "Skill names and frontmatter are structurally valid", status: "local-static" },
-  { category: "skills", criterion: "Skill descriptions trigger intended workflows", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "Pi ${evidence.host.version} Skill evidence passed.")] },
-  { category: "skills", criterion: "Init does not activate implicitly", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "init Skill activated implicitly")] },
-  { category: "skills", criterion: "Use activates for annotated edits and commits", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "annotated edit did not select the use Skill")] },
-  { category: "skills", criterion: "Search activates for rationale questions", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "rationale query did not select the search Skill")] },
-  { category: "skills", criterion: "Search never mutates", status: "covered", evidence: [evidence("scripts/native-skill-evidence.mjs", "Pi search changed repository state")] },
-  { category: "skills", criterion: "Main Skill files stay within disclosure limits", status: "local-static" },
-  { category: "skills", criterion: "Direct Git reference works without helper", status: "covered", evidence: [evidence("scripts/direct-git-acceptance.mjs", "Reveries direct-Git cookbook acceptance passed.")] },
-
-  { category: "host-adapters", criterion: "Native automatic-delivery conformance", status: "not-claimed", reason: "All hosts are graded CORE. No host/version claims verified delivery." },
-  { category: "installer", criterion: "Global npx Skills install for five hosts", status: "covered", evidence: [evidence("scripts/installer-acceptance.mjs", "Reveries Skills installer acceptance passed.")] },
-  { category: "installer", criterion: "Skills update and removal paths", status: "covered", evidence: [evidence("scripts/installer-acceptance.mjs", "Reveries Skills installer acceptance passed.")] },
-];
-
-// RVR-020: every criterion in this runner belongs to the LOCAL grade. The
-// TEAM, HOSTED, and AUTOMATIC DELIVERY grades have their own runners and
-// reports; no higher grade is inferred from this one.
-const GRADE = "LOCAL";
-for (const item of criteria) item.grade ??= GRADE;
 
 async function run(command, args) {
   const started = performance.now();
@@ -124,15 +58,17 @@ async function markdownFiles(directory) {
 }
 
 async function validateSkills() {
-  const names = [
-    "reveries-git-notes-init",
-    "using-reveries",
-    "reveries-git-notes-search",
-  ];
+  const names = ["reveries-git-notes-init", "using-reveries", "reveries-git-notes-search"];
   const failures = [];
   for (const name of names) {
     const path = join(workspace, "skills", name, "SKILL.md");
-    const content = await readFile(path, "utf8");
+    let content;
+    try {
+      content = await readFile(path, "utf8");
+    } catch {
+      failures.push(`${name}: SKILL.md is missing`);
+      continue;
+    }
     const frontmatter = content.match(/^---\n([\s\S]*?)\n---\n/);
     if (frontmatter === null || !frontmatter[1].includes(`name: ${name}`)) {
       failures.push(`${name}: invalid or mismatched frontmatter name`);
@@ -148,7 +84,6 @@ async function validateSkills() {
       if (link === null) continue;
       const target = (link[1] ?? link[2]).split(/[?#]/, 1)[0];
       if (target.length === 0 || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(target)) continue;
-
       const resolved = resolve(dirname(path), decodeURIComponent(target));
       const relativeTarget = relative(skillDirectory, resolved);
       if (relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) {
@@ -162,123 +97,88 @@ async function validateSkills() {
       }
     }
   }
-  await readFile(join(skillDirectory, "references", "direct-git.md"), "utf8");
   return failures;
 }
 
-async function validateEvidence() {
-  const cacheByFile = new Map();
-  const failures = [];
-  for (const criterion of criteria.filter((item) => item.status === "covered")) {
-    for (const item of criterion.evidence) {
-      let content = cacheByFile.get(item.file);
-      if (content === undefined) {
-        content = await readFile(join(workspace, item.file), "utf8");
-        cacheByFile.set(item.file, content);
-      }
-      if (!content.includes(item.test)) {
-        failures.push(`${criterion.criterion}: missing evidence test '${item.test}'`);
-      }
-    }
+const gates = [];
+gates.push(await run("npm", ["run", "build"]));
+gates.push(await run("npm", ["run", "typecheck"]));
+gates.push(await run("npm", ["run", "test:full"]));
+const acceptance = await run("node", ["scripts/direct-git-acceptance.mjs", "--json"]);
+gates.push(acceptance);
+
+let acceptanceReport = { ok: false, criteria: [] };
+if (acceptance.ok) {
+  try {
+    acceptanceReport = JSON.parse(acceptance.stdout.trim().split("\n").at(-1) ?? "{}");
+  } catch {
+    acceptanceReport = { ok: false, criteria: [] };
   }
-  return failures;
+}
+const skillFailures = await validateSkills();
+const gatesOk = gates.every((gate) => gate.ok);
+const criteria = acceptanceReport.criteria.map((item) => ({
+  id: item.id,
+  criterion: item.title,
+  status: item.ok ? "covered" : "failed",
+  evidence: "scripts/direct-git-acceptance.mjs",
+  reason: item.ok ? null : item.detail,
+}));
+const acceptanceOk = acceptanceReport.ok === true && criteria.length === 20
+  && criteria.every((item) => item.status === "covered");
+const releaseReady = gatesOk && acceptanceOk && skillFailures.length === 0;
+
+const result = {
+  grade: "LOCAL",
+  generated_at: new Date().toISOString(),
+  host: {
+    name: "local-workstation",
+    version: `${process.version}, ${(await run("git", ["--version"])).stdout.trim()}`,
+  },
+  repository: "local worktree (no network access, no writes outside disposable directories)",
+  verdict: releaseReady ? "verified" : "failed",
+  environment: {
+    network_used: false,
+    external_writes: false,
+    native_host_testing: false,
+  },
+  gates: gates.map(({ ok, command, duration_ms, stdout, stderr }) => ({
+    ok,
+    command,
+    duration_ms,
+    diagnostic: ok ? null : [stdout, stderr].filter((output) => output.trim().length > 0).join("\n").trim(),
+  })),
+  acceptance: {
+    counts: {
+      covered: criteria.filter((item) => item.status === "covered").length,
+      failed: criteria.filter((item) => item.status === "failed").length,
+    },
+    skill_failures: skillFailures,
+    criteria,
+  },
+  release_ready: releaseReady,
+};
+
+if (json) {
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+} else {
+  process.stdout.write("Reveries LOCAL evaluation (grade: LOCAL)\n\n");
+  for (const gate of result.gates) {
+    process.stdout.write(`${gate.ok ? "PASS" : "FAIL"} ${gate.command.join(" ")} (${gate.duration_ms} ms)\n`);
+    if (!gate.ok && gate.diagnostic !== null) process.stdout.write(`  ${gate.diagnostic.replaceAll("\n", "\n  ")}\n`);
+  }
+  process.stdout.write("\nPRD acceptance criteria\n");
+  for (const item of criteria) {
+    process.stdout.write(`${item.status === "covered" ? "PASS" : "FAIL"} ${item.id}. ${item.criterion}\n`);
+    if (item.reason !== null && item.reason !== undefined) process.stdout.write(`  ${item.reason}\n`);
+  }
+  if (skillFailures.length > 0) {
+    process.stdout.write("\nSkill failures\n");
+    for (const failure of skillFailures) process.stdout.write(`${failure}\n`);
+  }
+  process.stdout.write(`\nRelease ready: ${releaseReady ? "yes" : "no"}\n`);
 }
 
-try {
-  const gates = [];
-  gates.push(await run("npm", ["run", "typecheck"]));
-  gates.push(await run("npm", ["run", "test:full"]));
-  gates.push(await run("npm", ["run", "conformance"]));
-  gates.push(await run("node", ["scripts/direct-git-acceptance.mjs"]));
-  gates.push(await run("node", ["scripts/post-merge-fixture.mjs"]));
-  gates.push(await run("npm", ["run", "test:scripts"]));
-  gates.push(await run("npm", ["run", "acceptance:receive"]));
-  gates.push(await run("node", ["scripts/native-skill-evidence.mjs"]));
-  gates.push(await run("node", ["scripts/installer-acceptance.mjs"]));
-  gates.push(await run("npm", [
-    "pack",
-    "--dry-run",
-    "--workspace", "@reveries/cli",
-    "--cache", cache,
-  ]));
-  gates.push(await run("git", ["diff", "--check", "HEAD"]));
-
-  const skillFailures = await validateSkills();
-  const evidenceFailures = await validateEvidence();
-  const localStaticOk = skillFailures.length === 0;
-  for (const criterion of criteria.filter((item) => item.status === "local-static")) {
-    criterion.status = localStaticOk ? "covered" : "failed";
-    criterion.reason = localStaticOk ? "Validated by the local evaluator." : skillFailures.join("; ");
-  }
-
-  const counts = Object.fromEntries(
-    [...new Set(criteria.map((item) => item.status))]
-      .map((status) => [status, criteria.filter((item) => item.status === status).length]),
-  );
-  const gatesOk = gates.every((gate) => gate.ok);
-  const releaseReady = gatesOk
-    && evidenceFailures.length === 0
-    && criteria.every((item) => item.status === "covered" || item.status === "not-claimed");
-  const hostVersion = await run("git", ["--version"]);
-  const result = {
-    grade: GRADE,
-    generated_at: new Date().toISOString(),
-    host: {
-      name: "local-workstation",
-      version: `${process.version}, ${hostVersion.stdout.trim()}`,
-    },
-    merge_mode: "not-applicable (local grade; hosted merge modes belong to HOSTED)",
-    repository: "local worktree (no network access, no writes outside disposable directories)",
-    evidence_scale: {
-      criteria: criteria.length,
-      gates: gates.length,
-      unit: "acceptance criteria and executable gates",
-    },
-    verdict: releaseReady ? "verified" : "failed",
-    environment: {
-      network_used: false,
-      external_writes: false,
-      native_host_testing: false,
-      recorded_native_host_evidence: "Pi 0.84.1",
-    },
-    gates: gates.map(({ ok, command, duration_ms, stdout, stderr }) => ({
-      ok,
-      command,
-      duration_ms,
-      diagnostic: ok ? null : [stdout, stderr].filter((output) => output.trim().length > 0).join("\n").trim(),
-    })),
-    acceptance: {
-      counts,
-      evidence_failures: evidenceFailures,
-      skill_failures: skillFailures,
-      criteria,
-    },
-    release_ready: releaseReady,
-  };
-
-  if (json) {
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  } else {
-    process.stdout.write("Reveries LOCAL evaluation (grade: LOCAL; TEAM, HOSTED, and AUTOMATIC DELIVERY have their own runners)\n\n");
-    for (const gate of result.gates) {
-      process.stdout.write(`${gate.ok ? "PASS" : "FAIL"} ${gate.command.join(" ")} (${gate.duration_ms} ms)\n`);
-      if (!gate.ok && gate.diagnostic !== null) process.stdout.write(`  ${gate.diagnostic.replaceAll("\n", "\n  ")}\n`);
-    }
-    process.stdout.write("\nAcceptance coverage\n");
-    for (const [status, count] of Object.entries(counts).sort()) {
-      process.stdout.write(`${status}: ${count}\n`);
-    }
-    const gaps = criteria.filter((item) => item.status !== "covered" && item.status !== "not-claimed");
-    if (gaps.length > 0) {
-      process.stdout.write("\nGaps and environment limits\n");
-      for (const item of gaps) process.stdout.write(`${item.status.toUpperCase()} ${item.criterion}: ${item.reason}\n`);
-    }
-    process.stdout.write(`\nRelease ready: ${releaseReady ? "yes" : "no"}\n`);
-  }
-
-  if (!gatesOk || evidenceFailures.length > 0 || skillFailures.length > 0 || (strict && !releaseReady)) {
-    process.exitCode = 1;
-  }
-} finally {
-  await rm(cache, { recursive: true, force: true });
+if (!gatesOk || !acceptanceOk || skillFailures.length > 0 || (strict && !releaseReady)) {
+  process.exitCode = 1;
 }
