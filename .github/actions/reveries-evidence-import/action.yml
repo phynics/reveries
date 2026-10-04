@@ -22,7 +22,7 @@ runs:
       shell: bash
       env:
         REVERIES_EVIDENCE_OUTPUT: ${{ inputs.output-path }}
-      run: node "${{ github.action_path }}/../../scripts/import-fork-evidence.mjs" --target-dir "${{ inputs.target-directory }}"
+      run: node "${{ github.action_path }}/../../../scripts/import-fork-evidence.mjs" --target-dir "${{ inputs.target-directory }}"
 
     - name: Publish the evidence manifest
       uses: actions/upload-artifact@v4

@@ -575,8 +575,9 @@ test("atomic commit creation preserves author and committer environment metadata
     }
   }
 
+  const metadata = await git(directory, "show", "-s", "--format=%an <%ae> %aI|%cn <%ce> %cI", commit);
   assert.equal(
-    await git(directory, "show", "-s", "--format=%an <%ae> %aI|%cn <%ce> %cI", commit),
+    metadata.replace(/Z(?=\||$)/g, "+00:00"),
     "Original Author <author@example.test> 2001-02-03T04:05:06+00:00|Original Committer <committer@example.test> 2002-03-04T05:06:07+00:00",
   );
 });

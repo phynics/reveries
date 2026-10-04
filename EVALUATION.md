@@ -117,6 +117,12 @@ SHA-256 digest of every file in each tested Skill:
 node scripts/native-skill-evidence.mjs --capture
 ```
 
+Capture uses the Pi provider and model named by `REVERIES_PI_PROVIDER` and `REVERIES_PI_MODEL`,
+which default to `openai-codex` and `gpt-5.4-mini`. Any Pi-authenticated provider that supports
+reasoning may be used; the recorded `host`, `provider`, and `model` describe the run that produced
+the checked-in evidence. The current evidence was captured with Pi 1.0.2 on the `opencode-go`
+provider and the `longcat-2.5-preview-free` model.
+
 The checked-in evidence is valid only while those Skill digests match. The normal verifier rejects
 stale evidence. Recapture requires Pi and model access; verification does not.
 

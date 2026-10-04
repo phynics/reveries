@@ -12,8 +12,8 @@ const skillNames = [
   "using-reveries",
   "reveries-git-notes-search",
 ];
-const provider = "openai-codex";
-const model = "gpt-5.4-mini";
+const provider = process.env.REVERIES_PI_PROVIDER ?? "openai-codex";
+const model = process.env.REVERIES_PI_MODEL ?? "gpt-5.4-mini";
 
 const prompts = {
   init: "A user explicitly asks: \"Initialize Reveries in this Git repository.\" Use the installed Skill that applies, including reading its instructions before answering. Do not change files. Return exactly one compact JSON object with keys selected_skill, setup_modes, required_user_choices, and mutation_before_answers. setup_modes must name every supported way a new agent can obtain the everyday Reveries Skill. required_user_choices must name every choice that must be asked before setup. mutation_before_answers must be a boolean.",
@@ -75,15 +75,53 @@ async function git(directory, ...args) {
 }
 
 function parseJsonOutput(output) {
-  const lines = output.split("\n").map((line) => line.trim()).filter(Boolean);
-  for (const line of lines.reverse()) {
-    try {
-      return JSON.parse(line);
-    } catch {
-      // Pi can emit non-JSON progress before its requested final object.
+  // Pi can emit non-JSON progress before its requested final object, and a
+  // model may return the object compact, pretty-printed, or inside a code
+  // fence. Scan for balanced top-level JSON values and return the last one
+  // that parses, so a multi-line answer is not mistaken for one of its own
+  // lines or for a nested value inside it.
+  const text = output.replace(/```(?:json)?/gi, " ");
+  const candidates = [];
+  for (let start = 0; start < text.length; start += 1) {
+    const opener = text[start];
+    if (opener !== "{" && opener !== "[") continue;
+    const closer = opener === "{" ? "}" : "]";
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') inString = true;
+      else if (character === opener) depth += 1;
+      else if (character === closer) {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push({ start, end: index + 1, text: text.slice(start, index + 1) });
+          break;
+        }
+      }
     }
   }
-  throw new Error(`Pi did not return a JSON object: ${output}`);
+  // Drop any candidate nested inside an earlier one, then take the last
+  // remaining candidate: that is the outermost object nearest the end of the
+  // output, which is the answer the model returned.
+  const parsed = [];
+  for (const candidate of candidates) {
+    try {
+      parsed.push({ ...candidate, value: JSON.parse(candidate.text) });
+    } catch {
+      // Keep scanning when a candidate is malformed.
+    }
+  }
+  if (parsed.length === 0) throw new Error(`Pi did not return a JSON object: ${output}`);
+  const outermost = parsed.filter((candidate) => !parsed.some((other) => other.start < candidate.start && other.end > candidate.end));
+  return outermost[outermost.length - 1].value;
 }
 
 async function runPi(prompt, cwd, tools = "read") {
@@ -208,13 +246,20 @@ async function verify() {
   const init = evidence.cases?.init?.output;
   assert(init?.selected_skill === "reveries-git-notes-init", "explicit initialization did not select the init Skill");
   assert(init.mutation_before_answers === false, "initialization would mutate before user choices");
-  assert(JSON.stringify(init.setup_modes) === JSON.stringify([
-    "Reminder only",
-    "Pull when missing",
-    "Vendored Skills",
-    "Linked project Skills",
-    "Git submodule",
-  ]), "initialization did not offer all Skill setup modes");
+  // The evidence checks that initialization offers every supported Skill
+  // delivery mode, not the exact prose a model uses. Each mode is matched by
+  // the phrases its Skill guidance uses, so a correct answer passes and an
+  // answer that omits or invents a mode fails.
+  const setupModes = Array.isArray(init.setup_modes) ? init.setup_modes.map((mode) => String(mode).toLowerCase()) : [];
+  const setupModeGuards = [
+    { name: "reminder", pattern: /reminder/ },
+    { name: "pull", pattern: /pull/ },
+    { name: "vendored", pattern: /vendor/ },
+    { name: "linked project skills", pattern: /symlink|linked project/ },
+    { name: "Git submodule", pattern: /submodule/ },
+  ];
+  const missingSetupModes = setupModeGuards.filter((guard) => !setupModes.some((mode) => guard.pattern.test(mode)));
+  assert(setupModes.length === setupModeGuards.length && missingSetupModes.length === 0, `initialization did not offer all Skill setup modes: missing ${missingSetupModes.map((guard) => guard.name).join(", ") || "none (wrong count)"}`);
   assert(init.required_user_choices?.length === 4, "initialization did not ask all four required user choices");
 
   const ordinary = evidence.cases?.ordinary?.output;

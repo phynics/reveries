@@ -761,7 +761,20 @@ async function slashConsumer(
   await git(directory, "config", "user.name", "Consumer");
   await git(directory, "config", "user.email", "consumer@example.com");
   for (const remote of remotes) {
-    await git(directory, "remote", "add", remote.name, bare);
+    if (remote.name.includes("/")) {
+      // Newer Git rejects nested names through `remote add`. Write the valid
+      // remote subsection directly so these fixtures can test Reveries' name
+      // resolution without relying on Git's version-specific validation.
+      await git(directory, "config", `remote.${remote.name}.url`, bare);
+      await git(
+        directory,
+        "config",
+        `remote.${remote.name}.fetch`,
+        `+refs/heads/*:refs/remotes/${remote.name}/*`,
+      );
+    } else {
+      await git(directory, "remote", "add", remote.name, bare);
+    }
     if (remote.role !== null) {
       // Slash names cannot use the legacy flat key (git rejects the `/`);
       // they are declared through the subsection encoding instead.
