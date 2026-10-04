@@ -14,53 +14,21 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   assertNoteSize,
   blobId,
-  canonicalLedgerManifest,
   commitId,
   objectId,
   type BlobId,
   type CommitId,
-  type LedgerManifest,
   type ObjectId,
   type ResourceLimits,
 } from "./protocol.ts";
 
 export const NOTES_REF = "refs/notes/reveries";
-export const LEDGER_REF = "refs/heads/reveries-ledger";
-/** The fixed commit message that identifies a ledger checkpoint (RVR-005). */
-export const LEDGER_MESSAGE = "Reveries ledger checkpoint\n";
-/** The only tree entries a ledger checkpoint envelope may carry. */
-export const LEDGER_MANIFEST_PATH = "manifest.json";
-export const LEDGER_NOTES_PATH = "notes";
-/**
- * The signature lines a checkpoint carries (RVR-009). RVR-005 allowed exactly two
- * tree entries; the manifest signature extends that allow-list to exactly three
- * and no further.
- */
-export const LEDGER_SIGNATURES_PATH = "signatures";
-
-/**
- * The fixed timestamp a ledger manifest signature carries (RVR-009).
- *
- * A checkpoint must stay byte-reproducible from the same evidence and signer, so
- * its signature cannot embed a wall-clock time: ed25519 over fixed bytes means
- * the same manifest and key always reproduce the same signature and therefore
- * the same checkpoint object ID. This is the signature counterpart of the fixed
- * `LEDGER_IDENTITY` epoch the commit itself already uses.
- */
-export const LEDGER_SIGNATURE_TIMESTAMP = "1970-01-01T00:00:00Z";
-/**
- * The single authoritative retention ref. It points at one deterministic
- * commit whose tree holds every retained blob and tree and whose parents are
- * the retained commits. Reachability is the only meaning; there is no
- * semantic state in retention.
- */
 export const RETENTION_REF = "refs/reveries/retention";
 /** Legacy retention refs, read only by the migration helper. */
 export const RETENTION_OBJECTS_REF = "refs/reveries/retention/objects";
 export const RETENTION_COMMITS_REF = "refs/reveries/retention/commits";
 export const RETENTION_BUNDLE_REFS = [
   NOTES_REF,
-  LEDGER_REF,
   RETENTION_REF,
 ] as const;
 export const INTERNAL_ATOMIC_PUSH_ENV = "REVERIES_INTERNAL_ATOMIC_PUSH";
@@ -117,15 +85,6 @@ const RETENTION_IDENTITY = {
  * retention checkpoint, so a checkpoint rebuilt from the same evidence
  * reproduces the same object ID.
  */
-const LEDGER_IDENTITY = {
-  GIT_AUTHOR_NAME: "Reveries Ledger",
-  GIT_AUTHOR_EMAIL: "ledger@reveries.local",
-  GIT_AUTHOR_DATE: "@0 +0000",
-  GIT_COMMITTER_NAME: "Reveries Ledger",
-  GIT_COMMITTER_EMAIL: "ledger@reveries.local",
-  GIT_COMMITTER_DATE: "@0 +0000",
-} as const;
-
 export interface GitResult {
   readonly stdout: string;
   readonly stderr: string;
@@ -147,25 +106,6 @@ interface RunOptions {
  * hermetic and needs no `ssh-keygen` or agent. Git SSH `allowed_signers` support
  * is a second implementation behind this same port.
  */
-export interface SignatureSigner {
-  readonly algorithm: string;
-  /** The key material identity; this is the field that rotates. */
-  readonly keyId: string;
-  /** The stable attesting identity that trust policy matches on. */
-  readonly signer: string;
-  sign(payload: Uint8Array): Uint8Array;
-}
-
-/**
- * Checks a signature over canonical payload bytes. Implementations must not throw
- * for a bad signature: a malformed signature is a reported `invalid` state, not
- * an exception, so one corrupt line can never abort a whole verification pass.
- */
-export interface SignatureVerifier {
-  readonly algorithm: string;
-  verify(input: { payload: Uint8Array; signature: Uint8Array; keyId: string }): boolean;
-}
-
 export interface Ed25519KeyPair {
   /** PKCS#8 PEM private key. Never written to a repository or a note. */
   readonly privateKey: string;
@@ -192,93 +132,6 @@ export function generateEd25519KeyPair(): Ed25519KeyPair {
 }
 
 /** The default in-process signer. Private key material is supplied by the caller. */
-export function createLocalEd25519Signer(input: {
-  readonly signer: string;
-  readonly keyId: string;
-  readonly privateKey: string;
-}): SignatureSigner {
-  const key = createPrivateKey(input.privateKey);
-  return {
-    algorithm: "ed25519",
-    keyId: input.keyId,
-    signer: input.signer,
-    sign(payload: Uint8Array): Uint8Array {
-      return new Uint8Array(sign(null, Buffer.from(payload), key));
-    },
-  };
-}
-
-/** The default in-process verifier, keyed by `keyId`. */
-export function createLocalEd25519Verifier(keys: Readonly<Record<string, string>>): SignatureVerifier {
-  return {
-    algorithm: "ed25519",
-    verify(input): boolean {
-      const pem = keys[input.keyId];
-      if (pem === undefined) return false;
-      try {
-        return verify(null, Buffer.from(input.payload), createPublicKey(pem), Buffer.from(input.signature));
-      } catch {
-        // Malformed key or signature material is a failed verification, never a
-        // thrown error, so one bad line cannot abort a verification pass.
-        return false;
-      }
-    },
-  };
-}
-
-/** One trust-store entry: public key material plus its authorization and revocation. */
-export interface TrustStoreKey {
-  readonly key_id: string;
-  readonly signer: string;
-  readonly revoked: boolean;
-  /** SPKI PEM public key. */
-  readonly public_key: string;
-}
-
-export interface TrustStoreFile {
-  readonly keys: readonly TrustStoreKey[];
-}
-
-const TRUST_STORE_KEYS = new Set(["key_id", "signer", "revoked", "public_key"]);
-
-/**
- * Read a local trust store. Public key material and revocation live in this file
- * rather than in the ledger manifest, which is what lets the manifest stay
- * byte-reproducible and need no signing-policy field of its own (RVR-009).
- */
-export async function readTrustStore(value: unknown): Promise<TrustStoreFile> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("trust store must be a JSON object");
-  }
-  const record = value as Record<string, unknown>;
-  if (!Array.isArray(record.keys)) throw new Error("trust store keys must be an array");
-  const keys: TrustStoreKey[] = record.keys.map((entry, index) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`trust store key ${index} must be an object`);
-    }
-    const key = entry as Record<string, unknown>;
-    for (const field of Object.keys(key)) {
-      if (!TRUST_STORE_KEYS.has(field)) throw new Error(`unknown trust store field: ${field}`);
-    }
-    for (const field of TRUST_STORE_KEYS) {
-      if (!(field in key)) throw new Error(`trust store key ${index} is missing ${field}`);
-    }
-    if (typeof key.key_id !== "string" || !key.key_id.trim()) throw new Error("trust store key_id must be nonempty");
-    if (typeof key.signer !== "string" || !key.signer.trim()) throw new Error("trust store signer must be nonempty");
-    if (typeof key.revoked !== "boolean") throw new Error("trust store revoked must be a boolean");
-    if (typeof key.public_key !== "string" || !key.public_key.trim()) {
-      throw new Error(`trust store key ${index} is missing public_key material`);
-    }
-    return {
-      key_id: key.key_id,
-      signer: key.signer,
-      revoked: key.revoked,
-      public_key: key.public_key,
-    };
-  });
-  return { keys };
-}
-
 export class GitCommandError extends Error {
   readonly args: readonly string[];
   readonly exitCode: number;
@@ -334,31 +187,6 @@ export const NOTES_TXN_REF_PREFIX = "refs/notes/reveries-txn/";
  * Where a fetched-but-unpromoted candidate is preserved (RVR-001 quarantine, and
  * the RVR-017 role check). The shape is unchanged from RVR-001 so existing
  * resolver tooling finds an import or mirror quarantine where it already looks.
- */
-export const QUARANTINE_REF_PREFIX = "refs/reveries/quarantine/";
-
-/** One preserved, unpromoted notes candidate, as reported by the repository. */
-export interface QuarantinedCandidate {
-  /** The canonical quarantine ref. Never a `refs/notes/` name. */
-  readonly ref: string;
-  /** The remote whose fetch produced the candidate, slashes included. */
-  readonly remote: string;
-  /** The notes commit the ref points at, and the thing to read the bytes from. */
-  readonly candidate: ObjectId;
-  /** Committer-date of the quarantine ref, or null when Git reports none. */
-  readonly createdAtUnix: number | null;
-}
-
-/**
- * The configured remote a remote-tracking revision belongs to, or null when it
- * names none.
- *
- * Remote names may contain slashes (`team/vendor`), so the first path segment
- * is NOT the answer: `refs/remotes/team/vendor/reveries-ledger` belongs to
- * `team/vendor`, not to `team`. Resolution is by longest exact
- * `refs/remotes/<name>/` prefix over the configured remote names. A first-
- * segment match would apply one remote's role to another remote's evidence —
- * refusing evidence nobody gated, or promoting evidence as the wrong primary.
  */
 export function matchTrackingRefRemote(
   revision: string | undefined,
@@ -449,13 +277,6 @@ export type TreeEntry =
 export const RETENTION_MESSAGE = "Reveries retention checkpoint\n";
 
 /** One immediate entry of a ledger checkpoint tree. */
-export type LedgerTreeEntry = {
-  readonly path: string;
-  readonly object: ObjectId;
-  readonly mode: string;
-  readonly kind: string;
-};
-
 export interface RetentionSubject {
   readonly object: ObjectId;
   readonly type: "blob" | "tree" | "commit" | "tag";
@@ -472,13 +293,6 @@ interface GitStateFileSnapshot {
   readonly name: string;
   readonly path: string;
   readonly contents: Buffer | null;
-}
-
-export class SnapshotIndexCorruptError extends Error {
-  constructor(readonly tip: string) {
-    super(`Reveries snapshot index for ${tip} is corrupt and must be rebuilt`);
-    this.name = "SnapshotIndexCorruptError";
-  }
 }
 
 export interface BatchReadOptions {
@@ -595,13 +409,6 @@ export class GitRepository {
   }
 
   /** Open a repository from a receive hook without assuming a worktree exists. */
-  static async openBare(cwd: string): Promise<GitRepository> {
-    const gitDirectory = (await runGit(cwd, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
-    const commonOutput = (await runGit(cwd, ["rev-parse", "--git-common-dir"])).stdout.trim();
-    const commonDir = isAbsolute(commonOutput) ? commonOutput : resolve(cwd, commonOutput);
-    return new GitRepository(gitDirectory, commonDir, cwd);
-  }
-
   async run(args: readonly string[], options: RunOptions = {}): Promise<GitResult> {
     return runGit(this.commandCwd, args, this.suppressLazyFetch(options));
   }
@@ -787,27 +594,6 @@ export class GitRepository {
    * pre-final-commit (squash / merge-queue) transition validation. The
    * given parent order is the merge order callers must record.
    */
-  async mergeCandidateTree(parents: readonly string[], mergeBase?: string): Promise<ObjectId> {
-    if (parents.length < 2) {
-      throw new Error("A merge candidate needs at least two parents");
-    }
-    for (const parent of parents) {
-      if (parent.length === 0 || parent.includes("\0")) {
-        throw new Error("A merge parent must be nonempty and cannot contain NUL");
-      }
-    }
-    const args = ["merge-tree", "--write-tree"];
-    if (mergeBase !== undefined) {
-      if (mergeBase.length === 0 || mergeBase.includes("\0")) {
-        throw new Error("A merge base must be nonempty and cannot contain NUL");
-      }
-      args.push("--merge-base", mergeBase);
-    }
-    args.push("--", ...parents);
-    return parseObjectId((await this.run(args)).stdout, "git merge-tree");
-  }
-
-  /** True when the object exists locally and is itself a tree. */
   async treeExists(object: ObjectId): Promise<boolean> {
     const result = await this.run(["cat-file", "-t", object], { allowExitCodes: [0, 1, 128] });
     return result.exitCode === 0 && result.stdout.trim() === "tree";
@@ -834,26 +620,6 @@ export class GitRepository {
     return result.exitCode === 0 ? result.stdout : null;
   }
 
-  async readNoteAt(revision: ObjectId, object: ObjectId): Promise<string | null> {
-    for (const path of [object, `${object.slice(0, 2)}/${object.slice(2)}`]) {
-      const result = await this.run(["show", `${revision}:${path}`], { allowExitCodes: [0, 1, 128] });
-      if (result.exitCode === 0) return result.stdout;
-    }
-    return null;
-  }
-
-  /**
-   * Report every object type and size with one `cat-file --batch-check`
-   * process. Missing objects map to null; the caller decides whether that is
-   * an error.
-   *
-   * A suppressed handle (`withoutLazyFetch`) cannot use the batch fast path:
-   * one unfetched promisor object aborts the whole batch with a fatal exit
-   * instead of a per-object `missing` line. Suppressed reads therefore probe
-   * objects individually (in parallel), mapping any failure to null. Call
-   * `missingObjects` on a suppressed handle when the goal is assessment:
-   * probing through a live handle would lazily fetch what it measures.
-   */
   async batchObjectDetails(
     objects: readonly ObjectId[],
   ): Promise<ReadonlyMap<ObjectId, { readonly type: string; readonly size: number } | null>> {
@@ -919,12 +685,6 @@ export class GitRepository {
     return new Map([...details].map(([object, detail]) => [object, detail === null ? null : detail.size] as const));
   }
 
-  /**
-   * Read every note body with one size pass and one body pass, no matter how
-   * many notes the snapshot holds. Note blobs over budget throw
-   * `LimitExceededError` before any body is loaded. The result maps each
-   * annotated object to its note body (null when the note blob is missing).
-   */
   async readNotesBatch(
     entries: readonly NoteListEntry[],
     options: BatchReadOptions = {},
@@ -1087,40 +847,6 @@ export class GitRepository {
   }
 
   /** Disposable snapshot-index directory; the index is a cache, never authority. */
-  snapshotIndexDirectory(): string {
-    return join(this.commonDir, "reveries", "snapshot-index");
-  }
-
-  snapshotIndexPath(notesTip: ObjectId | string): string {
-    const tip = String(notesTip);
-    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(tip)) {
-      throw new Error(`Invalid snapshot index tip: ${tip}`);
-    }
-    return join(this.snapshotIndexDirectory(), `${tip}.json`);
-  }
-
-  async readSnapshotIndex(notesTip: ObjectId | string): Promise<string | null> {
-    try {
-      return await readFile(this.snapshotIndexPath(notesTip), "utf8");
-    } catch (error: unknown) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-      throw error;
-    }
-  }
-
-  async writeSnapshotIndex(notesTip: ObjectId | string, payload: string): Promise<void> {
-    await mkdir(this.snapshotIndexDirectory(), { recursive: true });
-    await writeFile(this.snapshotIndexPath(notesTip), payload, "utf8");
-  }
-
-  async clearSnapshotIndex(notesTip?: ObjectId | string): Promise<void> {
-    if (notesTip === undefined) {
-      await rm(this.snapshotIndexDirectory(), { recursive: true, force: true });
-      return;
-    }
-    await rm(this.snapshotIndexPath(notesTip), { force: true });
-  }
-
   async notesTip(ref = NOTES_REF): Promise<ObjectId | null> {
     const result = await this.run(["rev-parse", "--verify", ref], { allowExitCodes: [0, 128] });
     return result.exitCode === 0 ? parseObjectId(result.stdout, `git rev-parse ${ref}`) : null;
@@ -1157,12 +883,6 @@ export class GitRepository {
           object: parseObjectId(objectValue, "git notes list object"),
         };
       });
-  }
-
-  async listNotesAt(revision: ObjectId): Promise<readonly NoteListEntry[]> {
-    return (await this.listTree(revision))
-      .filter((entry) => entry.type === "blob")
-      .map((entry) => ({ note: entry.object, object: notesSubjectFromPath(entry.path) }));
   }
 
   async listTree(revision = "HEAD"): Promise<readonly TreeEntry[]> {
@@ -1331,101 +1051,6 @@ export class GitRepository {
     return this.blobIsDurable(blobId(object));
   }
 
-  async commitWithNote(input: {
-    readonly message: string;
-    readonly note: string;
-    readonly validateNotesRef: NotesRefValidator;
-  }): Promise<CommitId> {
-    if (input.message.trim().length === 0) throw new Error("Commit message must be nonempty");
-
-    // Lock-free: the ref-transaction below is the publication guard, so a
-    // killed process leaves only a disposable temp ref, an orphan commit
-    // object, and a message file — never a repository-wide blockage.
-    const branchRef = await this.currentBranchRef();
-    const branchTip = await this.refTip(branchRef);
-    const notesTip = await this.notesTip();
-    const mergeHead = await this.readGitStateFile("MERGE_HEAD");
-    const mergeState = mergeHead.contents === null
-      ? []
-      : [mergeHead, await this.readGitStateFile("MERGE_MSG"), await this.readGitStateFile("MERGE_MODE")];
-    const temporaryRef = `${NOTES_TXN_REF_PREFIX}${process.pid}-${randomUUID()}`;
-    // The message file lives beside the retired lock directory, never inside
-    // it, so a stale lock dir is not a dependency of this path.
-    const messageDir = join(this.commonDir, "reveries", "tmp");
-    const messagePath = join(messageDir, `commit-message-${process.pid}-${randomUUID()}.txt`);
-    let commit: CommitId;
-    try {
-      if (notesTip !== null) await this.run(["update-ref", temporaryRef, notesTip]);
-      await mkdir(messageDir, { recursive: true });
-      await writeFile(messagePath, `${input.message.replace(/\n*$/, "")}\n`, { encoding: "utf8", flag: "wx" });
-      await this.run(["hook", "run", "--ignore-missing", "pre-commit"]);
-      await this.run([
-        "hook",
-        "run",
-        "--ignore-missing",
-        "prepare-commit-msg",
-        "--",
-        messagePath,
-        "message",
-      ]);
-      await this.run(["hook", "run", "--ignore-missing", "commit-msg", "--", messagePath]);
-      const tree = parseObjectId((await this.run(["write-tree"])).stdout, "git write-tree");
-      const parents = this.commitParents(branchTip, mergeHead.contents);
-      const message = await readFile(messagePath, "utf8");
-      if (message.trim().length === 0) throw new Error("Commit message hook produced an empty message");
-      const signing = await this.run(["config", "--bool", "--get", "commit.gpgSign"], {
-        allowExitCodes: [0, 1],
-      });
-      const argumentsList = ["commit-tree", tree];
-      for (const parent of parents) argumentsList.push("-p", parent);
-      if (signing.stdout.trim() === "true") argumentsList.push("-S");
-      argumentsList.push("-F", "-");
-      const newCommit = commitId(parseObjectId(
-        (await this.run(argumentsList, { input: message })).stdout,
-        "git commit-tree",
-      ));
-
-      const notes = new TemporaryNotesTransaction(this, temporaryRef);
-      await notes.append(newCommit, input.note);
-      const newNotesTip = await this.notesTip(temporaryRef);
-      if (newNotesTip === null) throw new Error("Prepared Reveries notes transaction has no tip");
-      await input.validateNotesRef(temporaryRef);
-      const currentHead = await this.run(["symbolic-ref", "--quiet", "HEAD"], { allowExitCodes: [0, 1] });
-      if (currentHead.exitCode !== 0 || currentHead.stdout.trim() !== branchRef) {
-        throw new Error("The current branch changed concurrently during commit preparation");
-      }
-
-      await this.updateRefsAtomically([
-        { ref: branchRef, next: newCommit, expected: branchTip },
-        { ref: NOTES_REF, next: newNotesTip, expected: notesTip },
-      ]);
-      await this.clearMergeState(mergeState);
-      commit = newCommit;
-    } finally {
-      await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
-      await rm(messagePath, { force: true });
-    }
-    try {
-      await this.run(["hook", "run", "--ignore-missing", "post-commit"]);
-    } catch {
-      // A post-commit hook cannot undo a commit after its refs have been published.
-    }
-    return commit;
-  }
-
-  /**
-   * Lock-free notes mutation. Each attempt reads the canonical tip, builds
-   * and validates the mutation on a unique private ref, then publishes with
-   * an expected-old-OID compare-and-swap. On contention the pure `operation`
-   * replays against the new tip after bounded backoff; when retries exhaust,
-   * a `NotesContentionError` reports explicit bounded contention — never
-   * silent loss. A killed process leaves only a disposable temp ref and
-   * orphan objects, never a write blockage.
-   *
-   * Replay contract: `operation` must be pure — every read through
-   * `notes.read`, no consumed iterators or single-use state captured outside
-   * the closure — because it may run more than once per call.
-   */
   async withNotesWrite<T>(
     operation: (notes: NotesTransaction) => Promise<T>,
     validate: NotesRefValidator = async () => undefined,
@@ -1485,66 +1110,6 @@ export class GitRepository {
    * current notes history. The private candidate ref is removed on every exit;
    * callers publish the returned commit with a separate compare-and-swap.
    */
-  async createNotesSnapshotFromEmpty(
-    notes: readonly { readonly subject: ObjectId; readonly body: string }[],
-    validate: NotesRefValidator,
-  ): Promise<ObjectId> {
-    const temporaryRef = `${NOTES_TXN_REF_PREFIX}hard-redaction-${process.pid}-${randomUUID()}`;
-    try {
-      const transaction = new TemporaryNotesTransaction(this, temporaryRef);
-      const seen = new Set<ObjectId>();
-      for (const note of notes) {
-        if (seen.has(note.subject)) throw new Error(`Duplicate subject in rewritten notes snapshot: ${note.subject}`);
-        seen.add(note.subject);
-        if (note.body.length === 0) continue;
-        await transaction.replace(note.subject, note.body);
-      }
-      const candidate = await this.notesTip(temporaryRef);
-      if (candidate === null) throw new Error("A rewritten notes snapshot must contain at least one note");
-      await validate(temporaryRef);
-      return candidate;
-    } finally {
-      await this.run(["update-ref", "-d", temporaryRef], { allowExitCodes: [0, 1, 128] });
-    }
-  }
-
-  /**
-   * Publish a hard-redaction snapshot and sever the local copies it supersedes.
-   *
-   * The transaction replaces the canonical notes and ledger refs, deletes the
-   * local retention refs, and deletes the remote-tracking and quarantine refs
-   * that still point at the removed history. It moves refs only: objects
-   * already fetched into a clone, a bundle, or a mirror stay there, so a caller
-   * must never report this as proof of erasure.
-   */
-  async replaceEvidenceRefsAfterHardRedaction(input: {
-    readonly notesCommit: ObjectId;
-    readonly ledgerCheckpoint: ObjectId;
-    readonly expectedNotes: ObjectId | null;
-    readonly expectedLedger: ObjectId | null;
-    readonly expectedRetention: ObjectId | null;
-    readonly obsoleteRefs: readonly { readonly ref: string; readonly expected: ObjectId }[];
-  }): Promise<void> {
-    const updates: { ref: string; next: ObjectId | null; expected: ObjectId | null }[] = [
-      { ref: NOTES_REF, next: input.notesCommit, expected: input.expectedNotes },
-      { ref: LEDGER_REF, next: input.ledgerCheckpoint, expected: input.expectedLedger },
-      { ref: RETENTION_REF, next: null, expected: input.expectedRetention },
-    ];
-    const allowedObsoleteRef = (ref: string): boolean =>
-      (ref.startsWith("refs/notes/remotes/") && ref.endsWith("/reveries"))
-      || (/^refs\/remotes\/.+\/reveries-ledger$/.test(ref))
-      || ref.startsWith("refs/reveries/quarantine/");
-    const names = new Set(updates.map(({ ref }) => ref));
-    for (const obsolete of input.obsoleteRefs) {
-      if (!allowedObsoleteRef(obsolete.ref)) throw new Error(`Ref is not a known disposable Reveries copy: ${obsolete.ref}`);
-      if (names.has(obsolete.ref)) throw new Error(`Duplicate ref in hard-redaction transaction: ${obsolete.ref}`);
-      names.add(obsolete.ref);
-      updates.push({ ref: obsolete.ref, next: null, expected: obsolete.expected });
-    }
-    await this.updateRefsAtomically(updates);
-  }
-
-  /** Every live transaction ref under the disposable `reveries-txn` namespace. */
   async listTemporaryNotesRefs(): Promise<readonly TemporaryNotesRef[]> {
     const result = await this.run(
       ["for-each-ref", "--format=%(refname)%00%(creatordate:unix)", NOTES_TXN_REF_PREFIX],
@@ -1652,205 +1217,11 @@ export class GitRepository {
    * branch fetch leaves it, so callers verifying a transported envelope pass
    * that ref explicitly.
    */
-  async ledgerTip(ref: string = LEDGER_REF): Promise<ObjectId | null> {
-    return this.notesTip(ref);
-  }
-
-  /** The OID of a path inside a tree, or null when the path is absent. */
-  async treeEntryAt(tree: ObjectId, path: string): Promise<ObjectId | null> {
-    const result = await this.run(["rev-parse", "--verify", `${tree}:${path}`], { allowExitCodes: [0, 1, 128] });
-    return result.exitCode === 0 ? parseObjectId(result.stdout.trim(), `git rev-parse ${tree}:${path}`) : null;
-  }
-
-  /** The immediate entries of a ledger checkpoint tree. */
-  async ledgerTreeEntries(checkpoint: ObjectId): Promise<readonly LedgerTreeEntry[]> {
-    const tree = await this.treeForCommit(checkpoint);
-    const result = await this.run(["ls-tree", "-z", tree]);
-    return result.stdout.split("\0").filter((record) => record.length > 0).map((record) => {
-      const separator = record.indexOf("\t");
-      if (separator < 0) throw new Error("Malformed git ls-tree record");
-      const [mode, type, objectValue] = record.slice(0, separator).split(" ");
-      if (mode === undefined || type === undefined || objectValue === undefined) {
-        throw new Error("Malformed git ls-tree metadata");
-      }
-      return {
-        path: record.slice(separator + 1),
-        object: parseObjectId(objectValue, "git ls-tree"),
-        mode,
-        kind: type,
-      };
-    });
-  }
-
-  /** The notes tree grafted at the ledger `notes` entry. */
-  async notesTreeAt(checkpoint: ObjectId): Promise<ObjectId> {
-    const tree = await this.treeForCommit(checkpoint);
-    const notes = await this.treeEntryAt(tree, LEDGER_NOTES_PATH);
-    if (notes === null) throw new Error(`Ledger checkpoint ${checkpoint} has no ${LEDGER_NOTES_PATH} subtree`);
-    return notes;
-  }
-
-  /** The canonical manifest bytes stored by a ledger checkpoint. */
-  async readLedgerManifestAt(checkpoint: ObjectId): Promise<string | null> {
-    const tree = await this.treeForCommit(checkpoint);
-    const manifest = await this.treeEntryAt(tree, LEDGER_MANIFEST_PATH);
-    return manifest === null ? null : this.readBlobAt(manifest);
-  }
-
-  /**
-   * The canonical signature lines a checkpoint carries, or null when the
-   * checkpoint predates signing. RVR-005 checkpoints have no `signatures`
-   * entry, so absence is a normal unsigned state and not damage.
-   */
-  async readLedgerSignaturesAt(checkpoint: ObjectId): Promise<string | null> {
-    const tree = await this.treeForCommit(checkpoint);
-    const signatures = await this.treeEntryAt(tree, LEDGER_SIGNATURES_PATH);
-    return signatures === null ? null : this.readBlobAt(signatures);
-  }
-
   async readBlobAt(object: ObjectId): Promise<string> {
     return (await this.runBinary(["cat-file", "blob", object])).toString("utf8");
   }
 
   /** The ordered parents of a ledger checkpoint: previous ledger, notes, retention. */
-  async ledgerParents(checkpoint: ObjectId): Promise<readonly ObjectId[]> {
-    const result = await this.run(["show", "-s", "--format=%P", checkpoint], { allowExitCodes: [0, 1, 128] });
-    if (result.exitCode !== 0) throw new Error(`Ledger checkpoint ${checkpoint} is not a commit`);
-    return result.stdout.trim().split(" ").filter((parent) => parent.length > 0).map((parent) => objectId(parent));
-  }
-
-  /** True when the object is a commit carrying the fixed ledger checkpoint message. */
-  async isLedgerCheckpoint(commit: string): Promise<boolean> {
-    if (!isObjectId(commit)) return false;
-    const result = await this.run(["show", "-s", "--format=%s", commit], { allowExitCodes: [0, 1, 128] });
-    return result.exitCode === 0 && result.stdout.trim() === LEDGER_MESSAGE.trimEnd();
-  }
-
-  /**
-   * Build a ledger checkpoint commit without moving any ref. The tree is the
-   * canonical manifest blob plus the exact notes tree grafted at `notes`, and
-   * the parents are the previous ledger, the notes commit, and the optional
-   * retention checkpoint, in that fixed order.
-   */
-  async commitLedgerCheckpoint(input: {
-    readonly manifest: LedgerManifest;
-    /** Overrides the manifest's own parent claims; used to detect a mismatch before writing. */
-    readonly previousLedger?: ObjectId | null;
-    readonly notesCommit?: ObjectId | null;
-    readonly retentionCommit?: ObjectId | null;
-    /**
-     * Canonical signature lines over `ledgerManifestPayload(manifest)`. When
-     * present the checkpoint gains a `signatures` tree entry; RVR-005 unsigned
-     * checkpoints keep the two-entry envelope.
-     */
-    readonly signatures?: string;
-  }): Promise<ObjectId> {
-    const manifest = input.manifest;
-    const previousLedger = input.previousLedger !== undefined ? input.previousLedger : manifest.previous_ledger;
-    const notesCommit = input.notesCommit !== undefined ? input.notesCommit : manifest.notes_commit;
-    const retentionCommit = input.retentionCommit !== undefined ? input.retentionCommit : manifest.retention_commit;
-    // The manifest is the authority on the parent roles, so a caller that
-    // disagrees with it must fail here rather than write an envelope whose own
-    // description contradicts its parents.
-    if (previousLedger !== manifest.previous_ledger) {
-      throw new Error(`Ledger parent mismatch: manifest names previous_ledger ${manifest.previous_ledger}, got ${previousLedger}`);
-    }
-    if (notesCommit !== manifest.notes_commit) {
-      throw new Error(`Ledger parent mismatch: manifest names notes_commit ${manifest.notes_commit}, got ${notesCommit}`);
-    }
-    if (retentionCommit !== manifest.retention_commit) {
-      throw new Error(`Ledger parent mismatch: manifest names retention_commit ${manifest.retention_commit}, got ${retentionCommit}`);
-    }
-
-    const manifestBlob = await this.writeBlob(canonicalLedgerManifest(manifest));
-    const notesTree = notesCommit === null
-      ? await this.emptyTreeObjectId()
-      : await this.treeForCommit(notesCommit);
-    if (manifest.notes_tree !== null && manifest.notes_tree !== notesTree) {
-      throw new Error(
-        `Ledger subtree mismatch: manifest names notes_tree ${manifest.notes_tree}, notes commit ${notesCommit} has ${notesTree}`,
-      );
-    }
-    // Grafting the existing notes tree by OID keeps the envelope free of copied
-    // note blobs and makes the tree entry comparable to the manifest field.
-    // The signature entry is written last so the tree stays byte-reproducible
-    // for a given manifest and signature set.
-    const entries = [
-      `100644 blob ${manifestBlob}\t${LEDGER_MANIFEST_PATH}`,
-      `040000 tree ${notesTree}\t${LEDGER_NOTES_PATH}`,
-    ];
-    if (input.signatures !== undefined && input.signatures.length > 0) {
-      entries.push(`100644 blob ${await this.writeBlob(input.signatures)}\t${LEDGER_SIGNATURES_PATH}`);
-    }
-    const tree = parseObjectId((await this.run([
-      "mktree",
-    ], {
-      input: [...entries, ""].join("\n"),
-    })).stdout, "git mktree");
-
-    const argumentsList = ["commit-tree", tree];
-    for (const parent of [previousLedger, notesCommit, retentionCommit]) {
-      if (parent !== null) argumentsList.push("-p", parent);
-    }
-    argumentsList.push("-F", "-");
-    return parseObjectId(
-      (await this.run(argumentsList, { input: LEDGER_MESSAGE, environment: { ...LEDGER_IDENTITY } })).stdout,
-      "git commit-tree",
-    );
-  }
-
-  /**
-   * Move the ledger branch with an expected-old-OID compare-and-swap. The
-   * previous ledger is always the first parent, so this single guard makes a
-   * ledger update fast-forward or nothing.
-   */
-  async updateLedgerRef(update: {
-    readonly next: ObjectId;
-    readonly expected?: ObjectId | null;
-  }): Promise<void> {
-    try {
-      await this.updateRefsAtomically([
-        { ref: LEDGER_REF, next: update.next, expected: update.expected ?? null },
-      ]);
-    } catch (error: unknown) {
-      throw new Error(`The Reveries ledger ${LEDGER_REF} changed concurrently`, { cause: error });
-    }
-  }
-
-  /**
-   * Every canonical note line carried by a checkpoint's grafted notes tree,
-   * keyed by annotated subject. Reading through the commit keeps this
-   * layout-agnostic: Git uses a flat notes tree below 256 notes and a fanout
-   * tree above.
-   */
-  async ledgerNotesLines(checkpoint: ObjectId): Promise<Map<ObjectId, readonly string[]>> {
-    const result = await this.run(["ls-tree", "-r", "-z", `${checkpoint}:${LEDGER_NOTES_PATH}`], {
-      allowExitCodes: [0, 1, 128],
-    });
-    const subjects = new Map<ObjectId, readonly string[]>();
-    if (result.exitCode !== 0) return subjects;
-    for (const record of result.stdout.split("\0").filter((entry) => entry.length > 0)) {
-      const separator = record.indexOf("\t");
-      if (separator < 0) throw new Error("Malformed git ls-tree record");
-      const object = parseObjectId(record.slice(0, separator).split(" ")[2] ?? "", "git ls-tree");
-      const subject = notesSubjectFromPath(record.slice(separator + 1));
-      const body = await this.readBlobAt(object);
-      subjects.set(subject, body.split("\n").filter((line) => line.length > 0));
-    }
-    return subjects;
-  }
-
-  async emptyTreeObjectId(): Promise<ObjectId> {
-    return parseObjectId((await this.run(["mktree"], { input: "" })).stdout.trim(), "git mktree");
-  }
-
-  /**
-   * Build the retention fanout tree for blob and tree subjects.
-   *
-   * The tree is a pure function of the subject set: each object ID is placed
-   * under a two-character prefix directory in sorted order, so the same
-   * evidence always produces the same tree object.
-   */
   async writeRetentionObjects(subjects: readonly RetentionSubject[]): Promise<ObjectId> {
     const unique = new Map<string, RetentionSubject["type"]>();
     for (const subject of subjects) {
@@ -2043,99 +1414,12 @@ export class GitRepository {
    * had to pass. A quarantined candidate is therefore evidence held outside the
    * canonical ref, never evidence silently merged into it.
    */
-  async quarantineFetchedNotes(
-    remote: string,
-    validate: NotesRefValidator = async () => undefined,
-    onValidationFailure?: NotesValidationFailure,
-  ): Promise<string> {
-    let quarantineRef: string | null = null;
-    await this.mergeFetchedNotes(remote, validate, onValidationFailure, {
-      promote: false,
-      onCandidate: async (candidate) => {
-        quarantineRef = await this.quarantineNotes(remote, candidate);
-      },
-    });
-    if (quarantineRef === null) {
-      throw new Error(`Fetched notes for ${remote} produced no candidate to quarantine`);
-    }
-    return quarantineRef;
-  }
-
-  async quarantineNotes(remote: string, candidate: ObjectId): Promise<string> {
-    const ref = `${QUARANTINE_REF_PREFIX}${remote}/${candidate}`;
-    await this.run(["update-ref", ref, candidate]);
-    return ref;
-  }
-
-  /**
-   * Every quarantined candidate, newest first, with the remote it came from.
-   *
-   * This is the supported way to find a quarantine, and it exists because the
-   * obvious alternative is a silent false negative. `git notes --ref=` does not
-   * accept a ref outside `refs/notes/`: given
-   * `refs/reveries/quarantine/<remote>/<oid>` it resolves
-   * `refs/notes/refs/reveries/quarantine/...` instead, so the command reports
-   * "no note found" for a candidate that is sitting right there. Write and read
-   * then agree in the wrong direction, and an operator inspecting a quarantine
-   * during an incident concludes there is nothing to inspect.
-   *
-   * The remote is recovered from the ref rather than trusted from a caller,
-   * because the ref is the record. A remote name may contain slashes
-   * (`team/vendor`), so the remote is everything between the prefix and the
-   * trailing object ID — a first-segment split would report `team` for a
-   * candidate fetched from `team/vendor`.
-   */
-  async quarantinedCandidates(): Promise<readonly QuarantinedCandidate[]> {
-    const result = await this.run(
-      ["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname) %(committerdate:unix)", QUARANTINE_REF_PREFIX],
-      { allowExitCodes: [0, 1] },
-    );
-    const candidates: QuarantinedCandidate[] = [];
-    for (const line of result.stdout.split("\n")) {
-      if (line.trim().length === 0) continue;
-      const parts = line.split(" ");
-      const ref = parts[0];
-      const candidate = parts[1];
-      if (ref === undefined || candidate === undefined) continue;
-      const scope = ref.slice(QUARANTINE_REF_PREFIX.length);
-      const remote = scope.slice(0, Math.max(0, scope.length - candidate.length - 1));
-      candidates.push({
-        ref,
-        remote,
-        candidate: objectId(candidate),
-        createdAtUnix: parts[2] === undefined || parts[2] === "" ? null : Number(parts[2]),
-      });
-    }
-    return candidates;
-  }
-
-  /**
-   * Publish the code branch, the notes ref, and the ledger envelope in one
-   * `git push --atomic` transaction. Atomicity is all-or-nothing across every
-   * ref in the transaction: if any ref is rejected, none of them advances.
-   *
-   * Each pushed ref carries its own `--force-with-lease=<ref>:<expected>` guard
-   * (the zero OID when the remote ref is absent), so a concurrent remote advance
-   * fails the whole transaction instead of silently winning or losing. The
-   * capability probe runs the same refspec set as `--dry-run` first: a remote
-   * without atomic support fails closed with `AtomicPushUnavailableError`
-   * before any ref moves. There is no ordered-push fallback — falling back
-   * would let the branch and notes advance after the ledger is refused.
-   *
-   * The ledger refspec is included only when `includeLedger` is set, which the
-   * caller does exactly when a local ledger tip exists. A repository that never
-   * built a checkpoint has no envelope to publish, so the transaction is the
-   * branch plus the notes.
-   */
   async pushAtomically(remote: string, options: {
     /** The local branch ref HEAD is pushed to (enables the branch lease). */
     readonly branchRef?: string;
     /** Expected remote OIDs; absent (undefined) means the lease is omitted. */
     readonly expectedBranch?: ObjectId | null;
     readonly expectedNotes?: ObjectId | null;
-    readonly expectedLedger?: ObjectId | null;
-    /** Include `${LEDGER_REF}:${LEDGER_REF}` in the transaction. */
-    readonly includeLedger?: boolean;
     /**
      * Include `${NOTES_REF}:${NOTES_REF}` in the transaction. A repository that
      * has never written a note has no such ref, and "src refspec does not match
@@ -2144,12 +1428,10 @@ export class GitRepository {
      */
     readonly includeNotes?: boolean;
   } = {}): Promise<void> {
-    const includeLedger = options.includeLedger ?? false;
     const includeNotes = options.includeNotes ?? true;
     const branchSpec = options.branchRef === undefined ? "HEAD" : `HEAD:${options.branchRef}`;
     const refspecs = [branchSpec];
     if (includeNotes) refspecs.push(`${NOTES_REF}:${NOTES_REF}`);
-    if (includeLedger) refspecs.push(`${LEDGER_REF}:${LEDGER_REF}`);
     const leases: string[] = [];
     const format = await this.objectFormat();
     const absent = "0".repeat(format === "sha1" ? 40 : 64);
@@ -2158,7 +1440,6 @@ export class GitRepository {
     };
     if (options.branchRef !== undefined) leaseFor(options.branchRef, options.expectedBranch);
     if (includeNotes) leaseFor(NOTES_REF, options.expectedNotes);
-    if (includeLedger) leaseFor(LEDGER_REF, options.expectedLedger);
     const probe = [
       "push",
       "--atomic",

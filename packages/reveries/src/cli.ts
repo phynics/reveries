@@ -60,7 +60,7 @@ class EditorCancelledError extends Error {}
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
-const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue", "confidential-pointer"]);
+const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
 const VERSION = "1.0.2";
 const HELP = `reveries <command>
 

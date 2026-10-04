@@ -7,7 +7,6 @@ export {
   NotesContentionError,
   NotesLockError,
   NOTES_TXN_REF_PREFIX,
-  SnapshotIndexCorruptError,
 } from "./git.ts";
 export type {
   BatchReadOptions,

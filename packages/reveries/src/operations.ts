@@ -4,62 +4,24 @@ import { join } from "node:path";
 import {
   blobId,
   canonicalRecord,
-  classifySignature,
   commitId,
-  correctionPayload,
-  createAttestation,
-  createSignature,
-  createCorrection,
-  createLedgerManifest,
-  createLineage,
-  createOccurrence,
-  createRedaction,
-  createResolution,
-  createReverie,
-  createTransition,
   createEvidenceSnapshot,
-  LEDGER_REF,
+  createLineage,
+  createReverie,
   lineageId,
   lineagePayload,
   NOTES_REF,
   objectId,
-  occurrenceId,
-  occurrencePayload,
-  parseLedgerManifest,
   parseNote,
   projectActiveReveries,
-  readLedgerManifest,
-  redactionPayload,
-  recordFactId,
-  REMOTE_ROLE_CONFIG_PATTERN,
-  parseRemoteRoleConfigLines,
-  resolutionPayload,
-  resolveAuthorityRoles,
   resolveLimits,
-  rolePromotion,
-  rolePublishable,
-  roleSyncSource,
   semanticPayload,
-  SIGNATURE_DOMAIN_MANIFEST,
-  SIGNATURE_DOMAIN_RECORD,
-  SIGNATURE_ROLES,
-  signingPayload,
-  transitionId,
-  transitionPayload,
   validateNote,
   type ActiveProjection,
-  type AuthorityResolution,
-  type AuthorityState,
   type BlobId,
   type CommitId,
-  type CorrectionId,
-  type CorrectionInput,
-  type CorrectionRecord,
   type Diagnostic,
   type EvidenceSnapshot,
-  type FactTargetId,
-  type LedgerManifest,
-  ledgerManifestPayload,
   type LineageEndpoint,
   type LineageId,
   type LineageInput,
@@ -67,61 +29,26 @@ import {
   type LineageRecord,
   type NoteRecord,
   type ObjectId,
-  type OccurrenceCoordinate,
-  type OccurrenceId,
-  type OccurrenceInput,
-  type OccurrenceRecord,
-  type PublicationAttestation,
-  type RedactionId,
-  type RedactionInput,
-  type RedactionRecord,
   type RegionSubject,
-  type RemoteRole,
-  type ResolutionId,
-  type ResolutionInput,
-  type ResolutionRecord,
   type ResourceLimits,
   type ReverieId,
   type ReverieInput,
   type ReverieMetadata,
   type ReverieRecord,
-  type ReveriesInit,
-  type SessionSummary,
-  type SignatureId,
-  type SignatureRecord,
-  type SignatureRole,
-  type SignatureTrustReport,
-  type SigningPolicy,
   type Source,
   type SubjectId,
-  type SummaryEntry,
-  type TrustState,
-  type TransitionCausal,
-  type TransitionId,
-  type TransitionInput,
-  type TransitionMetadata,
-  type TransitionSummary,
-  type TrustStore,
-  reverieId,
 } from "./protocol.ts";
 import { suggestLineage, type LineageSuggestion } from "./lineage.ts";
 import {
   GitRepository,
   cloneEvidenceGrade,
   hashBlobContent,
-  LEDGER_MANIFEST_PATH,
-  LEDGER_NOTES_PATH,
-  LEDGER_SIGNATURES_PATH,
-  LEDGER_SIGNATURE_TIMESTAMP,
   matchTrackingRefRemote,
   RETENTION_REF,
-  SnapshotIndexCorruptError,
   type CompletenessGrade,
   type NoteListEntry,
   type NotesTransaction,
   type RetentionSubject,
-  type SignatureSigner,
-  type SignatureVerifier,
   type WithNotesWriteOptions,
 } from "./git.ts";
 
@@ -151,34 +78,12 @@ export interface RecordResult {
  * caller names a path and a revision; the coordinate is resolved here so the
  * stored record cannot claim a subject the repository does not have there.
  */
-export interface RecordOccurrenceInput {
-  readonly path: string;
-  readonly revision: "HEAD" | "index" | string;
-  readonly semantic: OccurrenceInput;
-  readonly metadata: ReverieMetadata;
-}
-
-export interface OccurrenceResult {
-  readonly object: ObjectId;
-  readonly record: OccurrenceRecord;
-  readonly occurrence: OccurrenceCoordinate;
-  /** Every current path of the same subject, for the disclosure in the CLI. */
-  readonly paths: readonly string[];
-}
-
-/**
- * A durable subject pairing (RVR-014). Endpoints are given as paths, never as
- * hand-typed object IDs: the subject at each path is resolved in the revision
- * the edge is bound to, so an edge cannot claim a pairing the repository does
- * not contain.
- */
 export interface RecordLineageInput {
   readonly kind: LineageKind;
   readonly parent: string;
   readonly commit: string;
   readonly from: readonly string[];
   readonly to: readonly string[];
-  readonly transition?: TransitionId | null;
   readonly semantic: {
     readonly driving_event: string;
     readonly decision: string;
@@ -227,55 +132,6 @@ export interface LinkResult {
  *   endpoint that is not part of it. Fail closed: a wrong pairing is worse
  *   than a missing one.
  */
-export type LineageAuthority = "authoritative" | "history" | "contradictory";
-
-export type LineageUse = {
-  readonly id: LineageId;
-  readonly authority: LineageAuthority;
-  readonly detail: string;
-};
-
-/** How a lineage edge was treated by one check, for evidence and for tests. */
-export interface LineageUseReport {
-  readonly used: readonly LineageUse[];
-  readonly historyOnly: readonly LineageId[];
-}
-
-/**
- * One remote-side action a hard redaction cannot perform itself (RVR-018).
- *
- * The local rewrite is the only part Reveries can carry out. A mirror, an
- * archive, and every independent clone are outside this repository's reach, so
- * the operation names the action it requires instead of reporting success it
- * cannot know about.
- */
-export interface HardRedactionRemoteAction {
-  readonly remote: string;
-  /** The declared role, or `unassigned` when configuration declares none. */
-  readonly role: RemoteRole | "unassigned";
-  /** Human-readable command an operator runs against that remote. */
-  readonly action: string;
-}
-
-export interface HardRedactionResult extends CheckResult {
-  readonly state: "redacted" | "unchanged" | "refused";
-  /** Fact IDs removed from the canonical notes snapshot. */
-  readonly removed: readonly FactTargetId[];
-  /** Subjects whose notes were rewritten because they carried a removed fact. */
-  readonly rewrittenSubjects: readonly ObjectId[];
-  readonly notesBefore: ObjectId | null;
-  readonly notesAfter: ObjectId | null;
-  readonly ledgerBefore: ObjectId | null;
-  /** New genesis ledger checkpoint over the sanitized snapshot, or null. */
-  readonly ledgerAfter: ObjectId | null;
-  /** Local refs deleted because they still pointed at the removed history. */
-  readonly severedRefs: readonly string[];
-  /** Mirror, archive, and remote-side follow-up this repository cannot perform. */
-  readonly remoteActions: readonly HardRedactionRemoteAction[];
-  /** Always stated: local completion is never proof of distributed deletion. */
-  readonly disclaimer: string;
-}
-
 export interface ShowInput {
   readonly target: string;
   readonly revision?: "HEAD" | "index" | string;
@@ -304,232 +160,16 @@ export interface CheckResult {
   readonly diagnostics: readonly string[];
 }
 
-export type SyncConflictType =
-  | "duplicate-session-summary"
-  | "multiple-initialization-boundaries"
-  | "secret-material"
-  | "invalid-source"
-  | "invalid-projection"
-  | "invalid-object-attachment"
-  | "invalid-record";
-
-export interface SyncConflictRecord {
-  readonly recordId: string | null;
-  readonly canonicalLine: string;
-  readonly origins: readonly [
-    "local" | "remote",
-    ...("local" | "remote")[],
-  ];
-}
-
-export type SyncResolutionAction =
-  | { readonly kind: "inspect-quarantine"; readonly ref: string }
-  | { readonly kind: "construct-replacement-candidate"; readonly sourceRef: string }
-  | { readonly kind: "retry-sync"; readonly remote: string };
-
-export interface SyncConflict {
-  readonly kind: "invalid-notes-union";
-  readonly conflictType: SyncConflictType;
-  readonly message: string;
-  readonly annotatedObject: ObjectId | null;
-  readonly records: readonly SyncConflictRecord[];
-  readonly provenance: {
-    readonly localNotes: ObjectId | null;
-    readonly remoteNotes: ObjectId;
-    readonly candidate: ObjectId;
-    readonly quarantineRef: string;
-  };
-  readonly resolutionActions: readonly SyncResolutionAction[];
-}
-
-export type SyncResult =
-  | {
-      readonly ok: true;
-      readonly diagnostics: readonly string[];
-      readonly state: "fetched" | "remote-notes-absent";
-      readonly conflicts: readonly [];
-      /**
-       * The ref a valid but unpromoted candidate was preserved at, or null when
-       * the sync promoted into canonical state (RVR-017).
-       */
-      readonly quarantineRef?: string | null;
-    }
-  | {
-      readonly ok: false;
-      readonly diagnostics: readonly string[];
-      readonly state: "fetched";
-      readonly conflicts: readonly SyncConflict[];
-      readonly quarantineRef?: string | null;
-    };
+export type SyncResult = {
+  readonly ok: boolean;
+  readonly diagnostics: readonly string[];
+  readonly state: "fetched" | "remote-notes-absent";
+};
 
 export interface DoctorResult extends CheckResult {
   readonly state: "healthy" | "damaged";
   readonly notices: readonly string[];
   readonly retention: RetentionStatus;
-}
-
-/**
- * How the ledger envelope relates to local state. The four states are
- * deliberately distinct so a healthy repository that simply has not published
- * its newest notes is never reported as damaged.
- */
-export type LedgerState = "absent" | "valid" | "stale" | "invalid";
-
-export interface LedgerStatus {
-  readonly state: LedgerState;
-  /** The ledger branch tip, or null when no checkpoint exists. */
-  readonly tip: ObjectId | null;
-  /** The notes commit the verified envelope transports. */
-  readonly notesCommit: ObjectId | null;
-  /** The current local notes tip, which may lead the envelope. */
-  readonly notesTip: ObjectId | null;
-  readonly previousLedger: ObjectId | null;
-  readonly retentionCommit: ObjectId | null;
-  readonly annotatedSubjects: number;
-  readonly diagnostics: readonly string[];
-}
-
-export interface LedgerCheckpointResult extends CheckResult {
-  readonly state: "created" | "unchanged" | "refused";
-  readonly checkpoint: ObjectId | null;
-  readonly previousLedger: ObjectId | null;
-  readonly notesTip: ObjectId | null;
-}
-
-export interface LedgerMaterializeResult extends CheckResult {
-  readonly state: "materialized" | "unchanged";
-  readonly notesTip: ObjectId | null;
-}
-
-/**
- * Signing material, all optional (RVR-009). A repository that never signs
- * configures nothing and every signature operation reports `unavailable`
- * rather than failing.
- */
-export interface SigningOptions {
-  /** Signs canonical payloads. Absent means this repository cannot sign. */
-  readonly signer?: SignatureSigner;
-  /** Verifies signatures. Absent means no signature can be trusted here. */
-  readonly verifier?: SignatureVerifier;
-  /** Public key material and revocation. Absent means every key is unknown. */
-  readonly trust?: TrustStore;
-  /**
-   * Roles a policy requires, normally from `reveries.signingRoles`. Absent or
-   * empty means no signature can reach `policy-satisfying`; `trusted` is the
-   * honest ceiling.
-   */
-  readonly requiredRoles?: readonly SignatureRole[];
-}
-
-export type TrustStateCounts = Readonly<Record<TrustState, number>>;
-
-export interface SignatureTrustEntry {
-  readonly id: string;
-  readonly target: string;
-  readonly subject: string;
-  readonly signer: string;
-  readonly keyId: string;
-  readonly role: SignatureRole;
-  readonly state: TrustState;
-  readonly diagnostics: readonly string[];
-}
-
-export interface SignRecordResult extends CheckResult {
-  readonly state: "signed" | "unavailable";
-  readonly record: SignatureRecord | null;
-}
-
-/**
- * How signing relates to local evidence (RVR-009). The states mirror
- * `LedgerState`: `absent` and `unknown` are ordinary and never damage, and
- * only `invalid` or `revoked` attestations are diagnostics. A repository that
- * has not adopted signing must never be reported as broken.
- */
-export interface SignatureStatus {
-  readonly state: "absent" | "unsigned" | "signed";
-  /** Count per trust state, so a reader sees all four required states. */
-  readonly counts: TrustStateCounts;
-  /** The ledger checkpoint tip, or null when no checkpoint exists. */
-  readonly checkpoint: ObjectId | null;
-  /** True when the checkpoint's manifest carries a verifying signature. */
-  readonly checkpointSigned: boolean;
-  /** Roles the current policy requires. */
-  readonly requiredRoles: readonly SignatureRole[];
-  readonly diagnostics: readonly string[];
-}
-
-export interface DoctorProtection {
-  readonly helper: "available" | "unavailable";
-  readonly local: "complete" | "partial" | "not-configured";
-  readonly receiveSide: "unknown";
-}
-
-/**
- * How authoritative publication is configured (RVR-017).
- *
- * The states mirror `LedgerState` and `SignatureStatus` on purpose: `absent`,
- * `inferred`, and `unconfigured` are all ordinary, so a repository that never
- * adopted roles, or that has a single publisher, is never reported as broken.
- * Only `invalid` means the configuration contradicts itself, and only it
- * contributes diagnostics.
- */
-export interface AuthorityStatus {
-  readonly state: AuthorityState;
-  /** The single authoritative remote, or null when none is determined. */
-  readonly primary: string | null;
-  /** Every declared role, keyed by remote name, for reporting. */
-  readonly roles: ReadonlyMap<string, RemoteRole>;
-  /** Why there is no primary, or which remote is authoritative. */
-  readonly notice: string;
-  readonly diagnostics: readonly string[];
-}
-
-/**
- * How one configured mirror relates to the primary checkpoint (RVR-017).
- *
- * A mirror is a replica, so the states are about agreement: `unavailable` means
- * the mirror's envelope has not been fetched and is a notice, `unsigned` means
- * the primary is unsigned so the stronger check could not run, and only
- * `divergent` and `authority-mismatch` are damage.
- */
-export type MirrorState = "matching" | "unavailable" | "unsigned" | "divergent" | "authority-mismatch";
-
-export interface MirrorStatus {
-  readonly remote: string;
-  readonly state: MirrorState;
-  /** The mirror's remote-tracking checkpoint, or null when it was never fetched. */
-  readonly checkpoint: ObjectId | null;
-  /** The trust state of the mirror's own manifest signature, when it has one. */
-  readonly signature: TrustState | null;
-  readonly diagnostics: readonly string[];
-}
-
-/**
- * What every hard-redaction result states about its own reach.
- *
- * The wording is fixed because it is the claim that matters: the local rewrite
- * is complete and auditable, and deletion everywhere else is still unproven.
- */
-export const HARD_REDACTION_DISCLAIMER =
-  "Local hard redaction removed the named facts from this repository's refs and retention paths. "
-  + "Independent clones, bundles, mirrors, archives, caches, and backups may still hold the bytes; "
-  + "deletion outside this repository is not guaranteed and must be requested and verified separately.";
-
-/** Stable UTF-8 byte ordering for ID and ref lists, matching the protocol rule. */
-function compareUtf8Ids(left: string, right: string): number {
-  return Buffer.from(left).compare(Buffer.from(right));
-}
-
-/**
- * Refs a hard redaction may delete because they hold a copy of the evidence:
- * fetched remote-tracking notes, fetched remote-tracking envelopes, and held
- * quarantine candidates. Ordinary remote-tracking *code* branches are excluded
- * because they are code, not evidence.
- */
-function isStaleEvidenceRef(ref: string): boolean {
-  return (ref.startsWith("refs/notes/remotes/") && ref.endsWith("/reveries"))
-    || /^refs\/remotes\/.+\/reveries-ledger$/.test(ref)
-    || ref.startsWith("refs/reveries/quarantine/");
 }
 
 export const RETENTION_POLICIES = ["none", "active", "all", "archive"] as const;
@@ -548,13 +188,6 @@ export interface RetentionStatus {
 
 export interface RetentionResult extends RetentionStatus {
   readonly changed: boolean;
-}
-
-export interface PushUpdate {
-  readonly localRef: string;
-  readonly localObject: ObjectId | null;
-  readonly remoteRef: string;
-  readonly remoteObject: ObjectId | null;
 }
 
 export interface SearchInput {
@@ -580,17 +213,6 @@ export interface SearchHit {
   readonly object: ObjectId;
   readonly record: NoteRecord;
   readonly paths: readonly string[];
-  /**
-   * The coordinate an occurrence record is about (RVR-014), so a hit is never
-   * read as "applies everywhere this content occurs".
-   */
-  readonly occurrence?: OccurrenceCoordinate;
-  /**
-   * False when the occurrence's own coordinate no longer holds this subject in
-   * the searched revision. The record is still reported — with its anchor —
-   * but it is historical evidence, not a claim about the current paths.
-   */
-  readonly applicable?: boolean;
 }
 
 /**
@@ -642,67 +264,6 @@ export interface HistoryEntry {
   readonly viaLineage?: LineageId;
 }
 
-export interface HostedSummaryInput {
-  readonly commit: string;
-  readonly sourceCommits: readonly string[];
-}
-
-export type HostedSummaryPlanState = "ready" | "already-summarized" | "unsummarizable";
-
-export interface HostedSummaryPlan {
-  readonly commit: CommitId;
-  readonly state: HostedSummaryPlanState;
-  readonly entries: readonly SummaryEntry[];
-  readonly diagnostics: readonly string[];
-}
-
-export interface AttachHostedSummaryInput {
-  readonly commit: string;
-  readonly summary: SessionSummary;
-}
-
-export type AttachHostedSummaryState = "attached" | "already-summarized";
-
-export interface AttachHostedSummaryResult {
-  readonly commit: CommitId;
-  readonly state: AttachHostedSummaryState;
-  readonly summary: SessionSummary;
-  readonly diagnostics: readonly string[];
-}
-
-/** Resolved tree pair behind a transition identity. */
-export interface TransitionTrees {
-  /** Ordered parent trees (`[]` for a root commit); order is significant. */
-  readonly parents: readonly ObjectId[];
-  readonly result: ObjectId;
-}
-
-export type TransitionCoverage = "transition" | "v1-summary" | "none";
-
-export interface TransitionCheckResult extends CheckResult {
-  readonly coverage: TransitionCoverage;
-  readonly transition: TransitionId | null;
-}
-
-export interface PublishNotesInput {
-  readonly remote: string;
-  readonly attempts?: number;
-}
-
-export interface PublishNotesResult {
-  readonly ok: boolean;
-  readonly attempts: number;
-  readonly remoteTip: ObjectId | null;
-  readonly diagnostics: readonly string[];
-}
-
-interface DiffTransition {
-  readonly from: ObjectId;
-  readonly to?: ObjectId;
-  readonly oldPath?: string;
-  readonly newPath?: string;
-}
-
 class NotesRefValidationError extends Error {
   constructor(
     readonly annotatedObject: ObjectId,
@@ -718,59 +279,6 @@ class NotesRefValidationError extends Error {
  * lineage edge or a retirement. Rather than inventing a transient green, the
  * diagnostic names the route that does close the obligation and the gates where
  * that evidence exists.
- */
-const STAGED_ROUTE_GUIDANCE = "Record this change, then record its lineage edge on that commit "
-  + "(reveries lineage record --parent <parent> --commit <commit> --from <path> --to <path>) together with "
-  + "a per-decision continuation, supersession, or causal retirement, and re-check the committed, "
-  + "outgoing, and receive gates.";
-
-function isFullObjectId(value: string): boolean {
-  return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
-}
-
-function noteLines(note: string | null): readonly string[] {
-  if (note === null) return [];
-  return note.endsWith("\n") ? note.slice(0, -1).split("\n") : note.split("\n");
-}
-
-function recordIdFromCanonicalLine(line: string): string | null {
-  try {
-    const value: unknown = JSON.parse(line);
-    if (typeof value !== "object" || value === null || !("id" in value)) return null;
-    return typeof value.id === "string" ? value.id : null;
-  } catch {
-    return null;
-  }
-}
-
-function recordOrigins(
-  canonicalLine: string,
-  localLines: ReadonlySet<string>,
-  remoteLines: ReadonlySet<string>,
-): SyncConflictRecord["origins"] {
-  const local = localLines.has(canonicalLine);
-  const remote = remoteLines.has(canonicalLine);
-  if (local && remote) return ["local", "remote"];
-  if (local) return ["local"];
-  if (remote) return ["remote"];
-  throw new Error("A candidate record has neither local nor remote provenance");
-}
-
-function syncConflictType(message: string): SyncConflictType {
-  if (/likely secret material/i.test(message)) return "secret-material";
-  if (/more than one session summary/i.test(message)) return "duplicate-session-summary";
-  if (/more than one Reveries initialization boundary/i.test(message)) {
-    return "multiple-initialization-boundaries";
-  }
-  if (/source|referenced reverie|path source/i.test(message)) return "invalid-source";
-  if (/supersession|conflicting duplicate/i.test(message)) return "invalid-projection";
-  if (/attached|protocol records cannot be attached/i.test(message)) return "invalid-object-attachment";
-  return "invalid-record";
-}
-
-/**
- * One Git-detected similarity candidate. Only the suggestion surface parses
- * these; the authoritative transition parser never sees a rename.
  */
 type SimilarityCandidate = {
   readonly from: { readonly path: string; readonly subject: SubjectId };
@@ -819,6 +327,10 @@ function zeroObject(value: string): boolean {
   return /^0+$/.test(value);
 }
 
+function isFullObjectId(value: string): boolean {
+  return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
+}
+
 /**
  * The path as a coordinate stores it: repository-relative and without a
  * leading `./`, so two spellings of one location cannot produce two
@@ -828,72 +340,19 @@ function normalizeCoordinatePath(path: string): string {
   return path.replace(/^\.\//, "");
 }
 
-export function coordinateKey(commit: string, path: string, subject: string): string {
-  return `${commit}\u0000${normalizeCoordinatePath(path)}\u0000${subject}`;
-}
-/**
- * How a coordinate relates to earlier ones, built from durable lineage edges:
- * one entry per edge endpoint, pointing back at the coordinates that edge says
- * this one came from.
- */
-export type OccurrenceDerivation = ReadonlyMap<
-  string,
-  readonly { readonly coordinate: OccurrenceCoordinate; readonly lineage: LineageId }[]
->;
+/** A path-and-object coordinate used only to walk lineage in `history`. */
+type HistoryCoordinate = {
+  readonly commit: CommitId;
+  readonly path: string;
+  readonly subject: ObjectId;
+};
 
-/**
- * The edges that derive `anchor` into `from`, walking backwards through
- * explicit lineage only. Empty means nothing derives it, which is the honest
- * answer for a path that only ever shared a blob: no edge, no applicability.
- *
- * Every edge on every path from `from` back to `anchor` is reported, so a
- * multi-hop chain names each link rather than only the farthest one.
- */
-export function deriveLineage(
-  derivation: OccurrenceDerivation,
-  from: OccurrenceCoordinate,
-  anchor: OccurrenceCoordinate,
-): readonly LineageId[] {
-  const target = coordinateKey(anchor.commit, anchor.path, anchor.subject);
-  const settled = new Map<string, boolean>();
-  const used = new Set<LineageId>();
-  const walk = (coordinate: OccurrenceCoordinate): boolean => {
-    const key = coordinateKey(coordinate.commit, coordinate.path, coordinate.subject);
-    if (key === target) return true;
-    const known = settled.get(key);
-    if (known !== undefined) return known;
-    settled.set(key, false);
-    let found = false;
-    for (const step of derivation.get(key) ?? []) {
-      if (walk(step.coordinate)) {
-        used.add(step.lineage);
-        found = true;
-      }
-    }
-    settled.set(key, found);
-    return found;
-  };
-  walk(from);
-  return [...used].sort();
+function coordinateKey(commit: string, path: string, subject: string): string {
+  return `${commit}\u0000${normalizeCoordinatePath(path)}\u0000${subject}`;
 }
 
 function allSources(record: NoteRecord): readonly Source[] {
-  if (record.type === "reverie") {
-    return record.sources;
-  }
-  if (record.type === "correction" || record.type === "resolution") {
-    return record.sources;
-  }
-  if (record.type === "transition-summary") {
-    return record.sources;
-  }
-  if (record.type === "occurrence" || record.type === "lineage") {
-    return record.sources;
-  }
-  if (record.type === "session-summary") {
-    return record.entries.flatMap((entry) => entry.sources);
-  }
-  return [];
+  return record.sources;
 }
 
 function recordAuthor(record: NoteRecord): string {
@@ -902,26 +361,6 @@ function recordAuthor(record: NoteRecord): string {
 
 function searchText(record: NoteRecord): string {
   return JSON.stringify(record).toLocaleLowerCase();
-}
-
-function emptySummary(): SessionSummary {
-  return {
-    v: 1,
-    type: "session-summary",
-    author_email: "continuity-check@localhost",
-    session: null,
-    created_at: "1970-01-01T00:00:00Z",
-    entries: [{
-      driving_event: "Staged continuity analysis.",
-      decision: "Analyze dispositions before commit.",
-      impact: "No commit summary exists yet.",
-      recurrence_control: null,
-      alternatives: [],
-      sources: [],
-      reveries: [],
-      retirements: [],
-    }],
-  };
 }
 
 export interface SnapshotNoteEntry {
@@ -959,12 +398,6 @@ export interface SnapshotLoadOptions {
   readonly limits?: Partial<ResourceLimits>;
 }
 
-interface SnapshotIndexPayload {
-  readonly v: 1;
-  readonly tip: string;
-  readonly bodies: readonly { readonly object: string; readonly body: string | null }[];
-}
-
 function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotView {
   return {
     tip: null,
@@ -976,35 +409,6 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     limits,
     stats: { notesListed: 0, notesRead: 0, bytesRead: 0, notesParsed: 0, indexHit: false },
   };
-}
-
-function parseSnapshotIndexPayload(raw: string, tip: ObjectId): SnapshotIndexPayload {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new SnapshotIndexCorruptError(tip);
-  }
-  if (
-    !parsed || typeof parsed !== "object" || Array.isArray(parsed)
-    || (parsed as { v?: unknown }).v !== 1
-    || (parsed as { tip?: unknown }).tip !== tip
-    || !Array.isArray((parsed as { bodies?: unknown }).bodies)
-  ) {
-    throw new SnapshotIndexCorruptError(tip);
-  }
-  const bodies = (parsed as SnapshotIndexPayload).bodies;
-  for (const entry of bodies) {
-    if (
-      !entry || typeof entry !== "object"
-      || typeof entry.object !== "string"
-      || (typeof entry.body !== "string" && entry.body !== null)
-    ) {
-      throw new SnapshotIndexCorruptError(tip);
-    }
-    objectId(entry.object);
-  }
-  return parsed as SnapshotIndexPayload;
 }
 
 export class Reveries {
@@ -1027,8 +431,6 @@ export class Reveries {
      * lock-free `withNotesWrite` compare-and-swap via `mutateNotes`.
      */
     private readonly liveRepository: GitRepository,
-    private readonly proposedNotesTip?: ObjectId,
-    private readonly signing: SigningOptions = {},
   ) {}
 
   /**
@@ -1046,9 +448,9 @@ export class Reveries {
     readonly edges: ReadonlyMap<CommitId, readonly LineageRecord[]>;
   } | null = null;
 
-  static async open(cwd: string, signing: SigningOptions = {}): Promise<Reveries> {
+  static async open(cwd: string): Promise<Reveries> {
     const repository = await GitRepository.open(cwd);
-    return new Reveries(repository.withoutLazyFetch(), repository, undefined, signing);
+    return new Reveries(repository.withoutLazyFetch(), repository);
   }
 
   async assessCompleteness(input: {
@@ -1451,7 +853,7 @@ export class Reveries {
     const log = await this.repository.run(["log", "--format=%H", "--", path]);
     const history: HistoryEntry[] = [];
     const seen = new Set<string>();
-    let latestOccurrence: OccurrenceCoordinate | null = null;
+    let latestOccurrence: HistoryCoordinate | null = null;
     for (const value of log.stdout.trim().split("\n").filter((line) => line.length > 0)) {
       const commit = commitId(value);
       try {
@@ -1513,7 +915,7 @@ export class Reveries {
    * is deterministic: commit descending, then path.
    */
   private async lineageHistory(
-    start: OccurrenceCoordinate,
+    start: HistoryCoordinate,
     seen: Set<string>,
   ): Promise<readonly HistoryEntry[]> {
     const view = await this.loadEvidenceSnapshot({});
@@ -1522,10 +924,10 @@ export class Reveries {
     const key = (commit: string, path: string, subject: string): string =>
       `${commit}\u0000${normalizeCoordinatePath(path)}\u0000${subject}`;
     const visited = new Set<string>([key(String(start.commit), start.path, String(start.subject))]);
-    const queue: OccurrenceCoordinate[] = [start];
-    const earlier: { coordinate: OccurrenceCoordinate; lineage: LineageId }[] = [];
+    const queue: HistoryCoordinate[] = [start];
+    const earlier: { coordinate: HistoryCoordinate; lineage: LineageId }[] = [];
     while (queue.length > 0) {
-      const coordinate = queue.shift() as OccurrenceCoordinate;
+      const coordinate = queue.shift() as HistoryCoordinate;
       for (const edge of edges) {
         const matches = edge.to.some((endpoint) =>
           endpoint.subject === coordinate.subject
@@ -1535,7 +937,7 @@ export class Reveries {
           const previous = key(String(edge.parent), endpoint.path, String(endpoint.subject));
           if (visited.has(previous)) continue;
           visited.add(previous);
-          const next: OccurrenceCoordinate = {
+          const next: HistoryCoordinate = {
             commit: edge.parent,
             path: normalizeCoordinatePath(endpoint.path),
             subject: endpoint.subject,
@@ -1801,8 +1203,6 @@ export class Reveries {
           if (!(await hasReverie(source.ref))) throw new Error(`Referenced reverie does not exist: ${source.ref}`);
         } else if (source.kind === "git-email") {
           if (!/^[^\s@]+@[^\s@]+$/.test(source.ref)) throw new Error(`Invalid Git email source: ${source.ref}`);
-        } else if (source.kind === "confidential-pointer") {
-          continue;
         } else if (!/^(?:github|gitlab|linear|jira|generic):\S+$/.test(source.ref)) {
           throw new Error(`Invalid issue source: ${source.ref}`);
         }
@@ -1917,7 +1317,7 @@ export class Reveries {
   async syncPull(remote: string): Promise<SyncResult> {
     const fetched = await this.liveRepository.fetchNotes(remote);
     if (fetched === "absent") {
-      return { ok: true, diagnostics: [], state: "remote-notes-absent", conflicts: [] };
+      return { ok: true, diagnostics: [], state: "remote-notes-absent" };
     }
     const remoteNotes = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
     if (remoteNotes === null) {
@@ -1925,7 +1325,6 @@ export class Reveries {
         ok: false,
         diagnostics: [`Fetched notes for ${remote} have no remote-tracking tip`],
         state: "fetched",
-        conflicts: [],
       };
     }
     try {
@@ -1935,10 +1334,9 @@ export class Reveries {
         ok: false,
         diagnostics: [error instanceof Error ? error.message : String(error)],
         state: "fetched",
-        conflicts: [],
       };
     }
-    return { ok: true, diagnostics: [], state: "fetched", conflicts: [] };
+    return { ok: true, diagnostics: [], state: "fetched" };
   }
 
   async push(remote: string): Promise<CheckResult> {
@@ -2283,15 +1681,11 @@ export class Reveries {
   }
 
   private async evidenceNotes(ref = "refs/notes/reveries"): Promise<readonly NoteListEntry[]> {
-    return this.proposedNotesTip !== undefined && ref === "refs/notes/reveries"
-      ? this.repository.listNotesAt(this.proposedNotesTip)
-      : this.repository.listNotes(ref);
+    return this.repository.listNotes(ref);
   }
 
   private async readEvidenceNote(object: ObjectId, ref = "refs/notes/reveries"): Promise<string | null> {
-    return this.proposedNotesTip !== undefined && ref === "refs/notes/reveries"
-      ? this.repository.readNoteAt(this.proposedNotesTip, object)
-      : this.repository.readNoteFromRef(ref, object);
+    return this.repository.readNoteFromRef(ref, object);
   }
 
   private async strictRead(object: ObjectId, ref = "refs/notes/reveries"): Promise<{
@@ -2305,34 +1699,6 @@ export class Reveries {
     const parsed = parseNote(note, "strict", { verifyIds: false });
     const records = validateNote(parsed, { verifyIds: false });
     for (const record of records) {
-      if (record.type === "correction") {
-        const expected = `cr:${await this.repository.hashObject(`${correctionPayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          throw new Error(`Correction ID mismatch for ${record.id}; expected ${expected}`);
-        }
-        continue;
-      }
-      if (record.type === "resolution") {
-        const expected = `rs:${await this.repository.hashObject(`${resolutionPayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          throw new Error(`Resolution ID mismatch for ${record.id}; expected ${expected}`);
-        }
-        continue;
-      }
-      if (record.type === "redaction") {
-        const expected = `rd:${await this.repository.hashObject(`${redactionPayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          throw new Error(`Redaction ID mismatch for ${record.id}; expected ${expected}`);
-        }
-        continue;
-      }
-      if (record.type === "occurrence") {
-        const expected = `oc:${await this.repository.hashObject(`${occurrencePayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          throw new Error(`Occurrence ID mismatch for ${record.id}; expected ${expected}`);
-        }
-        continue;
-      }
       if (record.type === "lineage") {
         const expected = `lg:${await this.repository.hashObject(`${lineagePayload(record)}\n`)}`;
         if (expected !== record.id) {
