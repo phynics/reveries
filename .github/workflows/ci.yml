@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Evaluate Reveries
+      - name: Build, typecheck, test, and run PRD acceptance
         run: npm run verify
 
       - name: Test Git 2.39 compatibility
@@ -34,4 +34,4 @@ jobs:
           --mount type=bind,source="$GITHUB_WORKSPACE",target=/work,readonly
           --workdir /work
           node:22.20.0-bookworm
-          npm run test:full
+          sh -c "npm run test:full && node scripts/direct-git-acceptance.mjs"

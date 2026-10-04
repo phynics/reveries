@@ -1,36 +1,42 @@
 ---
 name: reveries-git-notes-init
-description: Initialize, inspect, repair, upgrade, remove, or diagnose Reveries Git-notes engineering memory in a Git repository. Use only when explicitly asked to configure Reveries, choose publishing remotes or supported hosts, edit Reveries-owned instruction blocks, install or compose hooks, or repair a Reveries setup. Do not use for ordinary note reading, decision maintenance, or rationale search.
+description: Prepare a Git repository for Reveries evidence. Use when explicitly asked to initialize Reveries, repair the notes merge strategy, or add the Reveries-owned AGENTS.md instructions block. Do not use for ordinary note reading, recording decisions, or rationale search.
 ---
 
 # Reveries Git Notes Init
 
-Prepare an idempotent, conservative local installation. The Git notes ref is evidence
-and remains untouched by normal removal.
+`reveries init` does two things and nothing else:
 
-1. Confirm the repository is a Git worktree and inspect the marker, notes ref, hooks,
-   remotes, and current protocol state.
-2. Before running `reveries init`, ask four separate questions:
-   - How should agents obtain the Reveries Skills: reminder, pull, vendored copy,
-     project-local symlinks, or a pinned Git submodule?
-   - Which hosts should use the setup? "No host adapters" is valid.
-   - Which remotes should publish Reveries? "Local only" is valid.
-   - Which Git email identifies material user directives? "Leave unset" is valid.
-   Never infer an answer. Map every answer to an explicit CLI flag, including each
-   `--no-*` choice.
-3. Present the intended tracked-file, Git-config, and hook changes before changing them.
-4. Apply the selected Skill setup, then add only the owned marker blocks. Preserve other
-   instruction prose, unrelated worktree changes, and unknown hooks.
-5. Configure the notes merge strategy and selected remote refspecs, then run `doctor`.
-6. Leave initialization changes uncommitted. Use the returned adoption plan with
-   `reveries adopt`; it verifies every prepared file, excludes unrelated staged work, creates
-   the exact adoption commit, and atomically attaches its generated summary and initialization
-   records. Print the strict check and first atomic push when a publishing remote was selected.
+1. It sets `notes.reveries.mergeStrategy` to `cat_sort_uniq`, so two clones' notes refs
+   combine by union.
+2. It writes the Reveries-owned block into `AGENTS.md`, preserving all surrounding prose.
 
-Do not create a commit, push, install global software, choose a remote, overwrite an
-unknown hook, or delete `refs/notes/reveries` without explicit authorization.
+It installs no hooks, configures no publishing remote, creates no trust store, and makes no
+commit. Reveries is an evidence format, not a workflow gate, so setup must not decide when a
+commit or a push is allowed.
 
-Read [initialization.md](references/initialization.md) for the workflow and owned blocks.
-Read [git-config.md](references/git-config.md) before changing Git configuration or hooks.
-Read [troubleshooting.md](references/troubleshooting.md) for repair, upgrade, removal, or
-partial-enforcement cases.
+## Run it
+
+```bash
+reveries init
+reveries doctor
+```
+
+`init` is idempotent. It replaces only the text between the `<!-- reveries:begin -->` and
+`<!-- reveries:end -->` markers and leaves every other byte of `AGENTS.md` intact.
+
+## What to do next
+
+- Publish evidence with an ordinary `git push` of `refs/notes/reveries`, or use
+  `reveries push <remote>` for one atomic push of HEAD and the notes ref.
+- Run `reveries retain` to anchor annotated subjects under `refs/reveries/retention`, so a
+  pruning `git gc` cannot remove evidence for content no longer reachable from a branch.
+- To share evidence, add the fetch refspec
+  `+refs/notes/reveries*:refs/notes/remotes/<remote>/reveries*` and merge with
+  `cat_sort_uniq`. Never fetch automatically.
+
+## Repair
+
+If `AGENTS.md` lost its markers or the merge strategy is wrong, run `reveries init` again.
+It rewrites only the owned block and the strategy. It never deletes `refs/notes/reveries`.
+`reveries doctor` reports the state without changing anything.

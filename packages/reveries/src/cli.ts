@@ -77,6 +77,7 @@ Commands:
   link       Record explicit lineage, or suggest candidates
   search     Search current or historical engineering evidence
   history    Trace a path or reverie through history
+  retain     Anchor annotated subjects under refs/reveries/retention
   sync       Inspect or pull a publishing remote's notes
   push       Atomically push HEAD and refs/notes/reveries
 
@@ -175,6 +176,15 @@ Trace evidence attached to a path or reverie through history.
 Examples:
   reveries history src/state.ts
   reveries history rv:<full-id>
+`,
+  retain: `Usage: reveries retain [--json]
+
+Rebuild refs/reveries/retention from the annotated subjects the configured
+policy selects. The ref anchors those objects so a pruning git gc keeps them
+reachable. reveries.retention is one of none, active, all, or archive;
+active is the default. Only an explicit none policy removes the ref.
+Examples:
+  reveries retain
 `,
   sync: `Usage: reveries sync [<remote>] (--status|--pull) [--json]
 
@@ -1060,6 +1070,13 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       const result = await reveries.push(remote);
       emit(io, json, command, result, result.diagnostics, { remote });
       return result.ok ? 0 : 1;
+    }
+    if (command === "retain") {
+      const parsed = parseArguments(argv.slice(1), [], ["--json"]);
+      if (parsed.positionals.length > 0) throw new UsageError("retain takes no arguments");
+      const result = await reveries.retain();
+      emit(io, json, command, result, result.missing.length === 0 ? [] : result.missing);
+      return result.missing.length === 0 ? 0 : 1;
     }
     if (command === "doctor") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);

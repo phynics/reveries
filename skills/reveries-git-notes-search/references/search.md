@@ -3,8 +3,8 @@
 ## Default scope
 
 `reveries search QUERY` begins with the selected revision’s current tree (default `HEAD`). It
-searches valid reveries attached to reachable blobs, the selected commit’s session summary, and
-sources in those records. This answers “Why does the repository look like this?”
+searches valid reveries attached to reachable blobs, their lineage edges, and sources in those
+records. This answers “Why does the repository look like this?”
 
 Useful forms:
 

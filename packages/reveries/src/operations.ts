@@ -5122,14 +5122,17 @@ export class Reveries {
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
     const notices: string[] = [];
+    // The AGENTS.md block is a convenience for agent hosts, not evidence. Its
+    // absence never makes the evidence unsound, so it is a notice an operator
+    // may act on and never flips `ok` to false.
     let agents = "";
     try {
       agents = await readFile(join(this.repository.root, "AGENTS.md"), "utf8");
     } catch {
-      diagnostics.push("AGENTS.md is unavailable");
+      notices.push("AGENTS.md is unavailable; run reveries init to add the owned instructions block");
     }
-    if (!agents.includes("<!-- reveries:begin -->") || !agents.includes("<!-- reveries:end -->")) {
-      diagnostics.push("AGENTS.md Reveries marker is missing or incomplete");
+    if (agents !== "" && (!agents.includes("<!-- reveries:begin -->") || !agents.includes("<!-- reveries:end -->"))) {
+      notices.push("AGENTS.md Reveries marker is missing or incomplete; run reveries init to repair it");
     }
     const strategy = await this.repository.run(
       ["config", "--get", "notes.reveries.mergeStrategy"],
@@ -5197,10 +5200,13 @@ export class Reveries {
     };
     try {
       retention = await this.retentionStatus();
+      // Retention is rebuildable from evidence, so an incomplete vault is a
+      // notice an operator clears with `reveries retain`, never damage. Only a
+      // retained object that no longer resolves is a diagnostic.
       if (retention.missing.length > 0) {
-        diagnostics.push(
+        notices.push(
           `Retention policy ${retention.policy} does not keep ${retention.missing.length} annotated subject(s): `
-          + `${retention.missing.join(", ")}`,
+          + `${retention.missing.join(", ")}. Run reveries retain to rebuild the retention ref.`,
         );
       }
     } catch (error: unknown) {

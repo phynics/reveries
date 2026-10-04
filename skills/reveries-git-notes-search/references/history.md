@@ -11,8 +11,8 @@ git log -p refs/notes/reveries
 ```
 
 Path history walks revisions affecting the path, resolves each historical blob, shows associated
-reveries and relevant session-summary entries, then follows supersession/source links. A path is
-only a historical navigation mechanism; it is not an applicability identity.
+reveries and lineage edges, then follows supersession and source links. A path is only a
+historical navigation mechanism; it is not an applicability identity.
 
 For raw inspection, list notes and read their note blobs:
 
