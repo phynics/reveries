@@ -26,10 +26,6 @@ jobs:
       pull-requests: read
     env:
       REVERIES_REQUIRED_CHECK: Reveries receive-check
-      # Job-level, because the producer step and the upload step must agree and a
-      # step-scoped `env:` does not reach later steps. The producer script writes
-      # to $BINDING_DIR and the upload step reads the file from the same directory.
-      BINDING_DIR: ${{ runner.temp }}/reveries-binding
     steps:
       - name: Check out the trusted base revision
         uses: actions/checkout@v7
@@ -48,16 +44,27 @@ jobs:
       # of the script. The binding records the pull request number, head, and base
       # the checker validated, so the controlled-merge bot can tell a check that
       # describes *this* merge from one left over from before the base moved.
+      #
+      # `BINDING_DIR` is resolved here rather than at job level: the `runner`
+      # context is not available to a job-level `env:`, and GitHub rejects the
+      # entire workflow file (unparsed name, no triggers, zero-job runs) rather
+      # than reporting the bad expression. The resolved path is published as a
+      # step output so the upload step reads the same directory.
       - name: Record the base and head binding
         if: success()
-        run: node scripts/publish-receive-check-binding.mjs
+        id: binding
+        env:
+          BINDING_DIR: ${{ runner.temp }}/reveries-binding
+        run: |
+          echo "dir=$BINDING_DIR" >> "$GITHUB_OUTPUT"
+          node scripts/publish-receive-check-binding.mjs
 
       - name: Publish the binding as an artifact of this run
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: reveries-receive-check-binding
-          path: ${{ env.BINDING_DIR }}/binding.json
+          path: ${{ steps.binding.outputs.dir }}/binding.json
           if-no-files-found: error
           # Long enough to merge, short enough that a stale binding does not
           # linger. An expired artifact is a refusal, never a fallback.

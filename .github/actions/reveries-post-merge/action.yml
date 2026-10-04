@@ -26,24 +26,29 @@ inputs:
 runs:
   using: composite
   steps:
-    # The action source is this repository at the pinned revision; its root
-    # sits two levels above the action directory. Install and build run
-    # there so synthesis never depends on target-directory code.
+    # The action source is this repository at the pinned revision, and these
+    # steps must run at its root so synthesis never depends on
+    # target-directory code. A composite run step starts in the caller's
+    # checkout, which is exactly that root.
+    #
+    # Do not build the pattern from `github.action_path` with "../..":
+    # `actions/setup-node` rejects any `cache-dependency-path` that still
+    # contains "." or ".." segments, so a self-relative pattern fails the
+    # action with "Relative pathing '.' and '..' is not allowed" before a
+    # single build step runs.
     - name: Set up Node.js
       uses: actions/setup-node@v7
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
-        cache-dependency-path: ${{ github.action_path }}/../../package-lock.json
+        cache-dependency-path: package-lock.json
 
     - name: Install dependencies
       shell: bash
-      working-directory: ${{ github.action_path }}/../..
       run: npm ci
 
     - name: Build the synthesis library
       shell: bash
-      working-directory: ${{ github.action_path }}/../..
       run: npm run build
 
     - name: Configure the authenticated notes remote
@@ -60,4 +65,4 @@ runs:
       shell: bash
       env:
         REVERIES_POST_MERGE_REMOTE: ${{ inputs.notes-remote }}
-      run: node "${{ github.action_path }}/../../scripts/reveries-post-merge.mjs" --target-dir "${{ inputs.target-directory }}"
+      run: node scripts/reveries-post-merge.mjs --target-dir "${{ inputs.target-directory }}"
