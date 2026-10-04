@@ -128,7 +128,8 @@ Commands:
   show       Show notes for a path, blob, tree, or commit
   record     Create, continue, or supersede a blob-or-tree reverie
   occurrence Record evidence about one occurrence of a subject
-  lineage    Record a durable subject pairing, or suggest candidates
+  link       Record explicit lineage, or suggest candidates
+  lineage    Deprecated alias for link
   summarize  Attach or replace a commit summary or initialization record
   check      Check staged, committed, or outgoing continuity and coverage
   search     Search current or historical engineering evidence
@@ -247,6 +248,25 @@ Examples:
   reveries lineage suggest --staged
   reveries lineage record --kind preserve --commit HEAD --from src/module --to lib/module --driving-event "Moved" --decision "Same intent" --impact "Paths change"
   reveries lineage record --kind split --commit HEAD --parent HEAD~1 --from lib/util.js --to lib/a.js --to lib/b.js --driving-event "Split" --decision "Two concerns" --impact "Callers update"
+`,
+  link: `Usage: reveries link --kind <preserve|derive|split|merge|retire> --commit <commit> --from <path>... --to <path>... [--parent <commit>] [causal options]
+       reveries link suggest [<commit>|--staged] [--json]
+
+Record explicit lineage between subject occurrences. The immutable record is
+written to the note of every --to endpoint when --to is non-empty, otherwise
+to every --from endpoint, so the edge is discoverable from either end. Because
+endpoints are object IDs, the edge survives a rebase.
+
+lineage is never inferred: a similarity hint may suggest an edge, but only
+recording it establishes one. An edge discharges no obligation; continuity is
+known only when explicit lineage or a retirement exists.
+Options: --driving-event <text>, --decision <text>, --impact <text>,
+         --recurrence-control <text>|--no-recurrence-control, --alternative <text>,
+         --source <relation:kind:ref[@at]>, --session <name>, --from-file <file|->, --staged, --json
+Examples:
+  reveries link suggest --staged
+  reveries link --kind preserve --commit HEAD --from src/module --to lib/module --driving-event "Moved" --decision "Same intent" --impact "Paths change"
+  reveries link --kind split --commit HEAD --parent HEAD~1 --from lib/util.js --to lib/a.js --to lib/b.js --driving-event "Split" --decision "Two concerns" --impact "Callers update"
 `,
   summarize: `Usage: reveries summarize <commit> [--from <file|->] [causal options] [--replace]
        reveries summarize <commit> --from <reveries-init.json> --init
@@ -1495,16 +1515,19 @@ function humanOutput(
       "",
     ].join("\n");
   }
-  if (command === "lineage record") {
+  if (command === "link" || command === "lineage record") {
     const from = endpointPaths(value?.from);
     const to = endpointPaths(value?.to);
+    const subjects = Array.isArray(value?.subjects) ? value.subjects.length : 0;
     return [
       `Recorded lineage ${stringField(asRecord(value?.record) ?? {}, "id")}: ${stringField(asRecord(value?.record) ?? {}, "kind")} ${from}${to === "" ? " -> (no successor)" : ` -> ${to}`}.`,
-      "This pairing discharges nothing on its own: every decision on a predecessor still needs a continuation on each successor, a supersession, or a causal retirement.",
+      ...(subjects === 0
+        ? ["This pairing discharges nothing on its own; continuity stays unresolved until a successor disposition is recorded."]
+        : [`Written to ${subjects} endpoint note(s); lineage discharges no obligation.`]),
       "",
     ].join("\n");
   }
-  if (command === "lineage suggest") {
+  if (command === "link suggest" || command === "lineage suggest") {
     const suggestions = Array.isArray(value?.suggestions) ? value.suggestions : [];
     const notice = stringField(value ?? {}, "notice", SUGGESTION_NOTICE);
     if (suggestions.length === 0) return `No lineage suggestions.\n${notice}\n`;
@@ -3089,6 +3112,12 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     }
     if (command === "help") {
       const topic = argv[1];
+      if (topic === "lineage") {
+        io.stdout("lineage was renamed; use `reveries link` instead.\n");
+        const renamed = COMMAND_HELP.link;
+        if (renamed !== undefined) io.stdout(renamed);
+        return 0;
+      }
       if (topic === undefined) io.stdout(HELP);
       else {
         const help = COMMAND_HELP[topic];
@@ -3319,7 +3348,7 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       emit(io, json, "occurrence record", result);
       return 0;
     }
-    if (command === "lineage") {
+    if (command === "link" || command === "lineage") {
       const action = argv[1];
       if (action === "suggest") {
         const parsed = parseArguments(argv.slice(2), [], ["--staged", "--json"]);
@@ -3327,7 +3356,7 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
           staged: parsed.flags.has("--staged"),
           ...(parsed.positionals[0] === undefined ? {} : { revision: parsed.positionals[0] }),
         });
-        emit(io, json, "lineage suggest", {
+        emit(io, json, "link suggest", {
           ...result,
           suggestions: result.suggestions.map((suggestion) => ({
             ...suggestion,
@@ -3337,32 +3366,33 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
         }, [], {});
         return 0;
       }
-      if (action !== "record") throw new UsageError("lineage action must be record or suggest");
+      if (command === "lineage" && action === "record") {
+        throw new UsageError("lineage record was replaced by link; run reveries link --help");
+      }
+      if (action !== undefined) throw new UsageError("link action must be suggest");
       const parsed = parseArguments(
-        argv.slice(2),
-        ["--kind", "--commit", "--parent", "--from", "--to", "--transition", "--from-file", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
-        ["--json", "--no-recurrence-control", "--edit"],
+        argv.slice(1),
+        ["--kind", "--commit", "--parent", "--from", "--to", "--from-file", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
+        ["--json", "--no-recurrence-control", "--edit", "--transition"],
       );
       const commit = one(parsed, "--commit", true);
-      if (commit === undefined) throw new UsageError("lineage record requires --commit");
+      if (commit === undefined) throw new UsageError("link requires --commit");
       const from = parsed.values.get("--from") ?? [];
       const to = parsed.values.get("--to") ?? [];
-      if (from.length === 0) throw new UsageError("lineage record requires at least one --from path");
+      if (from.length === 0) throw new UsageError("link requires at least one --from path");
       const draftSource = await prepareDraft(await readDraft(one(parsed, "--from-file"), io), parsed.flags.has("--edit"), io);
       const result = await usePreparedDraft(draftSource, async (raw) => {
         const draft = await parseLineageDraft(raw, reveries, io, parsed);
-        const transitionValue = one(parsed, "--transition");
-        return reveries.recordLineage({
+        return reveries.link({
           kind: parseLineageKind(one(parsed, "--kind")),
           commit,
           parent: one(parsed, "--parent") ?? `${commit}~1`,
           from,
           to,
-          transition: transitionValue === undefined ? null : transitionId(transitionValue),
           ...draft,
         });
       });
-      emit(io, json, "lineage record", result);
+      emit(io, json, "link", result);
       return 0;
     }
     if (command === "summarize") {
