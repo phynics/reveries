@@ -202,6 +202,24 @@ export interface LineageResult {
   readonly to: readonly LineageEndpoint[];
 }
 
+export interface LinkInput {
+  readonly kind: LineageKind;
+  readonly commit: string;
+  readonly parent: string;
+  readonly from: readonly string[];
+  readonly to: readonly string[];
+  readonly semantic: RecordLineageInput["semantic"];
+  readonly metadata: ReverieMetadata;
+}
+
+export interface LinkResult {
+  readonly record: LineageRecord;
+  readonly from: readonly LineageEndpoint[];
+  readonly to: readonly LineageEndpoint[];
+  /** Every note that received the immutable lineage record. */
+  readonly subjects: readonly ObjectId[];
+}
+
 /**
  * Whether a lineage edge may act as the pairing authority for one checked
  * change (RVR-014).
@@ -1451,6 +1469,48 @@ export class Reveries {
       await notes.append(commit, canonicalRecord(record));
     });
     return { commit, record, from: record.from, to: record.to };
+  }
+
+  /**
+   * Record explicit lineage on the notes of its endpoints.
+   *
+   * Similarity may suggest an edge, never establish one, so this writes only
+   * what the caller names: no disturbance test and no continuity obligation.
+   * The same immutable record is written to every `to` endpoint's note when
+   * `to` is non-empty, otherwise to every `from` endpoint's note. Note-level
+   * union dedupes by record ID, so an edge stays discoverable from either end
+   * and survives a rebase because endpoints are object IDs.
+   */
+  async link(input: LinkInput): Promise<LinkResult> {
+    const commit = await this.repository.resolveCommit(input.commit);
+    const parent = await this.repository.resolveCommit(input.parent);
+    const from: LineageEndpoint[] = [];
+    for (const path of input.from) {
+      from.push(await this.lineageEndpoint(path, parent, "from"));
+    }
+    const to: LineageEndpoint[] = [];
+    for (const path of input.to) {
+      to.push(await this.lineageEndpoint(path, commit, "to"));
+    }
+    const record = createLineage(
+      {
+        v: 1,
+        kind: input.kind,
+        parent,
+        commit,
+        from,
+        to,
+        transition: null,
+        ...input.semantic,
+      },
+      input.metadata,
+      (bytes) => this.repository.hashObjectSync(bytes),
+    );
+    const subjects = [...new Set((to.length > 0 ? to : from).map((endpoint) => String(endpoint.subject)))] as ObjectId[];
+    await this.mutateNotes(async (notes) => {
+      for (const subject of subjects) await notes.append(subject, canonicalRecord(record));
+    });
+    return { record, from: record.from, to: record.to, subjects };
   }
 
   /**
@@ -3381,13 +3441,18 @@ export class Reveries {
         // ride on blob, tree, and commit notes alongside the records that live
         // there. It is not evidence about the subject's content, so it never
         // disqualifies the subject as a transition result or publication.
+        // A lineage edge is a fact about object endpoints, so it rides the note
+        // of every endpoint subject: `to` when one exists, otherwise `from`.
+        // Lineage is protocol evidence in its own right, not a file reverie, so
+        // a blob carrying it is still a valid endpoint.
         if (entry.objectType === "blob" && entry.records.some((record) =>
           record.type !== "reverie"
           && record.type !== "occurrence"
           && record.type !== "correction"
           && record.type !== "resolution"
           && record.type !== "redaction"
-          && record.type !== "signature")) {
+          && record.type !== "signature"
+          && record.type !== "lineage")) {
           throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
         }
         if (entry.objectType === "commit" && entry.records.some((record) =>
@@ -3409,17 +3474,21 @@ export class Reveries {
             && record.type !== "correction"
             && record.type !== "resolution"
             && record.type !== "redaction"
-            && record.type !== "signature")) {
+            && record.type !== "signature"
+            && record.type !== "lineage")) {
           throw new Error(`Tree ${entry.object} has a non-tree protocol record`);
         }
         for (const record of entry.records) {
           if (record.type === "publication-attestation" && record.commit !== entry.object) {
             throw new Error(`Attestation for ${record.commit} is attached to ${entry.object}`);
           }
-          // A lineage edge belongs to the change it describes, so it rides the
-          // note of that exact commit, beside that commit's session summary.
+          // A lineage edge is about object endpoints, not about the change it
+          // was recorded beside, so it may ride any endpoint subject's note.
           if (record.type === "lineage" && record.commit !== entry.object) {
-            throw new Error(`Lineage edge for commit ${record.commit} is attached to ${entry.object}`);
+            const endpoints = [...record.from, ...record.to].map((endpoint) => String(endpoint.subject));
+            if (!endpoints.includes(String(entry.object))) {
+              throw new Error(`Lineage edge ${record.id} is attached to ${entry.object}, which is not one of its endpoints`);
+            }
           }
           // An occurrence rides the note of the subject it names, and its
           // coordinate must still resolve to that subject. Without this a

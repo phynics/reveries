@@ -447,7 +447,7 @@ test("the suggestion surface never produces a confirmed edge", () => {
     to: { path: "b.ts", subject: blobB },
     score: 20,
   }), []);
-  assert.match(suggestionCommand(suggestion[0]!, "abc123"), /reveries lineage record --kind derive/);
+  assert.match(suggestionCommand(suggestion[0]!, "abc123"), /reveries link --kind derive/);
 });
 
 test("Git's rename candidates parse as suggestions only", () => {  const raw = [

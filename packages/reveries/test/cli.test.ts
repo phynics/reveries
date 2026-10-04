@@ -901,7 +901,8 @@ test("every command the help index lists has usage of its own", async () => {
   for (const command of commands) {
     const topic = captureIo("/tmp");
     assert.equal(await runCli(["help", command], topic.io), 0, `reveries help ${command}`);
-    assert.ok(topic.stdout().startsWith("Usage: reveries "), `reveries help ${command} has no usage line`);
+    // A renamed command still answers with usage, under its new name.
+    assert.match(topic.stdout(), /^Usage: reveries /m, `reveries help ${command} has no usage line`);
   }
 });
 

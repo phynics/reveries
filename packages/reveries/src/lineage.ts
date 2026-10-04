@@ -76,7 +76,7 @@ export function suggestionCommand(
 ): string {
   const quote = (value: string): string => (/[\s"']/.test(value) ? JSON.stringify(value) : value);
   return [
-    "reveries lineage record",
+    "reveries link",
     `--kind ${suggestion.kind}`,
     `--commit ${String(commit)}`,
     `--from ${quote(suggestion.from.path)}`,
