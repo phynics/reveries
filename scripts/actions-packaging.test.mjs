@@ -99,9 +99,21 @@ test("the evidence-import caller stays on pull_request_target with read-only per
 test("the evidence-import action resolves its script path to an existing repository file", async () => {
   const actionDir = new URL("./.github/actions/reveries-evidence-import/", root);
   const text = await readFile(new URL("action.yml", actionDir), "utf8");
-  const match = text.match(/github\.action_path\s*\}\}\s*\/(\.\.\/)+scripts\/import-fork-evidence\.mjs/);
+  const match = text.match(/github\.action_path\s*\}\}\s*\/((?:\.\.\/)+)scripts\/import-fork-evidence\.mjs/);
   assert.ok(match, "action must reference the repo-root scripts directory");
-  const resolved = new URL("../../../scripts/import-fork-evidence.mjs", actionDir);
+
+  // The literal path decides the fix. Resolve it exactly as the runner does,
+  // relative to `github.action_path` (the action directory), and require the
+  // result to be the repo-root scripts directory. A hardcoded same-path
+  // `new URL("../../../...", actionDir)` assertion would keep passing after
+  // someone reverted the manifest to `../../`, so it could not catch the bug
+  // that shipped on main.
+  const resolved = new URL(`${match[1]}scripts/import-fork-evidence.mjs`, actionDir);
+  assert.equal(
+    resolved.pathname,
+    new URL("scripts/import-fork-evidence.mjs", root).pathname,
+    "action must resolve to the repository root, not .github/",
+  );
   const { stat } = await import("node:fs/promises");
   await stat(resolved);
 });
