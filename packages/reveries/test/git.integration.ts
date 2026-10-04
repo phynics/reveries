@@ -262,10 +262,9 @@ test("retention removal requires the expected current tip", async () => {
   assert.equal(await repository.notesTip(RETENTION_REF), null);
 });
 
-test("retention bundle refs name notes, ledger, and retention", async () => {
+test("retention bundle refs name notes and retention", async () => {
   assert.deepEqual(RETENTION_BUNDLE_REFS, [
     "refs/notes/reveries",
-    "refs/heads/reveries-ledger",
     "refs/reveries/retention",
   ]);
 });
