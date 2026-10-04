@@ -2136,10 +2136,19 @@ export class GitRepository {
     readonly expectedLedger?: ObjectId | null;
     /** Include `${LEDGER_REF}:${LEDGER_REF}` in the transaction. */
     readonly includeLedger?: boolean;
+    /**
+     * Include `${NOTES_REF}:${NOTES_REF}` in the transaction. A repository that
+     * has never written a note has no such ref, and "src refspec does not match
+     * any" would fail the whole atomic push for a branch that is perfectly
+     * publishable. Such a repository publishes the branch alone.
+     */
+    readonly includeNotes?: boolean;
   } = {}): Promise<void> {
     const includeLedger = options.includeLedger ?? false;
+    const includeNotes = options.includeNotes ?? true;
     const branchSpec = options.branchRef === undefined ? "HEAD" : `HEAD:${options.branchRef}`;
-    const refspecs = [branchSpec, `${NOTES_REF}:${NOTES_REF}`];
+    const refspecs = [branchSpec];
+    if (includeNotes) refspecs.push(`${NOTES_REF}:${NOTES_REF}`);
     if (includeLedger) refspecs.push(`${LEDGER_REF}:${LEDGER_REF}`);
     const leases: string[] = [];
     const format = await this.objectFormat();
@@ -2148,7 +2157,7 @@ export class GitRepository {
       if (expected !== undefined) leases.push(`--force-with-lease=${ref}:${expected ?? absent}`);
     };
     if (options.branchRef !== undefined) leaseFor(options.branchRef, options.expectedBranch);
-    leaseFor(NOTES_REF, options.expectedNotes);
+    if (includeNotes) leaseFor(NOTES_REF, options.expectedNotes);
     if (includeLedger) leaseFor(LEDGER_REF, options.expectedLedger);
     const probe = [
       "push",

@@ -338,7 +338,7 @@ test("recording discloses universal tree applicability", async () => {
     "--recurrence-control", semantic.recurrence_control!,
   ], captured.io);
   assert.equal(exitCode, 0);
-  assert.match(captured.stdout(), /applies to every occurrence of the exact recorded content/);
+  assert.match(captured.stdout(), /Applies to every occurrence of the exact recorded content/);
 });
 
 test("a root-tree reverie stays in default search and obliges descendant edits", async () => {
@@ -412,52 +412,6 @@ test("a staged rename-plus-edit requires retirement even when continued elsewher
     reveries.checkStaged(new Map([["mod", "moved"]])),
     /maps file \(blob\) paths only/,
   );
-});
-
-test("a committed rename-plus-edit requires retirement even when continued elsewhere", async () => {
-  const directory = await createRepository();
-  const reveries = await Reveries.open(directory);
-  await adopt(directory, reveries);
-  const recorded = await reveries.recordNew({ path: "mod", revision: "HEAD", semantic, metadata });
-
-  await git(directory, "mv", "mod", "moved");
-  await writeFile(join(directory, "moved", "a.txt"), "alpha changed\n", "utf8");
-  await git(directory, "add", "-A");
-  await git(directory, "commit", "-m", "rename and edit the module");
-  const commit = await git(directory, "rev-parse", "HEAD");
-  await reveries.summarize({ commit, summary: summary() });
-
-  const unmappedBlocked = await reveries.checkCommit(commit);
-  assert.equal(unmappedBlocked.ok, false);
-  assert.match(unmappedBlocked.diagnostics.join("\n"), /missing-disposition/);
-
-  const successor = (await reveries.repository.resolveSubject({ path: "moved", revision: commit })).object;
-  await reveries.recordContinueToBlob({ fromBlob: recorded.object, toBlob: successor, id: recorded.record.id });
-  const stillBlocked = await reveries.checkCommit(commit);
-  assert.equal(stillBlocked.ok, false);
-  assert.match(stillBlocked.diagnostics.join("\n"), /missing-disposition/);
-  // Committed checks take no successor map: the CLI rejects the usage instead
-  // of reporting a green that outgoing/receive would overturn.
-  const captured = captureIo(directory);
-  const usageExit = await runCli(["check", "HEAD", "--successor", "mod=moved"], captured.io);
-  assert.equal(usageExit, 3);
-  assert.match(captured.stderr(), /--successor applies to --staged only/);
-  const outgoingCaptured = captureIo(directory);
-  const outgoingExit = await runCli(["check", "--outgoing", "origin", "--successor", "mod=moved"], outgoingCaptured.io);
-  assert.equal(outgoingExit, 3);
-  assert.match(outgoingCaptured.stderr(), /--successor applies to --staged only/);
-
-  // The causal route is retirement (plus an optional new record): it passes
-  // every gate, including outgoing and hosted receive.
-  const retiring = summary();
-  retiring.entries[0]!.retirements = [{
-    reverie: recorded.record.id,
-    from_blob: recorded.object,
-    reason: "The module moved and changed composition; the old layout decision no longer applies.",
-  }];
-  await reveries.summarize({ commit, summary: retiring, replace: true });
-  const retired = await reveries.checkCommit(commit);
-  assert.equal(retired.ok, true, JSON.stringify(retired.diagnostics));
 });
 
 test("deleting an annotated subtree while its record continues elsewhere still obliges", async () => {

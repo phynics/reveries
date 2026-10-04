@@ -293,7 +293,9 @@ test("publication fails closed when the receiving end lacks atomic support", asy
   await git(bare, "config", "receive.advertiseAtomic", "false");
   const branchBefore = await git(bare, "rev-parse", "refs/heads/main");
 
-  await assert.rejects(() => reveries.push("origin"), /does not support atomic/i);
+  const atomicUnsupported = await reveries.push("origin");
+  assert.equal(atomicUnsupported.ok, false);
+  assert.match(atomicUnsupported.diagnostics.join("\n"), /does not support atomic/i);
   assert.equal(await git(bare, "rev-parse", "refs/heads/main"), branchBefore);
   await assert.rejects(() => git(bare, "rev-parse", "refs/notes/reveries"), /exit code|unknown revision|needed a single revision/i);
 });
@@ -323,7 +325,9 @@ test("a rejected atomic publication advances neither branch nor notes", async ()
   const branchBefore = await git(bare, "rev-parse", "refs/heads/main");
   const notesBefore = await git(bare, "rev-parse", "refs/notes/reveries");
 
-  await assert.rejects(() => reveries.push("origin"), /rejected|failed|atomic/i);
+  const rejected = await reveries.push("origin");
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.diagnostics.join("\n"), /rejected|failed|atomic/i);
   assert.equal(await git(bare, "rev-parse", "refs/heads/main"), branchBefore);
   assert.equal(await git(bare, "rev-parse", "refs/notes/reveries"), notesBefore);
 });
