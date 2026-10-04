@@ -128,6 +128,7 @@ import {
   type WithNotesWriteOptions,
 } from "./git.ts";
 import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
+import { assertNoSecretMaterial, SECRET_SCAN_WARNING, scanSecretMaterial } from "./sensitive-evidence.ts";
 
 export interface RecordTarget {
   readonly path: string;
@@ -222,6 +223,41 @@ export interface LineageUseReport {
   readonly historyOnly: readonly LineageId[];
 }
 
+/**
+ * One remote-side action a hard redaction cannot perform itself (RVR-018).
+ *
+ * The local rewrite is the only part Reveries can carry out. A mirror, an
+ * archive, and every independent clone are outside this repository's reach, so
+ * the operation names the action it requires instead of reporting success it
+ * cannot know about.
+ */
+export interface HardRedactionRemoteAction {
+  readonly remote: string;
+  /** The declared role, or `unassigned` when configuration declares none. */
+  readonly role: RemoteRole | "unassigned";
+  /** Human-readable command an operator runs against that remote. */
+  readonly action: string;
+}
+
+export interface HardRedactionResult extends CheckResult {
+  readonly state: "redacted" | "unchanged" | "refused";
+  /** Fact IDs removed from the canonical notes snapshot. */
+  readonly removed: readonly FactTargetId[];
+  /** Subjects whose notes were rewritten because they carried a removed fact. */
+  readonly rewrittenSubjects: readonly ObjectId[];
+  readonly notesBefore: ObjectId | null;
+  readonly notesAfter: ObjectId | null;
+  readonly ledgerBefore: ObjectId | null;
+  /** New genesis ledger checkpoint over the sanitized snapshot, or null. */
+  readonly ledgerAfter: ObjectId | null;
+  /** Local refs deleted because they still pointed at the removed history. */
+  readonly severedRefs: readonly string[];
+  /** Mirror, archive, and remote-side follow-up this repository cannot perform. */
+  readonly remoteActions: readonly HardRedactionRemoteAction[];
+  /** Always stated: local completion is never proof of distributed deletion. */
+  readonly disclaimer: string;
+}
+
 export interface ShowInput {
   readonly target: string;
   readonly revision?: "HEAD" | "index" | string;
@@ -279,6 +315,7 @@ export interface CheckResult {
 export type SyncConflictType =
   | "duplicate-session-summary"
   | "multiple-initialization-boundaries"
+  | "secret-material"
   | "invalid-source"
   | "invalid-projection"
   | "invalid-object-attachment"
@@ -495,6 +532,34 @@ export interface MirrorStatus {
   /** The trust state of the mirror's own manifest signature, when it has one. */
   readonly signature: TrustState | null;
   readonly diagnostics: readonly string[];
+}
+
+/**
+ * What every hard-redaction result states about its own reach.
+ *
+ * The wording is fixed because it is the claim that matters: the local rewrite
+ * is complete and auditable, and deletion everywhere else is still unproven.
+ */
+export const HARD_REDACTION_DISCLAIMER =
+  "Local hard redaction removed the named facts from this repository's refs and retention paths. "
+  + "Independent clones, bundles, mirrors, archives, caches, and backups may still hold the bytes; "
+  + "deletion outside this repository is not guaranteed and must be requested and verified separately.";
+
+/** Stable UTF-8 byte ordering for ID and ref lists, matching the protocol rule. */
+function compareUtf8Ids(left: string, right: string): number {
+  return Buffer.from(left).compare(Buffer.from(right));
+}
+
+/**
+ * Refs a hard redaction may delete because they hold a copy of the evidence:
+ * fetched remote-tracking notes, fetched remote-tracking envelopes, and held
+ * quarantine candidates. Ordinary remote-tracking *code* branches are excluded
+ * because they are code, not evidence.
+ */
+function isStaleEvidenceRef(ref: string): boolean {
+  return (ref.startsWith("refs/notes/remotes/") && ref.endsWith("/reveries"))
+    || /^refs\/remotes\/.+\/reveries-ledger$/.test(ref)
+    || ref.startsWith("refs/reveries/quarantine/");
 }
 
 export const RETENTION_POLICIES = ["none", "active", "all", "archive"] as const;
@@ -722,6 +787,7 @@ function recordOrigins(
 }
 
 function syncConflictType(message: string): SyncConflictType {
+  if (/likely secret material/i.test(message)) return "secret-material";
   if (/more than one session summary/i.test(message)) return "duplicate-session-summary";
   if (/more than one Reveries initialization boundary/i.test(message)) {
     return "multiple-initialization-boundaries";
@@ -849,6 +915,9 @@ function allSources(record: NoteRecord): readonly Source[] {
     return record.sources;
   }
   if (record.type === "transition-summary") {
+    return record.sources;
+  }
+  if (record.type === "occurrence" || record.type === "lineage") {
     return record.sources;
   }
   if (record.type === "session-summary") {
@@ -1673,7 +1742,21 @@ export class Reveries {
     options: WithNotesWriteOptions = {},
   ): Promise<T> {
     return this.repository.withNotesWrite(
-      mutation,
+      async (notes) => mutation({
+        ref: notes.ref,
+        read: (object) => notes.read(object),
+        append: async (object, canonicalLine) => {
+          assertNoSecretMaterial(canonicalLine, "Evidence record");
+          await notes.append(object, canonicalLine);
+        },
+        replace: async (object, canonicalBody) => {
+          const existing = await notes.read(object);
+          const existingLines = new Set(existing?.split("\n").filter((line) => line.length > 0) ?? []);
+          const additions = canonicalBody.split("\n").filter((line) => line.length > 0 && !existingLines.has(line));
+          assertNoSecretMaterial(additions.join("\n"), "Evidence record");
+          await notes.replace(object, canonicalBody);
+        },
+      }),
       (ref) => this.validateNotesRef(ref),
       undefined,
       options,
@@ -1704,6 +1787,7 @@ export class Reveries {
     readonly summary: SessionSummary;
   }): Promise<CommitId> {
     validateNote([input.summary], { verifyIds: false });
+    assertNoSecretMaterial(canonicalRecord(input.summary), "Session summary");
     return this.repository.commitWithNote({
       message: input.message,
       note: canonicalRecord(input.summary),
@@ -1862,6 +1946,288 @@ export class Reveries {
       await notes.append(input.object, canonicalRecord(record));
     });
     return { record };
+  }
+
+  /**
+   * Hard redaction (RVR-018): remove named facts from every local copy of the
+   * evidence and leave a verifiable discontinuity checkpoint behind.
+   *
+   * Soft redaction hides a record from normal projection while its bytes stay in
+   * the repository. This is the deliberate alternative, so it is deliberately
+   * narrow about what it claims:
+   *
+   * - Only the named ID-bearing facts, and the signatures that attest exactly
+   *   them, leave the snapshot. Everything else is copied byte for byte, so
+   *   surviving history keeps its identities and its continuity claims.
+   * - The rewritten notes commit is a **new root**, not a descendant: the
+   *   removed lines are not reachable from the new canonical tip.
+   * - The new genesis ledger checkpoint names that commit and no previous
+   *   ledger, which is what makes the discontinuity visible to a reader who
+   *   follows the envelope. Ordinary append-only verification does not apply
+   *   across it, and that is the point rather than a defect.
+   * - The local retention refs and the stale remote-tracking and quarantine refs
+   *   are deleted in one transaction with the two canonical moves.
+   * - Nothing here contacts a mirror, an archive, a bundle, or any other clone.
+   *   Those requests are returned as `remoteActions`, and `disclaimer` states
+   *   that local completion is not proof of deletion anywhere else.
+   */
+  async hardRedact(input: {
+    readonly targets: readonly FactTargetId[];
+    /** Non-sensitive justification kept in the tombstone redaction records. */
+    readonly reason: string;
+    readonly metadata: ReverieMetadata;
+    /** Expected canonical tips; omitted defaults to what is present now. */
+    readonly expectedNotes?: ObjectId | null;
+    readonly expectedLedger?: ObjectId | null;
+    /** Sign the discontinuity checkpoint when a signer is configured. */
+    readonly sign?: boolean;
+    readonly signingRole?: SignatureRole;
+  }): Promise<HardRedactionResult> {
+    const disclaimer = HARD_REDACTION_DISCLAIMER;
+    const format = await this.repository.objectFormat();
+    const notesBefore = await this.repository.notesTip();
+    const ledgerBefore = await this.repository.ledgerTip();
+    const empty = (diagnostics: string[], state: "unchanged" | "refused", extra: Partial<HardRedactionResult> = {}): HardRedactionResult => ({
+      ok: state !== "refused",
+      diagnostics,
+      state,
+      removed: [],
+      rewrittenSubjects: [],
+      notesBefore,
+      notesAfter: notesBefore,
+      ledgerBefore,
+      ledgerAfter: ledgerBefore,
+      severedRefs: [],
+      remoteActions: [],
+      disclaimer,
+      ...extra,
+    });
+
+    const targets = [...new Set(input.targets)].sort(compareUtf8Ids);
+    if (targets.length === 0) {
+      return empty(["Hard redaction requires at least one fact ID"], "refused");
+    }
+    if (notesBefore === null) {
+      return empty(["The local Reveries notes ref does not exist, so there is nothing to redact"], "unchanged");
+    }
+    const activeTransactions = await this.repository.listTemporaryNotesRefs();
+    if (activeTransactions.length > 0) {
+      return empty(
+        [`Hard redaction refused: ${activeTransactions.length} live Reveries note transaction(s) must finish or be repaired first`],
+        "refused",
+      );
+    }
+
+    // Locate every target before changing anything. An unknown ID is a refusal,
+    // not a silent no-op: an operator who named a wrong ID must not be told the
+    // repository was cleaned.
+    const view = await this.loadEvidenceSnapshot({});
+    const removedSet = new Set<string>(targets as readonly string[]);
+    const located = new Map<string, ObjectId[]>();
+    for (const entry of view.entries) {
+      for (const record of entry.records) {
+        const id = recordFactId(record);
+        if (id === null || !removedSet.has(id)) continue;
+        located.set(id, [...(located.get(id) ?? []), entry.object]);
+      }
+    }
+    const alreadyRemoved = new Set<string>(
+      view.entries.flatMap((entry) => entry.records.flatMap((record) => record.type === "redaction" ? [record.target] : [])),
+    );
+    const missing = targets.filter((id) => !located.has(id as string));
+    if (missing.length > 0) {
+      // A repeat of a completed redaction converges instead of failing: the
+      // record is gone because this operation already removed it and left a
+      // tombstone. An ID that was never here is still a refusal.
+      const unredacted = missing.filter((id) => !alreadyRemoved.has(id as string));
+      if (unredacted.length > 0) {
+        return empty([`Hard redaction refused: no record in this repository carries ${unredacted.join(", ")}`], "refused");
+      }
+      return empty(
+        [`Hard redaction already removed ${missing.join(", ")}; the sanitized snapshot is unchanged`],
+        "unchanged",
+      );
+    }
+    const rewritten = new Set<ObjectId>([...located.values()].flat());
+
+    // Build the sanitized bodies. Only the target lines and the signatures that
+    // attest exactly those targets are dropped; a signature over anything else
+    // still attests what it claims.
+    const sanitized = [...view.entries].map((entry) => {
+      const kept = entry.records.filter((record) => {
+        const id = recordFactId(record);
+        if (id !== null && removedSet.has(id)) return false;
+        return !(record.type === "signature" && removedSet.has(record.target));
+      });
+      const tombstones = targets
+        .filter((id) => located.get(id as string)?.includes(entry.object))
+        .map((id) => createRedaction(
+          { v: 1, target: id, reason: input.reason },
+          input.metadata,
+          (bytes) => hashBlobContent(bytes, format),
+        ));
+      // Surviving lines keep their relative order and their exact bytes; the
+      // tombstones are appended. A repeated hard redaction converges because an
+      // identical tombstone is written once rather than accumulated.
+      const lines = [...kept.map((record) => canonicalRecord(record))];
+      for (const tombstone of tombstones) {
+        const line = canonicalRecord(tombstone);
+        if (!lines.includes(line)) lines.push(line);
+      }
+      return { subject: entry.object, body: lines.join("") };
+    }).filter((note) => note.body.length > 0);
+
+    let notesAfter: ObjectId;
+    try {
+      notesAfter = await this.repository.createNotesSnapshotFromEmpty(
+        sanitized,
+        async (ref) => this.validateNotesRef(ref),
+      );
+    } catch (error: unknown) {
+      return empty([`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`], "refused");
+    }
+    if (notesAfter === notesBefore) {
+      return empty(["Hard redaction left the notes snapshot unchanged"], "unchanged", {
+        notesAfter,
+        ledgerAfter: ledgerBefore,
+      });
+    }
+
+    // The discontinuity checkpoint is a genesis checkpoint over the sanitized
+    // commit: `previous_ledger` is null because the old chain still describes
+    // history this repository has just removed.
+    const notesTree = await this.repository.treeForCommit(notesAfter);
+    let totals = { subjects: 0, records: 0, noteBytes: 0 };
+    for (const note of sanitized) {
+      totals = {
+        subjects: totals.subjects + 1,
+        records: totals.records + note.body.split("\n").filter((line) => line.length > 0).length,
+        noteBytes: totals.noteBytes + Buffer.byteLength(note.body, "utf8"),
+      };
+    }
+    let authority: string | null;
+    try {
+      authority = (await this.authorityStatus()).primary;
+    } catch (error: unknown) {
+      return empty(
+        [`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`],
+        "refused",
+        { notesAfter },
+      );
+    }
+    let checkpoint: ObjectId;
+    try {
+      const manifest = createLedgerManifest({
+        notes_commit: notesAfter,
+        notes_tree: notesTree,
+        previous_ledger: null,
+        retention_commit: null,
+        authority,
+        annotated_subjects: totals.subjects,
+        records: totals.records,
+        note_bytes: totals.noteBytes,
+      });
+      const signed = input.sign === false ? null : await this.signLedgerManifest(manifest, input.signingRole ?? "publisher");
+      checkpoint = await this.repository.commitLedgerCheckpoint({
+        manifest,
+        ...(signed === null ? {} : { signatures: signed }),
+      });
+    } catch (error: unknown) {
+      return empty(
+        [`Hard redaction refused: the discontinuity checkpoint could not be built: ${error instanceof Error ? error.message : String(error)}`],
+        "refused",
+        { notesAfter },
+      );
+    }
+    const verification = await this.verifyLedgerEnvelope(checkpoint);
+    if (!verification.ok) {
+      return empty(
+        [`Hard redaction refused: the discontinuity checkpoint failed verification: ${verification.diagnostics.join("; ")}`],
+        "refused",
+        { notesAfter },
+      );
+    }
+
+    const vault = await this.retentionVault();
+    const obsolete = await this.staleEvidenceRefs([notesBefore, ledgerBefore].filter((tip): tip is ObjectId => tip !== null));
+    const expectedNotes = input.expectedNotes === undefined ? notesBefore : input.expectedNotes;
+    const expectedLedger = input.expectedLedger === undefined ? ledgerBefore : input.expectedLedger;
+    try {
+      await this.repository.replaceEvidenceRefsAfterHardRedaction({
+        notesCommit: notesAfter,
+        ledgerCheckpoint: checkpoint,
+        expectedNotes,
+        expectedLedger,
+        expectedRetentionObjects: vault.objectsTip,
+        expectedRetentionCommits: vault.commitsTip,
+        obsoleteRefs: obsolete,
+      });
+    } catch (error: unknown) {
+      // Nothing moved: the candidate snapshot and checkpoint exist only as
+      // unreachable objects, so the report names the tips that are still live
+      // rather than the candidates it could not publish.
+      return empty(
+        [`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`],
+        "refused",
+      );
+    }
+
+    return {
+      ok: true,
+      diagnostics: [],
+      state: "redacted",
+      removed: targets,
+      rewrittenSubjects: [...rewritten].sort(compareUtf8Ids),
+      notesBefore,
+      notesAfter,
+      ledgerBefore,
+      ledgerAfter: checkpoint,
+      severedRefs: obsolete.map(({ ref }) => ref).sort(compareUtf8Ids),
+      remoteActions: await this.hardRedactionRemoteActions(),
+      disclaimer,
+    };
+  }
+
+  /**
+   * Local refs that still hold the pre-redaction evidence: fetched remote-tracking
+   * notes and envelopes plus every held quarantine candidate. Remote-tracking
+   * *code* branches are untouched because they are ordinary code, not evidence.
+   */
+  private async staleEvidenceRefs(removedTips: readonly ObjectId[]): Promise<{ ref: string; expected: ObjectId }[]> {
+    if (removedTips.length === 0) return [];
+    const listed = await this.repository.run(["for-each-ref", "--format=%(refname) %(objectname)"], {
+      allowExitCodes: [0, 1, 128],
+    });
+    const stale: { ref: string; expected: ObjectId }[] = [];
+    for (const line of listed.stdout.split("\n")) {
+      if (line.length === 0) continue;
+      const [ref, value] = line.split(" ");
+      if (ref === undefined || value === undefined) continue;
+      if (!isStaleEvidenceRef(ref)) continue;
+      const tip = objectId(value);
+      for (const removed of removedTips) {
+        if (tip === removed || await this.repository.isAncestor(tip, removed)) {
+          stale.push({ ref, expected: tip });
+          break;
+        }
+      }
+    }
+    return stale;
+  }
+
+  /**
+   * The remote-side work a hard redaction cannot do. It names each configured
+   * remote and the command an operator runs from a clone that has that remote
+   * configured; it never contacts the remote itself, so a mirror that ignores
+   * the request is never reported as done.
+   */
+  private async hardRedactionRemoteActions(): Promise<readonly HardRedactionRemoteAction[]> {
+    const roles = (await this.authorityStatus()).roles;
+    return [...(await this.configuredRemoteNames())].sort(compareUtf8Ids).map((remote) => ({
+      remote,
+      role: roles.get(remote) ?? "unassigned",
+      action: `git push ${remote} --delete refs/notes/reveries refs/heads/reveries-ledger`,
+    }));
   }
 
   /**
@@ -2085,6 +2451,15 @@ export class Reveries {
         diagnostics: ["The local Reveries notes ref does not exist"],
       };
     }
+    const secretDiagnostics = await this.secretMaterialDiagnostics(await this.evidenceView());
+    if (secretDiagnostics.length > 0) {
+      return {
+        ok: false,
+        attempts: 0,
+        remoteTip: null,
+        diagnostics: secretDiagnostics,
+      };
+    }
     const diagnostics: string[] = [];
     for (let attempt = 1; attempt <= maximum; attempt += 1) {
       const expected = await this.liveRepository.remoteObject(remote, NOTES_REF);
@@ -2294,7 +2669,47 @@ export class Reveries {
     for (const diagnostic of await this.addressedEvidenceDiagnostics()) {
       diagnostics.push(diagnostic);
     }
+    diagnostics.push(...await this.secretMaterialDiagnostics(await this.evidenceView()));
     return { ok: diagnostics.length === 0, diagnostics };
+  }
+
+  private async secretMaterialDiagnostics(view: EvidenceSnapshotView): Promise<string[]> {
+    const diagnostics: string[] = [];
+    for (const entry of view.entries) {
+      for (const record of entry.records) {
+        const findings = scanSecretMaterial(canonicalRecord(record));
+        const id = recordFactId(record) ?? record.type;
+        if (findings.length > 0) {
+          const kinds = [...new Set(findings.map(({ kind }) => kind))].join(", ");
+          diagnostics.push(
+            `Evidence ${id} on ${entry.object} contains likely secret material (${kinds}); publication is refused. ${SECRET_SCAN_WARNING}`,
+          );
+        }
+        if (!allSources(record).some((source) => source.kind === "confidential-pointer")) continue;
+        const factId = recordFactId(record);
+        const content = canonicalRecord(record).replace(/\n$/, "");
+        const contentId = await this.repository.hashObject(content);
+        const signed = factId !== null && entry.records.some((candidate) =>
+          candidate.type === "signature"
+          && candidate.domain === SIGNATURE_DOMAIN_RECORD
+          && candidate.target === factId
+          && candidate.subject === entry.object
+          && candidate.content_id === contentId);
+        if (!signed) {
+          diagnostics.push(
+            `Confidential pointer in evidence ${id} on ${entry.object} requires a signature over the enclosing record before publication.`,
+          );
+        }
+      }
+    }
+    return diagnostics;
+  }
+
+  private async secretMaterialDiagnosticsAtNotesCommit(notesCommit: ObjectId): Promise<string[]> {
+    const listed = await this.repository.listNotesAt(notesCommit);
+    const bodies = await this.repository.readNotesBatch(listed, {});
+    const view = await this.buildSnapshotView(notesCommit, listed, bodies, resolveLimits(), false);
+    return this.secretMaterialDiagnostics(view);
   }
 
   /**
@@ -2397,6 +2812,9 @@ export class Reveries {
         diagnostics.push("The pushed notes object is not the current local Reveries notes tip");
       }
       diagnostics.push(...(await this.checkRemoteNotesIncorporated(remote, notesUpdate.remoteObject)).diagnostics);
+      if (notesUpdate.localObject !== null) {
+        diagnostics.push(...await this.secretMaterialDiagnostics(await this.evidenceView()));
+      }
     }
     for (const update of branchUpdates) {
       diagnostics.push(...await this.checkOutgoingRange(
@@ -2409,6 +2827,15 @@ export class Reveries {
     if (ledgerUpdate !== undefined && ledgerUpdate.localObject !== null) {
       const verification = await this.verifyLedgerEnvelope(ledgerUpdate.localObject);
       diagnostics.push(...verification.diagnostics);
+      if (verification.ok) {
+        const stored = await this.repository.readLedgerManifestAt(ledgerUpdate.localObject);
+        if (stored !== null) {
+          const manifest = readLedgerManifest(stored);
+          if (manifest.notes_commit !== null) {
+            diagnostics.push(...await this.secretMaterialDiagnosticsAtNotesCommit(manifest.notes_commit));
+          }
+        }
+      }
       if (verification.ok && ledgerUpdate.remoteObject !== null) {
         if (!(await this.repository.objectExists("commit", ledgerUpdate.remoteObject))) {
           diagnostics.push(
@@ -3029,6 +3456,8 @@ export class Reveries {
           if (!(await hasReverie(source.ref))) throw new Error(`Referenced reverie does not exist: ${source.ref}`);
         } else if (source.kind === "git-email") {
           if (!/^[^\s@]+@[^\s@]+$/.test(source.ref)) throw new Error(`Invalid Git email source: ${source.ref}`);
+        } else if (source.kind === "confidential-pointer") {
+          continue;
         } else if (!/^(?:github|gitlab|linear|jira|generic):\S+$/.test(source.ref)) {
           throw new Error(`Invalid issue source: ${source.ref}`);
         }
@@ -3206,7 +3635,11 @@ export class Reveries {
     try {
       await this.repository.mergeFetchedNotes(
         remote,
-        (ref) => this.validateNotesRef(ref),
+        async (ref) => {
+          await this.validateNotesRef(ref);
+          const findings = await this.secretMaterialDiagnostics(await this.loadEvidenceSnapshot({ ref }));
+          if (findings.length > 0) throw new Error(findings.join("; "));
+        },
         async (candidateRef, candidate, error) => {
           quarantineRef = await this.repository.quarantineNotes(remote, candidate);
           conflict = await this.describeSyncConflict({
@@ -3262,10 +3695,11 @@ export class Reveries {
     readonly quarantineRef: string;
   }): Promise<SyncConflict> {
     const message = input.error instanceof Error ? input.error.message : String(input.error);
+    const conflictType = syncConflictType(message);
     const annotatedObject = input.error instanceof NotesRefValidationError
       ? input.error.annotatedObject
       : null;
-    const records = annotatedObject === null
+    const records = annotatedObject === null || conflictType === "secret-material"
       ? []
       : await this.describeConflictRecords(
           annotatedObject,
@@ -3275,7 +3709,7 @@ export class Reveries {
         );
     return {
       kind: "invalid-notes-union",
-      conflictType: syncConflictType(message),
+      conflictType,
       message,
       annotatedObject,
       records,
@@ -3939,7 +4373,9 @@ export class Reveries {
       || target.type === "transition-summary"
       || target.type === "correction"
       || target.type === "resolution"
-      || target.type === "redaction";
+      || target.type === "redaction"
+      || target.type === "occurrence"
+      || target.type === "lineage";
     if (!attested) {
       return {
         ok: false,
@@ -4375,6 +4811,15 @@ export class Reveries {
       return {
         ok: false,
         diagnostics: ["The verified ledger envelope transports no notes commit"],
+        state: "unchanged",
+        notesTip: await this.repository.notesTip(),
+      };
+    }
+    const secretDiagnostics = await this.secretMaterialDiagnosticsAtNotesCommit(manifest.notes_commit);
+    if (secretDiagnostics.length > 0) {
+      return {
+        ok: false,
+        diagnostics: secretDiagnostics,
         state: "unchanged",
         notesTip: await this.repository.notesTip(),
       };

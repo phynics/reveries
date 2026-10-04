@@ -8,7 +8,15 @@ import { afterEach, test } from "node:test";
 
 import { checkReceive } from "../src/receive.ts";
 import { Reveries } from "../src/operations.ts";
-import { commitId, objectId, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
+import { hashBlobContent } from "../src/git.ts";
+import {
+  canonicalRecord,
+  commitId,
+  createReverie,
+  objectId,
+  type ReveriesInit,
+  type SessionSummary,
+} from "../src/protocol.ts";
 
 const execFileAsync = promisify(execFile);
 const temporary: string[] = [];
@@ -125,6 +133,35 @@ test("receive fixture validates proposed ref updates without moving refs", async
   assert.equal(accepted.ok, true, JSON.stringify(accepted.diagnostics));
   assert.deepEqual(accepted.findings, []);
   assert.equal(await git(bare, "rev-parse", "refs/heads/main"), oldObject);
+
+  const sourceNotesBeforeSecret = objectId(await git(source, "rev-parse", "refs/notes/reveries"));
+  const fakeToken = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+  const legacySecret = createReverie({
+    v: 1,
+    driving_event: `An imported note contains ${fakeToken}.`,
+    decision: "Do not transport this legacy secret-bearing record.",
+    impact: "The receiving repository must reject this note snapshot.",
+    recurrence_control: "The receive test confirms the token is never copied into diagnostics.",
+    alternatives: [],
+    sources: [],
+    supersedes: [],
+  }, {
+    author_email: "receive@example.com",
+    session: "receive:test",
+    created_at: "2026-08-25T03:06:00Z",
+  }, (bytes) => hashBlobContent(bytes, "sha1"));
+  await reveries.repository.withNotesWrite(async (notes) => {
+    await notes.append(first.object, canonicalRecord(legacySecret));
+  });
+  await git(source, "push", "origin", "refs/notes/reveries:refs/notes/secret-proposal");
+  const secretProposal = objectId(await git(bare, "rev-parse", "refs/notes/secret-proposal"));
+  const secretRejected = await checkReceive(bare, {
+    updates: [{ ref: "refs/notes/reveries", oldObject: oldNotes, newObject: secretProposal }],
+  });
+  assert.equal(secretRejected.ok, false);
+  assert.match(secretRejected.diagnostics.join("\n"), /likely secret material/);
+  assert.equal(secretRejected.diagnostics.join("\n").includes(fakeToken), false);
+  await git(source, "update-ref", "refs/notes/reveries", sourceNotesBeforeSecret);
 
   const missingEvidence = await checkReceive(bare, {
     updates: [{ ref: "refs/heads/main", oldObject, newObject: proposed }],

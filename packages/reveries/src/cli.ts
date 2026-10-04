@@ -36,7 +36,12 @@ import {
 } from "./git.ts";
 import { adaptHostEvent, handleHookEvent } from "./hooks.ts";
 import { SUGGESTION_NOTICE, suggestionCommand } from "./lineage.ts";
-import { Reveries, type PushUpdate, type SigningOptions } from "./operations.ts";
+import {
+  HARD_REDACTION_DISCLAIMER,
+  Reveries,
+  type PushUpdate,
+  type SigningOptions,
+} from "./operations.ts";
 import { checkReceive, type ReceiveCheckInput, type ReceiveEvidence, type ReceiveRefUpdate } from "./receive.ts";
 import {
   LINEAGE_KINDS,
@@ -110,7 +115,7 @@ class EditorCancelledError extends Error {}
 const RELATIONS = new Set<SourceRelation>([
   "caused-by", "constrained-by", "requested-by", "derived-from", "implements", "corroborated-by",
 ]);
-const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
+const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue", "confidential-pointer"]);
 const HOSTS = new Set<SupportedHost>(["pi", "claude", "opencode", "codex", "gemini"]);
 const VERSION = "1.0.2";
 const HELP = `reveries <command>
@@ -130,6 +135,7 @@ Commands:
   history    Trace a path or reverie through history
   sync       Inspect or pull a publishing remote's notes
   ledger     Inspect, advance, or materialize the protected ledger envelope
+  redact     Hard-redact named facts from every local copy of the evidence
   role       Show, set, or clear the role a publishing remote plays
   policy     Show, set, or clear the signature roles this repository requires
   sign       Attest one record with the configured signing key
@@ -331,6 +337,33 @@ Examples:
 A quarantined candidate is preserved at ${QUARANTINE_REF_PREFIX}<remote>/<oid>,
 which is not a notes ref: git notes --ref= resolves a different ref for it and
 reports no note for a candidate that is present. Use this command to inspect one.
+`,
+  redact: `Usage: reveries redact hard <fact-id>... --reason <reason> [options]
+
+Deliberately hard redaction (RVR-018). This removes the named ID-bearing facts
+from every local copy of the evidence: the canonical notes ref becomes a new
+root snapshot without those records, the local retention refs are deleted, and
+the fetched remote-tracking and quarantine refs that still hold the old history
+are deleted in the same ref transaction. Each rewritten subject keeps a signed-
+ready redaction tombstone recording the non-sensitive reason, and a new genesis
+ledger checkpoint names the sanitized snapshot, so the discontinuity is visible
+to a reader following the envelope.
+
+Hard redaction is not a claim of erasure. Independent clones, bundles, mirrors,
+archives, caches, and backups may still hold the bytes. The result reports the
+remote-side action each configured remote needs; this command never contacts a
+remote and never reports deletion it cannot observe.
+
+Options: --reason <reason> (required, non-sensitive), --from <path> (JSON
+metadata draft), --session <id>, --expect-notes <oid>, --expect-ledger <oid>,
+--sign, --no-sign, --signing-role <role>, --json.
+
+Refuses when a target ID matches no record, when a note transaction is live, or
+when the sanitized snapshot fails validation. Repeating the same redaction
+converges to the same snapshot instead of appending duplicate tombstones.
+Examples:
+  reveries redact hard rv:0123456789abcdef0123456789abcdef01234567 --reason "Customer data copied into a decision"
+  reveries redact hard rv:<id> oc:<id> --reason "Redacted per incident INC-42" --no-sign
 `,
   role: `Usage: reveries role <show|set|clear> [<remote> [<role>]] [--json]
 
@@ -670,6 +703,26 @@ function parseReverieId(value: string): ReturnType<typeof reverieId> {
     return reverieId(value);
   } catch (error: unknown) {
     throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Parse one ID a hard redaction may name, using the protocol's own vocabulary. */
+function parseFactTargetId(value: string): ReturnType<typeof factTargetId> {
+  try {
+    return factTargetId(value);
+  } catch (error: unknown) {
+    throw new UsageError(
+      `${value} is not a fact ID a redaction can target; expected rv:, tr:, cr:, rs:, rd:, oc:, or lg:`,
+    );
+  }
+}
+
+/** A full Git object ID supplied on the command line, for CAS expectations. */
+function parseCliObject(value: string, flagName: string): ReturnType<typeof objectId> {
+  try {
+    return objectId(value);
+  } catch (error: unknown) {
+    throw new UsageError(`${flagName} must be a full Git object ID: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -1283,6 +1336,31 @@ function humanOutput(
       ? `signed over the manifest (${stringField(value ?? {}, "reason")})`
       : `unsigned (${stringField(value ?? {}, "reason")})`;
     return `${base} Authority: ${authority}${divergence}; manifest ${attestation}.\n`;
+  }
+  if (command === "redact hard") {
+    const state = stringField(value ?? {}, "state");
+    const removed = (Array.isArray(value?.removed) ? value?.removed : []).map(String);
+    const severed = (Array.isArray(value?.severedRefs) ? value?.severedRefs : []).map(String);
+    const actions = (Array.isArray(value?.remoteActions) ? value?.remoteActions : [])
+      .map((entry) => asRecord(entry) ?? {});
+    const checkpoint = value?.ledgerAfter === null || value?.ledgerAfter === undefined
+      ? "none"
+      : String(value.ledgerAfter);
+    const summary: Record<string, string> = {
+      redacted: `Hard redacted ${removed.length} fact(s): ${removed.join(", ")}.`,
+      unchanged: "Hard redaction changed nothing.",
+      refused: "Hard redaction was refused; no ref moved.",
+    };
+    const lines = [
+      `${summary[state] ?? `Hard redaction ${state}.`} Notes ${stringField(value ?? {}, "notesAfter", "none")}; `
+      + `discontinuity checkpoint ${checkpoint}.`,
+    ];
+    if (severed.length > 0) lines.push(`Severed local refs: ${severed.join(", ")}.`);
+    for (const action of actions) {
+      lines.push(`  ${stringField(action, "remote")} (${stringField(action, "role", "unassigned")}): ${stringField(action, "action", "")}`);
+    }
+    lines.push(stringField(value ?? {}, "disclaimer", HARD_REDACTION_DISCLAIMER));
+    return `${lines.join("\n")}\n`;
   }
   if (command === "check" || command === "receive-check") {
     return `${value?.ok === true ? "Continuity check passed." : "Continuity check failed."}\n`;
@@ -3529,6 +3607,44 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       // and stderr both say so. The notes ref is still never overwritten.
       emit(io, json, label, report, report.diagnostics);
       return report.ok ? 0 : 1;
+    }
+    if (command === "redact") {
+      const action = argv[1];
+      if (action !== "hard") throw new UsageError("redact action must be hard");
+      const parsed = parseArguments(
+        argv.slice(2),
+        ["--reason", "--from", "--session", "--expect-notes", "--expect-ledger", "--signing-role"],
+        ["--json", "--sign", "--no-sign"],
+      );
+      const reason = one(parsed, "--reason");
+      if (reason === undefined) throw new UsageError("redact hard requires --reason with a non-sensitive justification");
+      const targets = parsed.positionals.map((value) => parseFactTargetId(value));
+      if (targets.length === 0) throw new UsageError("redact hard requires at least one fact ID");
+      if (parsed.flags.has("--sign") && parsed.flags.has("--no-sign")) {
+        throw new UsageError("choose exactly one of --sign or --no-sign");
+      }
+      const signChoice = optionalBoolean(parsed, "--sign", "--no-sign");
+      const signingRole = one(parsed, "--signing-role");
+      // The trust store is read here for the same reason `ledger build` reads
+      // it: the discontinuity checkpoint is signed by the identity this
+      // repository actually trusts, not by a key resolved ad hoc.
+      const trusted = await openWithTrust(io.cwd, io);
+      if (trusted.signingKeyError !== null) throw new UsageError(trusted.signingKeyError);
+      const expectedNotes = one(parsed, "--expect-notes");
+      const expectedLedger = one(parsed, "--expect-ledger");
+      const draft = await readDraft(one(parsed, "--from"), io);
+      const metadata = await parseMetadata(asRecord(draft) ?? {}, trusted.reveries, io, parsed);
+      const result = await trusted.reveries.hardRedact({
+        targets,
+        reason,
+        metadata,
+        ...(signChoice === undefined ? {} : { sign: signChoice }),
+        ...(signingRole === undefined ? {} : { signingRole: signatureRoleValue(signingRole) }),
+        ...(expectedNotes === undefined ? {} : { expectedNotes: parseCliObject(expectedNotes, "--expect-notes") }),
+        ...(expectedLedger === undefined ? {} : { expectedLedger: parseCliObject(expectedLedger, "--expect-ledger") }),
+      });
+      emit(io, json, "redact hard", result, result.diagnostics);
+      return result.ok ? 0 : 1;
     }
     if (command === "push") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);

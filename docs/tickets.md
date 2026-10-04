@@ -296,7 +296,7 @@ Use a fanout tree at `refs/reveries/retention/objects` for blobs and trees. Use 
 
 ### Dependencies
 
-RVR-012 provides efficient evidence loading. RVR-005 carries the vault checkpoint in the ledger. RVR-018 defines what hard redaction does to retention.
+RVR-012 provides efficient evidence loading. RVR-005 carries the vault checkpoint in the ledger. RVR-018 hard redaction deletes both retention refs rather than rebuilding them, because a vault that still anchors the removed subjects would keep the evidence reachable.
 
 ### Acceptance criteria
 

@@ -8,11 +8,14 @@ import {
   projectActiveReveries,
   semanticPayload,
   objectId,
+  projectFactGraph,
+  redactionPayload,
   type BlobId,
   type ObjectId,
   type ReverieRecord,
   type Source,
 } from "./protocol.ts";
+import { scanSecretMaterial } from "./sensitive-evidence.ts";
 
 const MARKER_BEGIN = "<!-- reveries:begin -->";
 const MARKER_END = "<!-- reveries:end -->";
@@ -234,9 +237,14 @@ function renderRecord(record: ReverieRecord): string {
   const alternatives = record.alternatives.length === 0
     ? "  - none recorded"
     : record.alternatives.map((alternative) => `  - ${indent(alternative)}`).join("\n");
-  const sources = record.sources.length === 0
-    ? "  - none recorded"
-    : record.sources.map((source) => `  - ${sanitize(source.relation)} ${sanitize(source.kind)}:${sanitize(source.ref)}${source.at === undefined ? "" : ` at ${sanitize(source.at)}`}`).join("\n");
+  const visibleSources = record.sources.filter((source) => source.kind !== "confidential-pointer");
+  const omittedConfidentialPointer = visibleSources.length !== record.sources.length;
+  const sources = visibleSources.length === 0
+    ? omittedConfidentialPointer ? "  - confidential pointer omitted" : "  - none recorded"
+    : [
+      ...visibleSources.map((source) => `  - ${sanitize(source.relation)} ${sanitize(source.kind)}:${sanitize(source.ref)}${source.at === undefined ? "" : ` at ${sanitize(source.at)}`}`),
+      ...(omittedConfidentialPointer ? ["  - confidential pointer omitted"] : []),
+    ].join("\n");
   const supersedes = record.supersedes.length === 0
     ? "  - none"
     : record.supersedes.map((id) => `  - ${sanitize(id)}`).join("\n");
@@ -420,9 +428,18 @@ async function activeFor(
         if (presence === "absent") return { records: [], reason: "broken-source", completeness: null };
       }
     }
-    const projection = projectActiveReveries(reveries);
+    for (const redaction of parsed.records.filter((record) => record.type === "redaction")) {
+      if (redaction.type !== "redaction") continue;
+      const expected = `rd:${await repository.hashObject(`${redactionPayload(redaction)}\n`)}`;
+      if (expected !== redaction.id) return { records: [], reason: "malformed-note", completeness: null };
+    }
+    const redacted = new Set(projectFactGraph(parsed.records).redacted);
+    const projection = projectActiveReveries(reveries.filter((record) => !redacted.has(record.id)));
     if (projection.cycles.length > 0 || projection.forks.length > 0 || (projection.conflicts?.length ?? 0) > 0) {
       return { records: [], reason: "conflicting-note", completeness: null };
+    }
+    if (projection.active.some((record) => scanSecretMaterial(JSON.stringify(record)).length > 0)) {
+      return { records: [], reason: "sensitive-evidence", completeness: null };
     }
     return { records: projection.active, reason: null, completeness: null };
   } catch {

@@ -10,6 +10,7 @@ import { afterEach, test } from "node:test";
 import {
   blobId,
   canonicalRecord,
+  createRedaction,
   createReverie,
   objectId,
   type ObjectId,
@@ -446,6 +447,66 @@ test("control bytes are neutralized in model-visible evidence", async () => {
   assert.equal(result.context?.includes("\u0000"), false);
   assert.equal(result.context?.includes("\u0007"), false);
   assert.match(result.context ?? "", /Observed event/);
+});
+
+test("soft-redacted records do not enter automatic model delivery", async () => {
+  const { repository } = await setup();
+  const secretRecord = makeRecord("Do not deliver ghp_0123456789abcdefghijklmnopqrstuvwxyz", "A fake GitHub token was pasted.");
+  const redaction = createRedaction(
+    {
+      v: 1,
+      target: secretRecord.id,
+      reason: "The record contains credential material.",
+    },
+    {
+      author_email: "engineer@example.com",
+      session: "codex:test",
+      created_at: "2026-08-25T03:00:00Z",
+    },
+    (bytes) => objectId(createHash("sha1").update(Buffer.from(`blob ${bytes.byteLength}\0`)).update(bytes).digest("hex")),
+  );
+  repository.notes.set(BLOB_A, `${canonicalRecord(secretRecord)}${canonicalRecord(redaction)}`);
+
+  const result = await handleHookEvent(event(), { repository });
+
+  assert.equal(result.context, null);
+  assert.equal(result.reason, null);
+});
+
+test("suspected credentials fail closed before model delivery", async () => {
+  const { repository } = await setup();
+  const secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+  repository.notes.set(BLOB_A, canonicalRecord(makeRecord(`Use boundary with token ${secret}`)));
+
+  const result = await handleHookEvent(event(), { repository });
+
+  assert.equal(result.context, null);
+  assert.equal(result.reason, "sensitive-evidence");
+});
+
+test("automatic delivery omits opaque confidential pointers", async () => {
+  const { repository } = await setup();
+  const pointer = `vault:v1:${"A".repeat(43)}`;
+  const record = createReverie(
+    {
+      v: 1,
+      driving_event: "A restricted review contains additional rationale.",
+      decision: "Keep its details outside the repository.",
+      impact: "The public record carries only an opaque locator.",
+      recurrence_control: null,
+      alternatives: [],
+      sources: [{ relation: "derived-from", kind: "confidential-pointer", ref: pointer }],
+      supersedes: [],
+    },
+    { author_email: "engineer@example.com", session: "codex:test", created_at: "2026-08-25T03:00:00Z" },
+    (bytes) => objectId(createHash("sha1").update(Buffer.from(`blob ${bytes.byteLength}\0`)).update(bytes).digest("hex")),
+  );
+  repository.notes.set(BLOB_A, canonicalRecord(record));
+
+  const result = await handleHookEvent(event(), { repository });
+
+  assert.match(result.context ?? "", /confidential pointer omitted/);
+  assert.equal(result.context?.includes(pointer), false);
 });
 
 test("context truncation omits whole records and reports the count", async () => {

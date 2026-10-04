@@ -6,6 +6,7 @@ import {
   NOTES_REF,
   analyzeContinuity,
   canonicalRecord,
+  confidentialPointer,
   createReverie,
   parseNote,
   projectActiveReveries,
@@ -90,6 +91,42 @@ test("canonical record uses protocol key order and no insignificant whitespace",
     canonicalRecord(record),
     `{"v":1,"type":"reverie","id":"${record.id}","driving_event":"A defect exposed two transition owners.","decision":"Use one guarded boundary because it owns transition validity.","impact":"All writers must use the guarded boundary.","recurrence_control":"A concurrency test rejects stale predecessors.","alternatives":["Keep both owners"],"sources":[{"relation":"caused-by","kind":"issue","ref":"github:org/repo#7"}],"supersedes":[],"author_email":"engineer@example.com","session":"codex:test","created_at":"2026-08-25T03:00:00Z"}\n`,
   );
+});
+
+test("confidential rationale uses a distinct opaque-pointer syntax", () => {
+  const pointer = confidentialPointer(`vault:v1:${"A".repeat(43)}`);
+  const record = make({
+    sources: [{ relation: "derived-from", kind: "confidential-pointer", ref: pointer }],
+  });
+
+  assert.match(canonicalRecord(record), /"kind":"confidential-pointer","ref":"vault:v1:/);
+  assert.throws(() => confidentialPointer("github:org/repo#7"), /vault:v1/);
+  assert.throws(() => make({
+    sources: [{ relation: "derived-from", kind: "confidential-pointer", ref: "confidential rationale" }],
+  }), /vault:v1/);
+});
+
+test("session summaries reject confidential pointers before publication", () => {
+  const record = make({
+    sources: [{ relation: "derived-from", kind: "confidential-pointer", ref: `vault:v1:${"A".repeat(43)}` }],
+  });
+  assert.throws(() => validateNote([{
+    v: 1,
+    type: "session-summary",
+    author_email: record.author_email,
+    session: record.session,
+    created_at: record.created_at,
+    entries: [{
+      driving_event: record.driving_event,
+      decision: record.decision,
+      impact: record.impact,
+      recurrence_control: record.recurrence_control,
+      alternatives: record.alternatives,
+      sources: record.sources,
+      reveries: [],
+      retirements: [],
+    }],
+  }]), /Confidential pointers require an ID-bearing record/);
 });
 
 test("canonical session entries deduplicate set-like arrays", () => {

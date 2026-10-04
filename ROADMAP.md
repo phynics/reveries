@@ -234,7 +234,7 @@ Ticket: [RVR-018](https://github.com/phynics/reveries/issues/18).
 | RVR-015 | P1 | [Model shallow and partial-clone completeness explicitly](https://github.com/phynics/reveries/issues/15) | Core / V1 |
 | RVR-016 | P0 | [Remove the crash-prone lock as a correctness dependency](https://github.com/phynics/reveries/issues/16) | Core / V1 |
 | RVR-017 | P1 | [Define primary authority, mirrors, and optional federation](https://github.com/phynics/reveries/issues/17) — roles, exactly-one-primary resolution, import quarantine, mirror verification, the `reveries role` writer, the `ledger build` authority stamp, and the envelope guard that keeps a quarantined remote out of canonical state all landed, with federation shipping as an off-by-default grammar and gate rather than a live merge path | Core / V1 and V2 |
-| RVR-018 | P1 | [Define redaction, secrets, and confidential-evidence policy](https://github.com/phynics/reveries/issues/18) | Partial / Boundary |
+| RVR-018 | P1 | [Define redaction, secrets, and confidential-evidence policy](https://github.com/phynics/reveries/issues/18) — the secret-free-write and secret-free-transport boundaries, the soft-redaction projection, the distinct confidential-pointer syntax with its signature requirement, and `reveries redact hard` with its discontinuity checkpoint and mirror report all landed. Deletion outside this repository stays a boundary: the command reports the requested remote actions and never claims distributed erasure | Core / V1 + Boundary |
 | RVR-019 | P1 | [Add evidence-diff review surfaces for PRs and IDEs](https://github.com/phynics/reveries/issues/19) | Core + Adapter |
 | RVR-020 | P0 | [Add multi-user, failure, and scale conformance grades](https://github.com/phynics/reveries/issues/20) | Core + Adapter |
 
@@ -254,6 +254,26 @@ evidence for the exact environment it names.
 
 ## Policy boundary
 
-Reveries evidence must be readable by everyone authorized to read the repository. It must never
-contain secrets. Soft redaction can suppress normal display, but it cannot erase bytes from clones,
-bundles, mirrors, or caches. Hard redaction must state that distributed deletion is not guaranteed.
+Reveries evidence is readable by every reader authorized for the repository. Never store credentials,
+customer data, regulated data, or other secrets in a note. Note writes reject recognized credential
+patterns before adding records, and existing resource limits still apply. The scanner is heuristic:
+it catches common formats but cannot prove that evidence is secret-free. Authors must review text
+before recording it, and the outgoing and receive boundaries must scan the complete notes snapshot,
+including soft-redacted history, before transport.
+
+Soft redaction hides a target from normal display, search, and automatic model delivery. It retains
+the original immutable record and makes no claim that the bytes were erased. A secret-bearing
+soft-redacted record is still refused for transport. Confidential rationale stays outside the notes;
+the protocol accepts only an opaque `confidential-pointer` source with the `vault:v1:<43-character-
+base64url-id>` form. The pointer is not a bearer credential. It may appear only in an ID-bearing
+record with a signature over that record; a consumer must verify the trusted signature before it
+relies on the private rationale. Automatic model delivery omits the pointer value.
+
+Hard redaction is implemented as `reveries redact hard <fact-id>... --reason <reason>`. It rewrites
+the canonical notes ref as a new root snapshot without the named facts and the signatures attesting
+exactly them, leaves a `redaction` tombstone on each rewritten subject, deletes the local retention
+refs and the fetched remote-tracking and quarantine refs that still hold the old history in one
+expected-old ref transaction, and publishes a new genesis ledger checkpoint so the discontinuity is
+verifiable. It reports the remote-side action each configured remote needs and states that deletion
+from independent clones, bundles, mirrors, archives, caches, and backups is not guaranteed. It does
+not erase bytes outside this repository, and no command claims global deletion.
