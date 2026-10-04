@@ -3,23 +3,35 @@
 // caller workflow; every tool step resolves through github.action_path and
 // every script invocation passes an explicit --target-dir.
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { test } from "node:test";
 import { parse as parseYaml } from "yaml";
 
 const root = new URL("..", import.meta.url);
 
+const compositeActions = ["reveries-receive-check", "reveries-post-merge", "reveries-evidence-import"];
+
+// Files the composite actions address, relative to the repository root. A
+// composite `run:` step with no `working-directory` starts at the caller's
+// checkout, which is that root.
+const repoRootFiles = [
+  "package-lock.json",
+  "scripts/import-fork-evidence.mjs",
+  "scripts/reveries-post-merge.mjs",
+  "scripts/github-receive-check.mjs",
+];
+
 async function action(name) {
   return readFile(new URL(`.github/actions/${name}/action.yml`, root), "utf8");
 }
 
-for (const name of ["reveries-receive-check", "reveries-post-merge", "reveries-evidence-import"]) {
+for (const name of compositeActions) {
   test(`${name} is a composite action that builds from its own source`, async () => {
     const text = await action(name);
     assert.match(text, /using:\s*["']?composite["']?/);
-    // Every tool step resolves through the action source, never the target,
-    // and every hosted script runs against an explicit target directory.
-    assert.match(text, /github\.action_path/);
+    // Every hosted script runs against an explicit target directory. Steps
+    // must not address their own source through `github.action_path`; the
+    // no-relative-pathing test below enforces the repository-root form.
     assert.match(text, /--target-dir/);
     if (name !== "reveries-evidence-import") {
       // The evidence import is dependency-free (Node.js builtins only), so
@@ -67,7 +79,7 @@ test("the post-merge action documents its write scope and concurrency contract",
 
 test("the evidence-import action publishes an artifact without executing fork code", async () => {
   const text = await action("reveries-evidence-import");
-  assert.match(text, /import-fork-evidence\.mjs/);
+  assert.match(text, /scripts\/import-fork-evidence\.mjs/);
   assert.match(text, /actions\/upload-artifact@/);
   assert.match(text, /REVERIES_EVIDENCE_OUTPUT/);
 });
@@ -96,27 +108,55 @@ test("the evidence-import caller stays on pull_request_target with read-only per
   assert.doesNotMatch(text, /node scripts\/import-fork-evidence\.mjs/);
 });
 
-test("the evidence-import action resolves its script path to an existing repository file", async () => {
-  const actionDir = new URL("./.github/actions/reveries-evidence-import/", root);
-  const text = await readFile(new URL("action.yml", actionDir), "utf8");
-  const match = text.match(/github\.action_path\s*\}\}\s*\/((?:\.\.\/)+)scripts\/import-fork-evidence\.mjs/);
-  assert.ok(match, "action must reference the repo-root scripts directory");
-
-  // The literal path decides the fix. Resolve it exactly as the runner does,
-  // relative to `github.action_path` (the action directory), and require the
-  // result to be the repo-root scripts directory. A hardcoded same-path
-  // `new URL("../../../...", actionDir)` assertion would keep passing after
-  // someone reverted the manifest to `../../`, so it could not catch the bug
-  // that shipped on main.
-  const resolved = new URL(`${match[1]}scripts/import-fork-evidence.mjs`, actionDir);
-  assert.equal(
-    resolved.pathname,
-    new URL("scripts/import-fork-evidence.mjs", root).pathname,
-    "action must resolve to the repository root, not .github/",
-  );
-  const { stat } = await import("node:fs/promises");
-  await stat(resolved);
+test("no composite action addresses its source with relative path segments", async () => {
+  // `actions/setup-node` rejects a `cache-dependency-path` that still contains
+  // "." or ".." segments, which failed the post-merge workflow on main with
+  // "Relative pathing '.' and '..' is not allowed" before any build step ran.
+  // A composite `run:` step already starts at the caller's checkout, so the
+  // plain repository-root form is simpler and accepted by every tool.
+  const offenders = [];
+  for (const name of compositeActions) {
+    for (const [index, line] of (await action(name)).split("\n").entries()) {
+      const code = line.split("#")[0];
+      if (/github\.action_path/.test(code) || /(?:^|[\s"'=:(])\.\.\//.test(code) || /\/\.\//.test(code)) {
+        offenders.push(`${name}/action.yml:${index + 1}: ${line.trim()}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], `actions must not address their source through github.action_path or ../ segments:\n${offenders.join("\n")}`);
 });
+
+for (const name of compositeActions) {
+  test(`${name} references only repository files that exist`, async () => {
+    const manifest = parseYaml(await action(name));
+    const references = new Set();
+    for (const step of manifest.runs.steps) {
+      const fields = [step.run, step["working-directory"], step.with?.["cache-dependency-path"]];
+      for (const value of fields) {
+        if (typeof value !== "string") continue;
+        for (const token of value.matchAll(/(?:^|[\s"'])((?:[\w.-]+\/)*[\w.-]+\.(?:json|mjs|cjs|js))\b/g)) {
+          references.add(token[1]);
+        }
+      }
+    }
+    // No false positives and no cross-action over-reach: every literal each
+    // action names must be one this repository owns at the root.
+    assert.deepEqual([...references].filter((path) => !repoRootFiles.includes(path)), []);
+    // The actions collectively cover every repository file the guard knows,
+    // so removing a reference cannot silently shrink the check.
+    const covered = new Set();
+    for (const other of compositeActions) {
+      for (const step of parseYaml(await action(other)).runs.steps) {
+        for (const value of [step.run, step["working-directory"], step.with?.["cache-dependency-path"]]) {
+          if (typeof value !== "string") continue;
+          for (const token of value.matchAll(/(?:^|[\s"'])((?:[\w.-]+\/)*[\w.-]+\.(?:json|mjs|cjs|js))\b/g)) covered.add(token[1]);
+        }
+      }
+    }
+    assert.deepEqual([...repoRootFiles].filter((path) => !covered.has(path)), []);
+    for (const path of references) await stat(new URL(path, root));
+  });
+}
 
 // RVR-027 portability guard: the runner evaluates `${{ }}` expressions
 // anywhere in an action manifest, including the top-level `name` and
@@ -124,7 +164,7 @@ test("the evidence-import action resolves its script path to an existing reposit
 // so an expression there fails the whole action with "Unrecognized
 // named-value: 'github'" before any step runs. Keep load-time metadata to
 // plain text; expressions belong in inputs, env, and run steps.
-for (const name of ["reveries-receive-check", "reveries-post-merge", "reveries-evidence-import"]) {
+for (const name of compositeActions) {
   test(`${name} keeps load-time metadata free of Actions expressions`, async () => {
     const manifest = parseYaml(await action(name));
     for (const field of ["name", "description"]) {
