@@ -327,7 +327,6 @@ function parseReverieId(value: string): ReturnType<typeof reverieId> {
   }
 }
 
-/** Parse one ID a hard redaction may name, using the protocol's own vocabulary. */
 async function readDraft(from: string | undefined, io: CliIo): Promise<unknown> {
   if (from === undefined) return {};
   let input: string;
@@ -589,10 +588,6 @@ function stringField(value: Record<string, unknown>, field: string, fallback = "
   return typeof item === "string" ? item : fallback;
 }
 
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
 function formatRecord(record: unknown, indent = "  "): string[] {
   const value = asRecord(record);
   if (value === null) return [`${indent}${String(record)}`];
@@ -603,14 +598,6 @@ function formatRecord(record: unknown, indent = "  "): string[] {
       ...(region === null ? [] : [
         `${indent}  Region: ${String(stringField(region, "blob")).slice(0, 12)} lines ${String(region.start_line_hint)}-${String(region.end_line_hint)} (exact ${String(stringField(region, "exact_hash")).slice(0, 12)})`,
       ]),
-      `${indent}  Event: ${stringField(value, "driving_event")}`,
-      `${indent}  Impact: ${stringField(value, "impact")}`,
-    ];
-  }
-  if (value.type === "occurrence") {
-    const occurrence = asRecord(value.occurrence) ?? {};
-    return [
-      `${indent}${stringField(value, "id")} (occurrence at ${stringField(occurrence, "path")} @ ${stringField(occurrence, "commit").slice(0, 12)}): ${stringField(value, "decision")}`,
       `${indent}  Event: ${stringField(value, "driving_event")}`,
       `${indent}  Impact: ${stringField(value, "impact")}`,
     ];
@@ -634,24 +621,6 @@ function formatRecord(record: unknown, indent = "  "): string[] {
       `${indent}  Impact: ${stringField(value, "impact")}`,
       `${indent}  This pairing discharges nothing: each decision on a predecessor still needs a continuation on every successor, a supersession, or a retirement.`,
     ];
-  }
-  if (value.type === "session-summary") {
-    const entries = Array.isArray(value.entries) ? value.entries : [];
-    return [
-      `${indent}Session summary by ${stringField(value, "author_email")}`,
-      ...entries.flatMap((entry, index) => {
-        const item = asRecord(entry);
-        if (item === null) return [];
-        return [
-          `${indent}  ${index + 1}. ${stringField(item, "decision")}`,
-          `${indent}     Event: ${stringField(item, "driving_event")}`,
-          `${indent}     Impact: ${stringField(item, "impact")}`,
-        ];
-      }),
-    ];
-  }
-  if (value.type === "reveries-init") {
-    return [`${indent}Initialization record for ${stringList(value.publishing_remotes).join(", ") || "local-only use"}`];
   }
   return [`${indent}${JSON.stringify(value)}`];
 }
