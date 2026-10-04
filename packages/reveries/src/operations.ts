@@ -117,8 +117,7 @@ import {
   LEDGER_SIGNATURES_PATH,
   LEDGER_SIGNATURE_TIMESTAMP,
   matchTrackingRefRemote,
-  RETENTION_COMMITS_REF,
-  RETENTION_OBJECTS_REF,
+  RETENTION_REF,
   SnapshotIndexCorruptError,
   type CompletenessGrade,
   type NoteListEntry,
@@ -2198,8 +2197,7 @@ export class Reveries {
         ledgerCheckpoint: checkpoint,
         expectedNotes,
         expectedLedger,
-        expectedRetentionObjects: vault.objectsTip,
-        expectedRetentionCommits: vault.commitsTip,
+        expectedRetention: vault.commit,
         obsoleteRefs: obsolete,
       });
     } catch (error: unknown) {
@@ -3888,11 +3886,11 @@ export class Reveries {
       selected.set(subject.object, subject.type);
     }
     if (policy === "archive") {
-      const vault = await this.repository.listRetentionObjects();
-      for (const object of await this.repository.listRetentionCommits()) {
+      const vault = await this.repository.readRetention();
+      for (const object of vault.commits) {
         if (!selected.has(object)) selected.set(object, "commit");
       }
-      for (const object of vault) {
+      for (const object of vault.objects) {
         if (selected.has(object)) continue;
         const type = await this.repository.objectType(object);
         if (type === "blob" || type === "tree") selected.set(object, type);
@@ -3904,17 +3902,11 @@ export class Reveries {
   }
 
   private async retentionVault(): Promise<{
-    readonly objectsTip: ObjectId | null;
+    readonly commit: ObjectId | null;
     readonly objects: readonly ObjectId[];
-    readonly commitsTip: ObjectId | null;
+    readonly commits: readonly ObjectId[];
   }> {
-    const objectsTip = await this.repository.notesTip(RETENTION_OBJECTS_REF);
-    const chain = await this.repository.retentionCommits();
-    return {
-      objectsTip,
-      objects: await this.repository.listRetentionObjects(),
-      commitsTip: chain.tip,
-    };
+    return this.repository.readRetention();
   }
 
   async retentionStatus(policy?: RetentionPolicy): Promise<RetentionStatus> {
@@ -3924,7 +3916,7 @@ export class Reveries {
     }
     const expected = (await this.retentionSelection(resolved)).map((subject) => subject.object);
     const vault = await this.retentionVault();
-    const retained = [...new Set([...vault.objects, ...await this.repository.listRetentionCommits()])]
+    const retained = [...new Set([...vault.objects, ...vault.commits])]
       .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
     const missing = expected.filter((object) => !retained.includes(object));
     return {
@@ -3938,36 +3930,25 @@ export class Reveries {
 
   /**
    * Rebuild the retention vault from evidence. Only the explicit `none` policy removes
-   * retention; an empty selection leaves the existing vault untouched.
+   * retention; an empty selection leaves the existing vault untouched. The single
+   * retention ref is a deterministic function of the selected subjects.
    */
   async retain(): Promise<RetentionResult> {
     const policy = await this.retentionPolicy();
     const vault = await this.retentionVault();
     if (policy === "none") {
-      if (vault.objectsTip === null && vault.commitsTip === null) {
+      if (vault.commit === null) {
         return { ...(await this.retentionStatus("none")), changed: false };
       }
-      await this.repository.deleteRetentionRefs({
-        objects: vault.objectsTip,
-        commits: vault.commitsTip,
-      });
+      await this.repository.deleteRetentionRef(vault.commit);
       return { ...(await this.retentionStatus("none")), changed: true };
     }
     const selection = await this.retentionSelection(policy);
     if (selection.length === 0) {
       return { ...(await this.retentionStatus(policy)), changed: false };
     }
-    const objects = await this.repository.writeRetentionObjects(
-      selection.filter((subject) => subject.type !== "commit"),
-    );
-    const commits = await this.repository.writeRetentionCommits(
-      selection.filter((subject) => subject.type === "commit").map((subject) => subject.object),
-      vault.commitsTip,
-    );
-    await this.repository.updateRetentionRefs({
-      objects: { next: objects, expected: vault.objectsTip },
-      commits: { next: commits, expected: vault.commitsTip },
-    });
+    const next = await this.repository.writeRetention(selection);
+    await this.repository.updateRetentionRef({ next, expected: vault.commit });
     return { ...(await this.retentionStatus(policy)), changed: true };
   }
 
@@ -4049,7 +4030,7 @@ export class Reveries {
     }
 
     if (manifest.retention_commit !== null
-      && !(await this.repository.isRetentionCheckpoint(manifest.retention_commit))) {
+      && !(await this.repository.isRetentionCommit(manifest.retention_commit))) {
       diagnostics.push(`Ledger retention_commit ${manifest.retention_commit} is not a retention checkpoint`);
     }
 
@@ -4202,7 +4183,7 @@ export class Reveries {
     const notesTree = notesTip === null ? null : await this.repository.treeForCommit(notesTip);
     const retentionCommit = input.retentionCommit !== undefined
       ? input.retentionCommit
-      : (await this.repository.retentionCommits()).tip;
+      : (await this.repository.readRetention()).commit;
     let totals = { subjects: 0, records: 0, noteBytes: 0 };
     if (notesTip !== null) {
       // The totals come from the canonical notes ref rather than from the ledger

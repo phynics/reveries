@@ -10,8 +10,7 @@ import { Reveries } from "../src/operations.ts";
 import {
   NOTES_REF,
   RETENTION_BUNDLE_REFS,
-  RETENTION_COMMITS_REF,
-  RETENTION_OBJECTS_REF,
+  RETENTION_REF,
 } from "../src/git.ts";
 import { blobId, objectId, type ReverieInput, type ReverieMetadata, type ReveriesInit, type SessionSummary } from "../src/protocol.ts";
 
@@ -712,18 +711,17 @@ test("the none policy removes retention and an empty rebuild never does", async 
   const reveries = await Reveries.open(directory);
   const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
   await reveries.retain();
-  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  const objectsTip = await reveries.repository.notesTip(RETENTION_REF);
   assert.notEqual(objectsTip, null);
 
   await git(directory, "config", "reveries.retention", "none");
   const removed = await reveries.retain();
   assert.equal(removed.changed, true);
-  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), null);
-  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), null);
+  assert.equal(await reveries.repository.notesTip(RETENTION_REF), null);
 
   await git(directory, "config", "reveries.retention", "all");
   await reveries.retain();
-  const restored = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
+  const restored = await reveries.repository.notesTip(RETENTION_REF);
   await writeFile(join(directory, "state.txt"), "third\n", "utf8");
   await git(directory, "add", "state.txt");
   const second = await reveries.repository.resolvePath({ path: "state.txt", revision: "index" });
@@ -731,7 +729,7 @@ test("the none policy removes retention and an empty rebuild never does", async 
   const empty = await reveries.retain();
 
   assert.deepEqual([...empty.retained], [recorded.object]);
-  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), restored);
+  assert.equal(await reveries.repository.notesTip(RETENTION_REF), restored);
 });
 
 test("doctor reports retention coverage and the subjects a vault misses", async () => {
@@ -780,17 +778,14 @@ test("a vault rebuilt from evidence reproduces the same objects", async () => {
   const commit = await reveries.commitWithSummary({ message: "annotated work", summary: summary() });
   await git(directory, "config", "reveries.retention", "all");
   const first = await reveries.retain();
-  const objectsTip = await reveries.repository.notesTip(RETENTION_OBJECTS_REF);
-  const commitsTip = await reveries.repository.notesTip(RETENTION_COMMITS_REF);
-  assert.notEqual(objectsTip, null);
-  assert.notEqual(commitsTip, null);
+  const retentionTip = await reveries.repository.notesTip(RETENTION_REF);
+  assert.notEqual(retentionTip, null);
 
-  await reveries.repository.deleteRetentionRefs({ objects: objectsTip, commits: commitsTip });
+  await reveries.repository.deleteRetentionRef(retentionTip);
   const rebuilt = await reveries.retain();
 
   assert.equal(rebuilt.changed, true);
-  assert.equal(await reveries.repository.notesTip(RETENTION_OBJECTS_REF), objectsTip);
-  assert.equal(await reveries.repository.notesTip(RETENTION_COMMITS_REF), commitsTip);
+  assert.equal(await reveries.repository.notesTip(RETENTION_REF), retentionTip);
   assert.deepEqual([...first.retained].sort(), [recorded.object, commit].sort());
 });
 
@@ -813,7 +808,7 @@ test("a bundle carries notes, ledger, and retention refs", async () => {
   await git(directory, "bundle", "create", created, ...refs);
   const heads = await git(directory, "bundle", "list-heads", created);
 
-  for (const ref of [NOTES_REF, "refs/heads/reveries-ledger", RETENTION_OBJECTS_REF, RETENTION_COMMITS_REF]) {
+  for (const ref of [NOTES_REF, "refs/heads/reveries-ledger", RETENTION_REF]) {
     assert.match(heads, new RegExp(`^\\S+ ${ref}$`, "m"), `the bundle is missing ${ref}`);
   }
 });

@@ -48,13 +48,20 @@ export const LEDGER_SIGNATURES_PATH = "signatures";
  * `LEDGER_IDENTITY` epoch the commit itself already uses.
  */
 export const LEDGER_SIGNATURE_TIMESTAMP = "1970-01-01T00:00:00Z";
+/**
+ * The single authoritative retention ref. It points at one deterministic
+ * commit whose tree holds every retained blob and tree and whose parents are
+ * the retained commits. Reachability is the only meaning; there is no
+ * semantic state in retention.
+ */
+export const RETENTION_REF = "refs/reveries/retention";
+/** Legacy retention refs, read only by the migration helper. */
 export const RETENTION_OBJECTS_REF = "refs/reveries/retention/objects";
 export const RETENTION_COMMITS_REF = "refs/reveries/retention/commits";
 export const RETENTION_BUNDLE_REFS = [
   NOTES_REF,
   LEDGER_REF,
-  RETENTION_OBJECTS_REF,
-  RETENTION_COMMITS_REF,
+  RETENTION_REF,
 ] as const;
 export const INTERNAL_ATOMIC_PUSH_ENV = "REVERIES_INTERNAL_ATOMIC_PUSH";
 
@@ -1515,15 +1522,13 @@ export class GitRepository {
     readonly ledgerCheckpoint: ObjectId;
     readonly expectedNotes: ObjectId | null;
     readonly expectedLedger: ObjectId | null;
-    readonly expectedRetentionObjects: ObjectId | null;
-    readonly expectedRetentionCommits: ObjectId | null;
+    readonly expectedRetention: ObjectId | null;
     readonly obsoleteRefs: readonly { readonly ref: string; readonly expected: ObjectId }[];
   }): Promise<void> {
     const updates: { ref: string; next: ObjectId | null; expected: ObjectId | null }[] = [
       { ref: NOTES_REF, next: input.notesCommit, expected: input.expectedNotes },
       { ref: LEDGER_REF, next: input.ledgerCheckpoint, expected: input.expectedLedger },
-      { ref: RETENTION_OBJECTS_REF, next: null, expected: input.expectedRetentionObjects },
-      { ref: RETENTION_COMMITS_REF, next: null, expected: input.expectedRetentionCommits },
+      { ref: RETENTION_REF, next: null, expected: input.expectedRetention },
     ];
     const allowedObsoleteRef = (ref: string): boolean =>
       (ref.startsWith("refs/notes/remotes/") && ref.endsWith("/reveries"))
@@ -1839,7 +1844,13 @@ export class GitRepository {
     return parseObjectId((await this.run(["mktree"], { input: "" })).stdout.trim(), "git mktree");
   }
 
-  /** Build the retention fanout tree for blob and tree subjects. */
+  /**
+   * Build the retention fanout tree for blob and tree subjects.
+   *
+   * The tree is a pure function of the subject set: each object ID is placed
+   * under a two-character prefix directory in sorted order, so the same
+   * evidence always produces the same tree object.
+   */
   async writeRetentionObjects(subjects: readonly RetentionSubject[]): Promise<ObjectId> {
     const unique = new Map<string, RetentionSubject["type"]>();
     for (const subject of subjects) {
@@ -1872,20 +1883,21 @@ export class GitRepository {
     }
   }
 
-  /** Advance the braided retention chain over the newly selected annotated commits. */
-  async writeRetentionCommits(
-    subjects: readonly ObjectId[],
-    previousTip: ObjectId | null,
-  ): Promise<ObjectId | null> {
-    const retained = new Set((await this.retentionCommits()).subjects);
-    const additions = [...new Set(subjects)]
-      .filter((object) => !retained.has(object))
+  /**
+   * Build the single retention checkpoint commit.
+   *
+   * One commit carries every retained blob and tree in its tree and every
+   * retained commit as a parent. The fixed identity, fixed epoch date, and
+   * fixed message make the commit object ID a pure function of the evidence,
+   * so a rebuild from the same notes reproduces the same ref target. There is
+   * no append-only chain and no second database.
+   */
+  async writeRetention(subjects: readonly RetentionSubject[]): Promise<ObjectId> {
+    const tree = await this.writeRetentionObjects(subjects.filter((subject) => subject.type !== "commit"));
+    const commits = [...new Set(subjects.filter((subject) => subject.type === "commit").map((subject) => subject.object))]
       .sort(compareUtf8);
-    if (additions.length === 0) return previousTip;
-    const tree = parseObjectId((await this.run(["mktree"], { input: "" })).stdout, "git mktree");
     const argumentsList = ["commit-tree", tree];
-    if (previousTip !== null) argumentsList.push("-p", previousTip);
-    for (const object of additions) argumentsList.push("-p", object);
+    for (const commit of commits) argumentsList.push("-p", commit);
     argumentsList.push("-F", "-");
     return parseObjectId(
       (await this.run(argumentsList, {
@@ -1896,55 +1908,25 @@ export class GitRepository {
     );
   }
 
-  /** Walk the chain to recover its tip and every annotated commit it anchors. */
-  async retentionCommits(): Promise<{ readonly tip: ObjectId | null; readonly subjects: readonly ObjectId[] }> {
-    const tip = await this.notesTip(RETENTION_COMMITS_REF);
-    if (tip === null) return { tip: null, subjects: [] };
-    const subjects: ObjectId[] = [];
-    const seen = new Set<string>();
-    let current: ObjectId | null = tip;
-    while (current !== null && !seen.has(current)) {
-      seen.add(current);
-      const parents = await this.retentionCheckpointParents(current);
-      if (parents === null) break;
-      const { chain, retained } = parents;
-      subjects.push(...retained);
-      current = chain;
-    }
-    return { tip, subjects: [...new Set(subjects)].sort(compareUtf8) };
-  }
-
   /**
-   * A checkpoint is an empty tree carrying the fixed message. Its first parent is the
-   * previous checkpoint when that parent is itself a checkpoint; every other parent is
-   * an annotated commit the chain anchors.
+   * Read `refs/reveries/retention` without interpreting it: the checkpoint
+   * commit, the blobs and trees in its tree, and the commits named as parents.
    */
-  private async retentionCheckpointParents(commit: ObjectId): Promise<{
-    readonly chain: ObjectId | null;
-    readonly retained: readonly ObjectId[];
-  } | null> {
-    const result = await this.run(["show", "-s", "--format=%T%n%s%n%P", commit]);
-    const [tree, subject, parentLine] = result.stdout.split("\n");
-    if (tree !== (await this.emptyTree()) || subject !== RETENTION_MESSAGE.trimEnd()) return null;
-    const parents = (parentLine ?? "").split(" ").filter((parent) => parent.length > 0);
-    const first = parents[0];
-    if (first === undefined) return { chain: null, retained: [] };
-    if (await this.isRetentionCheckpoint(first)) {
-      return { chain: objectId(first), retained: parents.slice(1).map((parent) => objectId(parent)) };
-    }
-    return { chain: null, retained: parents.map((parent) => objectId(parent)) };
+  async readRetention(): Promise<{
+    readonly commit: ObjectId | null;
+    readonly objects: readonly ObjectId[];
+    readonly commits: readonly ObjectId[];
+  }> {
+    const commit = await this.notesTip(RETENTION_REF);
+    if (commit === null) return { commit: null, objects: [], commits: [] };
+    return {
+      commit,
+      objects: await this.listRetentionObjects(),
+      commits: await this.listRetentionCommits(),
+    };
   }
 
-  /** True when the commit is a retention checkpoint: the fixed identity, message, and empty tree. */
-  async isRetentionCheckpoint(commit: string): Promise<boolean> {
-    if (!isObjectId(commit)) return false;
-    const result = await this.run(["show", "-s", "--format=%T%n%s", commit], { allowExitCodes: [0, 1, 128] });
-    if (result.exitCode !== 0) return false;
-    const [tree, subject] = result.stdout.split("\n");
-    return tree === (await this.emptyTree()) && subject === RETENTION_MESSAGE.trimEnd();
-  }
-
-  async listRetentionObjects(ref = RETENTION_OBJECTS_REF): Promise<readonly ObjectId[]> {
+  async listRetentionObjects(ref = RETENTION_REF): Promise<readonly ObjectId[]> {
     const result = await this.run(["ls-tree", "-r", "-z", ref], { allowExitCodes: [0, 1, 128] });
     if (result.exitCode !== 0) return [];
     return result.stdout
@@ -1960,50 +1942,42 @@ export class GitRepository {
   }
 
   async listRetentionCommits(): Promise<readonly ObjectId[]> {
-    return (await this.retentionCommits()).subjects;
+    const commit = await this.notesTip(RETENTION_REF);
+    if (commit === null) return [];
+    const result = await this.run(["show", "-s", "--format=%P", commit], { allowExitCodes: [0, 1, 128] });
+    if (result.exitCode !== 0) return [];
+    return result.stdout.trim().split(" ").filter((parent) => parent.length > 0).map((parent) => objectId(parent));
   }
 
-  async updateRetentionRefs(updates: {
-    readonly objects: { readonly next: ObjectId; readonly expected?: ObjectId | null };
-    readonly commits?: { readonly next: ObjectId | null; readonly expected?: ObjectId | null };
+  /** True when the commit is a Reveries retention checkpoint: the fixed message. */
+  async isRetentionCommit(commit: string): Promise<boolean> {
+    if (!isObjectId(commit)) return false;
+    const result = await this.run(["show", "-s", "--format=%s", commit], { allowExitCodes: [0, 1, 128] });
+    return result.exitCode === 0 && result.stdout.trim() === RETENTION_MESSAGE.trimEnd();
+  }
+
+  async updateRetentionRef(update: {
+    readonly next: ObjectId | null;
+    readonly expected?: ObjectId | null;
   }): Promise<void> {
-    const transactions: { ref: string; next: ObjectId | null; expected: ObjectId | null }[] = [{
-      ref: RETENTION_OBJECTS_REF,
-      next: updates.objects.next,
-      expected: updates.objects.expected ?? null,
-    }];
-    if (updates.commits !== undefined) {
-      transactions.push({
-        ref: RETENTION_COMMITS_REF,
-        next: updates.commits.next,
-        expected: updates.commits.expected ?? null,
-      });
-    }
-    await this.moveRefs(transactions);
+    await this.moveRetentionRef({ ref: RETENTION_REF, next: update.next, expected: update.expected ?? null });
   }
 
-  async deleteRetentionRefs(expected: {
-    readonly objects: ObjectId | null;
-    readonly commits: ObjectId | null;
-  }): Promise<void> {
-    await this.moveRefs([
-      { ref: RETENTION_OBJECTS_REF, next: null, expected: expected.objects },
-      { ref: RETENTION_COMMITS_REF, next: null, expected: expected.commits },
-    ]);
+  async deleteRetentionRef(expected: ObjectId | null): Promise<void> {
+    await this.moveRetentionRef({ ref: RETENTION_REF, next: null, expected });
   }
 
-  private async moveRefs(updates: readonly {
+  private async moveRetentionRef(update: {
     readonly ref: string;
     readonly next: ObjectId | null;
     readonly expected: ObjectId | null;
-  }[]): Promise<void> {
+  }): Promise<void> {
     try {
-      await this.updateRefsAtomically(updates);
+      await this.updateRefsAtomically([update]);
     } catch (error: unknown) {
-      throw new Error("The Reveries retention refs changed concurrently", { cause: error });
+      throw new Error("The Reveries retention ref changed concurrently", { cause: error });
     }
   }
-
   private async emptyTree(): Promise<string> {
     return (await this.run(["mktree"], { input: "" })).stdout.trim();
   }
