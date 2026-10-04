@@ -476,14 +476,24 @@ test("a merge refused for a moved head is reported rather than retried", async (
 
 // --- The binding directory the two steps must agree on ----------------------
 
-test("the binding producer and the upload step read one job-level directory", async () => {
+test("the binding producer and the upload step agree on one directory", async () => {
   const receive = await readFile(new URL("../.github/workflows/reveries-receive-check.yml", import.meta.url), "utf8");
-  // A step-scoped `env:` does not reach later steps, so the variable has to be at
-  // job level for the upload step to resolve it at all.
+
+  // The `runner` context is not available to a job-level `env:`. GitHub does not
+  // report the bad expression; it rejects the whole workflow file, so the name
+  // falls back to the raw path, no triggers register, and every push produces a
+  // zero-job failure while the required check never reports. That is what took
+  // the receive check offline. Resolve the directory in the step that uses it.
   const jobEnv = receive.match(/^    env:\n((?:      .+\n)+)/m)?.[1] ?? "";
-  assert.match(jobEnv, /BINDING_DIR: \$\{\{ runner\.temp \}\}\/reveries-binding/);
-  assert.doesNotMatch(receive, /^        env:\n          BINDING_DIR/m, "BINDING_DIR must not be step-scoped");
-  assert.match(receive, /path: \$\{\{ env\.BINDING_DIR \}\}\/binding\.json/);
+  assert.doesNotMatch(jobEnv, /\$\{\{ runner\./, "a job-level env: cannot reference the runner context");
+  assert.doesNotMatch(receive, /^    env:\n(?:      .+\n)*?      BINDING_DIR:/m, "BINDING_DIR must not be job-scoped");
+
+  // The producer resolves it and publishes the resolved path, and the upload
+  // step reads that output, so the two cannot drift.
+  assert.match(receive, /BINDING_DIR: \$\{\{ runner\.temp \}\}\/reveries-binding/);
+  assert.match(receive, /id: binding/);
+  assert.match(receive, /echo "dir=\$BINDING_DIR" >> "\$GITHUB_OUTPUT"/);
+  assert.match(receive, /path: \$\{\{ steps\.binding\.outputs\.dir \}\}\/binding\.json/);
 
   // The producer writes to the same variable, so the two cannot drift.
   const publisher = await readFile(new URL("./publish-receive-check-binding.mjs", import.meta.url), "utf8");
