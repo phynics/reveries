@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reveriesCliPath = join(workspace, "packages", "reveries", "dist", "src", "main.js");
 const jsonMode = process.argv.includes("--json");
+const outIndex = process.argv.indexOf("--out");
+const outPath = outIndex >= 0 ? process.argv[outIndex + 1] : undefined;
 
 function run(command, args, cwd, input = "") {
   return new Promise((resolvePromise, reject) => {
@@ -509,8 +511,17 @@ try {
     }
   }
   const ok = results.every((result) => result.ok);
+  const report = {
+    ok,
+    generated_at: new Date().toISOString(),
+    git_version: (await run("git", ["--version"], root)).trim(),
+    criteria: results,
+  };
+  if (outPath !== undefined && outPath.length > 0) {
+    await writeFile(outPath, `${JSON.stringify(report)}\n`, "utf8");
+  }
   if (jsonMode) {
-    process.stdout.write(`${JSON.stringify({ ok, criteria: results })}\n`);
+    process.stdout.write(`${JSON.stringify(report)}\n`);
   } else {
     for (const result of results) {
       process.stdout.write(`${result.ok ? "PASS" : "FAIL"} ${result.id}. ${result.title}\n`);
