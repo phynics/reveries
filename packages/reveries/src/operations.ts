@@ -801,7 +801,6 @@ export class Reveries {
         },
       }),
       (ref) => this.validateNotesRef(ref),
-      undefined,
       options,
     );
   }
