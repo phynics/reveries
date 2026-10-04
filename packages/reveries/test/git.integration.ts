@@ -10,8 +10,7 @@ import {
   GitRepository,
   NOTES_REF,
   RETENTION_BUNDLE_REFS,
-  RETENTION_COMMITS_REF,
-  RETENTION_OBJECTS_REF,
+  RETENTION_REF,
 } from "../src/git.ts";
 import { blobId, type ObjectId } from "../src/protocol.ts";
 
@@ -182,110 +181,92 @@ test("two clones merge independent canonical note lines without loss", async () 
   assert.match(merged ?? "", /"record":"b"/);
 });
 
-test("retention stores blobs in a fanout tree and commits in a braided chain", async () => {
+test("retention stores blobs in a fanout tree and commits as checkpoint parents", async () => {
   const directory = await createRepository();
   const repository = await GitRepository.open(directory);
   const blob = await repository.resolvePath({ path: "state.txt", revision: "HEAD" });
   const control = blobId((await repository.run(["hash-object", "-w", "--stdin"], { input: "control\n" })).stdout.trim());
+  const commit = await repository.resolveCommit("HEAD") as ObjectId;
 
-  const objects = await repository.writeRetentionObjects([
+  const checkpoint = await repository.writeRetention([
     { object: blob, type: "blob" },
     { object: control, type: "blob" },
+    { object: commit, type: "commit" },
   ]);
-  const commits = await repository.writeRetentionCommits(
-    [await repository.resolveCommit("HEAD") as ObjectId],
-    null,
-  );
-  await repository.updateRetentionRefs({
-    objects: { next: objects },
-    commits: { next: commits },
-  });
+  await repository.updateRetentionRef({ next: checkpoint });
 
   const stored = await repository.listRetentionObjects();
   assert.deepEqual([...stored].sort(), [...new Set([blob, control])].sort());
-  const paths = await git(directory, "ls-tree", "-r", "--name-only", RETENTION_OBJECTS_REF);
+  const paths = await git(directory, "ls-tree", "-r", "--name-only", RETENTION_REF);
   assert.deepEqual(
     paths.split("\n").sort(),
     [`${blob.slice(0, 2)}/${blob.slice(2)}`, `${control.slice(0, 2)}/${control.slice(2)}`].sort(),
   );
-  assert.deepEqual(await repository.listRetentionCommits(), [await repository.resolveCommit("HEAD") as ObjectId]);
-  assert.equal(await repository.objectType(await repository.notesTip(RETENTION_OBJECTS_REF) as ObjectId), "tree");
-  assert.equal(await repository.objectType(await repository.notesTip(RETENTION_COMMITS_REF) as ObjectId), "commit");
+  assert.deepEqual(await repository.listRetentionCommits(), [commit]);
+  assert.equal(await repository.objectType(await repository.notesTip(RETENTION_REF) as ObjectId), "commit");
+  assert.deepEqual(await repository.readRetention(), { commit: checkpoint, objects: [...stored].sort(), commits: [commit] });
 });
 
 test("retention rebuilds are byte-stable for the same subject set", async () => {
   const directory = await createRepository();
   const repository = await GitRepository.open(directory);
   const blob = await repository.resolvePath({ path: "state.txt", revision: "HEAD" });
-  const subjects = [{ object: blob, type: "blob" as const }];
-  const commit = await repository.resolveCommit("HEAD");
+  const commit = await repository.resolveCommit("HEAD") as ObjectId;
+  const subjects = [
+    { object: blob, type: "blob" as const },
+    { object: commit, type: "commit" as const },
+  ];
 
-  const firstObjects = await repository.writeRetentionObjects(subjects);
-  const firstChain = await repository.writeRetentionCommits([commit], null);
-  await repository.updateRetentionRefs({
-    objects: { next: firstObjects },
-    commits: { next: firstChain },
-  });
-  await repository.deleteRetentionRefs({
-    objects: firstObjects,
-    commits: firstChain,
-  });
+  const first = await repository.writeRetention(subjects);
+  await repository.updateRetentionRef({ next: first });
+  await repository.deleteRetentionRef(first);
 
-  assert.equal(await repository.writeRetentionObjects(subjects), firstObjects);
-  assert.equal(await repository.writeRetentionCommits([commit], null), firstChain);
+  assert.equal(await repository.writeRetention(subjects), first);
 });
 
-test("a stale retention expectation moves neither ref", async () => {
+test("a stale retention expectation moves the ref nowhere", async () => {
   const directory = await createRepository();
   const repository = await GitRepository.open(directory);
   const blob = await repository.resolvePath({ path: "state.txt", revision: "HEAD" });
-  const commit = await repository.resolveCommit("HEAD");
-  const objects = await repository.writeRetentionObjects([{ object: blob, type: "blob" }]);
-  const commits = await repository.writeRetentionCommits([commit], null);
-  await repository.updateRetentionRefs({ objects: { next: objects }, commits: { next: commits } });
+  const first = await repository.writeRetention([{ object: blob, type: "blob" }]);
+  await repository.updateRetentionRef({ next: first });
 
   const control = blobId((await repository.run(["hash-object", "-w", "--stdin"], { input: "control\n" })).stdout.trim());
-  const replacement = await repository.writeRetentionObjects([
+  const replacement = await repository.writeRetention([
     { object: blob, type: "blob" },
     { object: control, type: "blob" },
   ]);
-
-  const stale = await repository.writeRetentionObjects([]);
+  const stale = await repository.writeRetention([]);
   await assert.rejects(
-    () => repository.updateRetentionRefs({
-      objects: { next: replacement, expected: stale },
-      commits: { next: commits, expected: commits },
-    }),
+    () => repository.updateRetentionRef({ next: replacement, expected: stale }),
     /concurrently|stale|changed/i,
   );
-  assert.equal(await repository.notesTip(RETENTION_OBJECTS_REF), objects);
-  assert.equal(await repository.notesTip(RETENTION_COMMITS_REF), commits);
+  assert.equal(await repository.notesTip(RETENTION_REF), first);
 });
 
-test("retention removal requires the expected current tips", async () => {
+test("retention removal requires the expected current tip", async () => {
   const directory = await createRepository();
   const repository = await GitRepository.open(directory);
   const blob = await repository.resolvePath({ path: "state.txt", revision: "HEAD" });
-  const objects = await repository.writeRetentionObjects([{ object: blob, type: "blob" }]);
-  await repository.updateRetentionRefs({ objects: { next: objects } });
+  const first = await repository.writeRetention([{ object: blob, type: "blob" }]);
+  await repository.updateRetentionRef({ next: first });
 
-  const unrelated = await repository.writeRetentionObjects([]);
+  const unrelated = await repository.writeRetention([]);
   await assert.rejects(
-    () => repository.deleteRetentionRefs({ objects: unrelated, commits: null }),
+    () => repository.deleteRetentionRef(unrelated),
     /concurrently|stale|changed/i,
   );
-  assert.equal(await repository.notesTip(RETENTION_OBJECTS_REF), objects);
+  assert.equal(await repository.notesTip(RETENTION_REF), first);
 
-  await repository.deleteRetentionRefs({ objects, commits: null });
-  assert.equal(await repository.notesTip(RETENTION_OBJECTS_REF), null);
+  await repository.deleteRetentionRef(first);
+  assert.equal(await repository.notesTip(RETENTION_REF), null);
 });
 
-test("retention bundle refs name notes, ledger, and vault", async () => {
+test("retention bundle refs name notes, ledger, and retention", async () => {
   assert.deepEqual(RETENTION_BUNDLE_REFS, [
     "refs/notes/reveries",
     "refs/heads/reveries-ledger",
-    "refs/reveries/retention/objects",
-    "refs/reveries/retention/commits",
+    "refs/reveries/retention",
   ]);
 });
 

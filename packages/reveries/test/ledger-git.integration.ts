@@ -126,13 +126,14 @@ test("an optional retention checkpoint becomes the third parent", async () => {
   const directory = await createRepository();
   const repository = await GitRepository.open(directory);
   await annotate(repository, '{"v":1,"type":"reverie","id":"rv:one"}\n');
-  const retention = await repository.writeRetentionCommits([await repository.resolveCommit("HEAD")], null);
-  assert.notEqual(retention, null);
+  const retention = await repository.writeRetention([
+    { object: await repository.resolveCommit("HEAD") as ObjectId, type: "commit" },
+  ]);
 
   const manifest = await manifestFor(repository, { retention_commit: retention, annotated_subjects: 1 });
   const checkpoint = await repository.commitLedgerCheckpoint({ manifest });
   assert.deepEqual(await repository.ledgerParents(checkpoint), [manifest.notes_commit, retention]);
-  assert.equal(await repository.isRetentionCheckpoint(retention!), true);
+  assert.equal(await repository.isRetentionCommit(retention), true);
 });
 
 test("a genesis checkpoint with no notes and no previous ledger has no parents", async () => {
