@@ -1,5 +1,4 @@
 export * from "./protocol.ts";
-export * from "./sensitive-evidence.ts";
 export {
   AtomicPushUnavailableError,
   GitCommandError,
@@ -21,7 +20,5 @@ export type {
   TreeEntry,
   WithNotesWriteOptions,
 } from "./git.ts";
-export * from "./hooks.ts";
 export * from "./install.ts";
 export * from "./operations.ts";
-export * from "./receive.ts";
