@@ -16,6 +16,7 @@
     "alternatives": { "type": "array", "items": { "$ref": "#/$defs/nonemptyString" }, "uniqueItems": true },
     "sources": { "type": "array", "items": { "$ref": "#/$defs/source" }, "uniqueItems": true },
     "supersedes": { "type": "array", "items": { "$ref": "#/$defs/reverieId" }, "uniqueItems": true },
+    "region": { "$ref": "#/$defs/region" },
     "author_email": { "type": "string", "format": "email", "minLength": 1 },
     "session": { "type": ["string", "null"], "minLength": 1 },
     "created_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
@@ -23,6 +24,20 @@
   "$defs": {
     "nonemptyString": { "type": "string", "minLength": 1, "pattern": "^(?=.*\\S).*$" },
     "objectId": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "region": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "blob", "exact_hash", "start_line_hint", "end_line_hint", "prefix_hint", "suffix_hint"],
+      "properties": {
+        "kind": { "const": "region" },
+        "blob": { "$ref": "#/$defs/objectId" },
+        "exact_hash": { "$ref": "#/$defs/objectId" },
+        "start_line_hint": { "type": "integer", "minimum": 1 },
+        "end_line_hint": { "type": "integer", "minimum": 1 },
+        "prefix_hint": { "type": "string" },
+        "suffix_hint": { "type": "string" }
+      }
+    },
     "reverieId": { "type": "string", "pattern": "^rv:[0-9a-f]{40}([0-9a-f]{24})?$" },
     "source": {
       "type": "object",

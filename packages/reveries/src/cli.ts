@@ -656,6 +656,13 @@ function requirePositional(parsed: ParsedArguments, index: number, label: string
   return value;
 }
 
+function integerFlag(value: string, name: string): number {
+  if (!/^[0-9]+$/.test(value)) throw new UsageError(`${name} must be a positive integer`);
+  const parsed = Number.parseInt(value, 10);
+  if (parsed < 1) throw new UsageError(`${name} must be a positive integer`);
+  return parsed;
+}
+
 function expectObject(value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new UsageError(`${label} must be a JSON object`);
@@ -1188,8 +1195,12 @@ function formatRecord(record: unknown, indent = "  "): string[] {
   const value = asRecord(record);
   if (value === null) return [`${indent}${String(record)}`];
   if (value.type === "reverie") {
+    const region = asRecord(value.region);
     return [
       `${indent}${stringField(value, "id")}: ${stringField(value, "decision")}`,
+      ...(region === null ? [] : [
+        `${indent}  Region: ${String(stringField(region, "blob")).slice(0, 12)} lines ${String(region.start_line_hint)}-${String(region.end_line_hint)} (exact ${String(stringField(region, "exact_hash")).slice(0, 12)})`,
+      ]),
       `${indent}  Event: ${stringField(value, "driving_event")}`,
       `${indent}  Impact: ${stringField(value, "impact")}`,
     ];
@@ -3242,21 +3253,30 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       if (action === "new" || action === "supersede") {
         const parsed = parseArguments(
           argv.slice(2),
-          ["--from", "--old", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source"],
+          ["--from", "--old", "--session", "--driving-event", "--decision", "--impact", "--recurrence-control", "--alternative", "--source", "--start-line", "--end-line"],
           ["--staged", "--committed", "--json", "--no-recurrence-control", "--edit"],
         );
         const path = requirePositional(parsed, 0, "path");
         const from = one(parsed, "--from");
+        const startLine = one(parsed, "--start-line");
+        const endLine = one(parsed, "--end-line");
+        if ((startLine === undefined) !== (endLine === undefined)) {
+          throw new UsageError("--start-line and --end-line must be provided together");
+        }
+        const region = startLine === undefined || endLine === undefined
+          ? undefined
+          : { start_line: integerFlag(startLine, "--start-line"), end_line: integerFlag(endLine, "--end-line") };
         const draftSource = await prepareDraft(await readDraft(from, io), parsed.flags.has("--edit"), io);
         const revision = parsed.flags.has("--committed") ? "HEAD" : "index";
         const result = await usePreparedDraft(draftSource, async (raw) => {
           const draft = await parseReverieDraft(raw, reveries, io, parsed);
           return action === "new"
-            ? reveries.recordNew({ path, revision, ...draft })
+            ? reveries.recordNew({ path, revision, ...draft, ...(region === undefined ? {} : { region }) })
             : reveries.recordSupersede({
                 path,
                 revision,
                 ...draft,
+                ...(region === undefined ? {} : { region }),
                 old: parseReverieId(one(parsed, "--old", true) ?? ""),
               });
         });
