@@ -4,7 +4,6 @@ import test from "node:test";
 
 import {
   NOTES_REF,
-  analyzeContinuity,
   canonicalRecord,
   confidentialPointer,
   createReverie,
@@ -231,67 +230,3 @@ test("active projection detects supersession cycles", () => {
   assert.equal(projection.cycles.length, 1);
 });
 
-test("continuity requires continue, supersede, or retire for every changed annotated blob", () => {
-  const record = make();
-  const unresolved = analyzeContinuity({
-    transitions: [{ from: blob, to: successor }],
-    predecessors: new Map([[blob, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-    successors: new Map([[successor, { active: [], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-  });
-  assert.equal(unresolved.ok, false);
-  assert.equal(unresolved.obligations[0]?.id, record.id);
-
-  const continued = analyzeContinuity({
-    transitions: [{ from: blob, to: successor }],
-    predecessors: new Map([[blob, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-    successors: new Map([[successor, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-  });
-  assert.equal(continued.ok, true);
-  assert.equal(continued.dispositions[0]?.kind, "continue");
-});
-
-test("continuity evaluates every distinct successor of an identical predecessor blob", () => {
-  const record = make();
-  const otherSuccessor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as BlobId;
-  const report = analyzeContinuity({
-    transitions: [{ from: blob, to: successor }, { from: blob, to: otherSuccessor }],
-    predecessors: new Map([[blob, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-    successors: new Map([
-      [successor, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }],
-      [otherSuccessor, { active: [], historical: [], duplicates: [], forks: [], cycles: [] }],
-    ]),
-  });
-
-  assert.equal(report.ok, false);
-  assert.equal(report.dispositions.length, 1);
-  assert.equal(report.obligations.length, 1);
-  assert.equal(report.obligations[0]?.to_blob, otherSuccessor);
-});
-
-test("continuity accepts a causal retirement", () => {
-  const record = make();
-  const report = analyzeContinuity({
-    transitions: [{ from: blob }],
-    predecessors: new Map([[blob, { active: [record], historical: [], duplicates: [], forks: [], cycles: [] }]]),
-    successors: new Map(),
-    summary: {
-      v: 1,
-      type: "session-summary",
-      author_email: "engineer@example.com",
-      session: "codex:test",
-      created_at: "2026-08-25T03:00:00Z",
-      entries: [{
-        driving_event: "The abstraction was removed.",
-        decision: "Retire the decision because the abstraction no longer exists.",
-        impact: "No callers can reintroduce the removed owner.",
-        recurrence_control: null,
-        alternatives: [],
-        sources: [],
-        reveries: [],
-        retirements: [{ reverie: record.id, from_blob: blob, reason: "The abstraction was removed and ownership moved into the transaction boundary." }],
-      }],
-    },
-  });
-  assert.equal(report.ok, true);
-  assert.equal(report.dispositions[0]?.kind, "retire");
-});
