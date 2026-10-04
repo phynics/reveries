@@ -100,19 +100,41 @@ async function validateSkills() {
   return failures;
 }
 
-const gates = [];
-gates.push(await run("npm", ["run", "build"]));
-gates.push(await run("npm", ["run", "typecheck"]));
-gates.push(await run("npm", ["run", "test:full"]));
-const acceptance = await run("node", ["scripts/direct-git-acceptance.mjs", "--json"]);
-gates.push(acceptance);
+// `--report-only` is the CI mode: the workflow runs each gate as its own step
+// for clear failure attribution, then calls this runner to map the 20 criteria
+// and validate the Skills without re-running build, typecheck, or the suite.
+const reportOnly = process.argv.includes("--report-only");
+const reportIndex = process.argv.indexOf("--acceptance-report");
+const reportPath = reportIndex >= 0 ? process.argv[reportIndex + 1] : undefined;
 
-let acceptanceReport = { ok: false, criteria: [] };
-if (acceptance.ok) {
-  try {
-    acceptanceReport = JSON.parse(acceptance.stdout.trim().split("\n").at(-1) ?? "{}");
-  } catch {
-    acceptanceReport = { ok: false, criteria: [] };
+const gates = [];
+let acceptanceReport = { ok: false, criteria: [], generated_at: null };
+if (reportOnly) {
+  if (reportPath === undefined || reportPath.length === 0) {
+    process.stderr.write("--report-only requires --acceptance-report <file>\n");
+    process.exit(2);
+  }
+  acceptanceReport = JSON.parse(await readFile(reportPath, "utf8"));
+  const generatedAt = Date.parse(acceptanceReport.generated_at ?? "");
+  const stale = !Number.isFinite(generatedAt) || Date.now() - generatedAt > 60 * 60 * 1000;
+  if (stale) {
+    process.stderr.write(
+      `acceptance report is missing or stale (generated_at: ${String(acceptanceReport.generated_at)})\n`,
+    );
+    process.exitCode = 1;
+  }
+} else {
+  gates.push(await run("npm", ["run", "build"]));
+  gates.push(await run("npm", ["run", "typecheck"]));
+  gates.push(await run("npm", ["run", "test:full"]));
+  const acceptance = await run("node", ["scripts/direct-git-acceptance.mjs", "--json"]);
+  gates.push(acceptance);
+  if (acceptance.ok) {
+    try {
+      acceptanceReport = JSON.parse(acceptance.stdout.trim().split("\n").at(-1) ?? "{}");
+    } catch {
+      acceptanceReport = { ok: false, criteria: [], generated_at: null };
+    }
   }
 }
 const skillFailures = await validateSkills();

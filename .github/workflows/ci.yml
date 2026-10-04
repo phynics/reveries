@@ -9,8 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  evaluate:
+  verify:
+    name: Verify (Node 22)
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
@@ -25,13 +30,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build, typecheck, test, and run PRD acceptance
-        run: npm run verify
+      - name: Build
+        run: npm run build
 
-      - name: Test Git 2.39 compatibility
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Full test suite
+        run: npm run test:full
+
+      - name: PRD acceptance (20 criteria)
+        run: node scripts/direct-git-acceptance.mjs --out "$RUNNER_TEMP/acceptance.json"
+
+      - name: Map acceptance criteria and validate Skills
         run: >-
-          docker run --rm
-          --mount type=bind,source="$GITHUB_WORKSPACE",target=/work,readonly
-          --workdir /work
-          node:22.20.0-bookworm
-          sh -c "npm run test:full && node scripts/direct-git-acceptance.mjs"
+          node scripts/evaluate-local.mjs --strict --report-only
+          --acceptance-report "$RUNNER_TEMP/acceptance.json"
+
+      - name: Check for whitespace errors
+        run: git diff --check
+
+      - name: Assert the worktree is clean
+        run: test -z "$(git status --porcelain)"
+
+  git-compat:
+    name: Git 2.39 compatibility
+    runs-on: ubuntu-latest
+    container:
+      image: node:22.20.0-bookworm
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Full test suite on Git 2.39
+        run: npm run test:full
+
+      - name: PRD acceptance on Git 2.39
+        run: node scripts/direct-git-acceptance.mjs
