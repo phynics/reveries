@@ -76,6 +76,7 @@ import {
   type RedactionId,
   type RedactionInput,
   type RedactionRecord,
+  type RegionSubject,
   type RemoteRole,
   type ResolutionId,
   type ResolutionInput,
@@ -138,6 +139,11 @@ export interface RecordTarget {
 export interface RecordNewInput extends RecordTarget {
   readonly semantic: ReverieInput;
   readonly metadata: ReverieMetadata;
+  /**
+   * Optional arbitrary-region scope. The selected lines are hashed into the
+   * region fingerprint; line numbers are stored as hints only.
+   */
+  readonly region?: { readonly start_line: number; readonly end_line: number };
 }
 
 export interface RecordResult {
@@ -1226,9 +1232,16 @@ export class Reveries {
     if (!(await this.repository.subjectIsDurable(object))) {
       throw new Error(`Subject ${object} is neither staged nor reachable from a commit`);
     }
-    const semantic = `${semanticPayload(input.semantic)}\n`;
+    let semanticInput = input.semantic;
+    if (input.region !== undefined) {
+      semanticInput = {
+        ...input.semantic,
+        region: await this.regionSubject(object, input.region.start_line, input.region.end_line),
+      };
+    }
+    const semantic = `${semanticPayload(semanticInput)}\n`;
     const oid = await this.repository.hashObject(semantic);
-    const record = createReverie(input.semantic, input.metadata, () => oid);
+    const record = createReverie(semanticInput, input.metadata, () => oid);
     await this.appendRecord(object, record);
     return {
       object,
@@ -1236,6 +1249,33 @@ export class Reveries {
       paths: input.revision === "index"
         ? await this.repository.indexPathsForSubject(object)
         : await this.repository.pathsForSubject(object, input.revision),
+    };
+  }
+
+  /**
+   * Build the region descriptor for a blob: identity is the blob object ID
+   * plus the Git object hash of the selected bytes. Line numbers and the
+   * prefix/suffix strings ride along as navigation hints only.
+   */
+  private async regionSubject(object: ObjectId, startLine: number, endLine: number): Promise<RegionSubject> {
+    const type = (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
+    if (type !== "blob") throw new Error(`A region subject must be a blob; ${object} is a ${type}`);
+    if (!Number.isInteger(startLine) || startLine < 1) throw new Error("region start line must be a positive integer");
+    if (!Number.isInteger(endLine) || endLine < startLine) throw new Error("region end line must be at least the start line");
+    const text = await this.repository.readBlobAt(object);
+    const lines = text.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    if (endLine > lines.length) throw new Error(`region end line ${endLine} exceeds ${lines.length} lines in ${object}`);
+    const selected = lines.slice(startLine - 1, endLine);
+    const exactHash = await this.repository.hashObject(`${selected.join("\n")}\n`);
+    return {
+      kind: "region",
+      blob: object,
+      exact_hash: String(exactHash),
+      start_line_hint: startLine,
+      end_line_hint: endLine,
+      prefix_hint: selected[0] ?? "",
+      suffix_hint: selected[selected.length - 1] ?? "",
     };
   }
 

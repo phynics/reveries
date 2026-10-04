@@ -70,6 +70,28 @@ export type ReverieSemantic = {
   alternatives: string[];
   sources: Source[];
   supersedes: ReverieId[];
+  /**
+   * Optional arbitrary-region scope (lean core). Identity is the blob object
+   * ID plus the exact region fingerprint; every hint is navigation only and
+   * never participates in the record ID.
+   */
+  region?: RegionSubject;
+};
+
+/**
+ * A region inside one blob. `exact_hash` is the Git object hash of the
+ * selected bytes, so the region is exactly as durable as the data it names.
+ * Line numbers, prefix, and suffix are hints: they help a human find the
+ * bytes again and never define identity.
+ */
+export type RegionSubject = {
+  kind: "region";
+  blob: ObjectId;
+  exact_hash: string;
+  start_line_hint: number;
+  end_line_hint: number;
+  prefix_hint: string;
+  suffix_hint: string;
 };
 
 export type ReverieMetadata = {
@@ -1137,12 +1159,39 @@ function sortedUniqueSources(sources: readonly Source[]): Source[] {
   return [...unique.values()].sort(sourceSort);
 }
 
+function normalizeRegion(region: RegionSubject): RegionSubject {
+  if (region.kind !== "region") throw new Error("region.kind must be region");
+  objectId(region.blob);
+  const exact = trimText(region.exact_hash, "region.exact_hash");
+  if (!/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(exact)) {
+    throw new Error("region.exact_hash must be a Git object hash");
+  }
+  if (!Number.isInteger(region.start_line_hint) || region.start_line_hint < 1) {
+    throw new Error("region.start_line_hint must be a positive integer");
+  }
+  if (!Number.isInteger(region.end_line_hint) || region.end_line_hint < region.start_line_hint) {
+    throw new Error("region.end_line_hint must be at least region.start_line_hint");
+  }
+  if (typeof region.prefix_hint !== "string" || typeof region.suffix_hint !== "string") {
+    throw new Error("region hints must be strings");
+  }
+  return {
+    kind: "region",
+    blob: region.blob,
+    exact_hash: exact,
+    start_line_hint: region.start_line_hint,
+    end_line_hint: region.end_line_hint,
+    prefix_hint: region.prefix_hint,
+    suffix_hint: region.suffix_hint,
+  };
+}
+
 function normalizeSemantic(input: ReverieSemantic): ReverieSemantic {
   if (input.v !== 1) throw new Error("v must be exactly 1");
   const recurrence = input.recurrence_control === null
     ? null
     : recurrenceText(input.recurrence_control, "recurrence_control");
-  return {
+  const normalized: ReverieSemantic = {
     v: 1,
     driving_event: trimText(input.driving_event, "driving_event"),
     decision: trimText(input.decision, "decision"),
@@ -1152,10 +1201,26 @@ function normalizeSemantic(input: ReverieSemantic): ReverieSemantic {
     sources: sortedUniqueSources(input.sources),
     supersedes: [...new Set(input.supersedes)].sort(compareUtf8),
   };
+  if (input.region !== undefined && input.region !== null) normalized.region = normalizeRegion(input.region);
+  return normalized;
 }
 
 export function semanticPayload(record: ReverieSemantic): string {
-  return JSON.stringify(normalizeSemantic(record));
+  const normalized = normalizeSemantic(record);
+  // Region line numbers and surrounding-text hints are navigation only, so
+  // they are excluded from the identity payload. Two records that name the
+  // same blob bytes with different hints share one ID.
+  const payload = normalized.region === undefined
+    ? normalized
+    : {
+      ...normalized,
+      region: {
+        kind: normalized.region.kind,
+        blob: normalized.region.blob,
+        exact_hash: normalized.region.exact_hash,
+      },
+    };
+  return JSON.stringify(payload);
 }
 
 export function createReverie(
@@ -1167,7 +1232,7 @@ export function createReverie(
   const resolved = resolveLimits(limits);
   const semantic = normalizeSemantic(input);
   validateTimestamp(metadata.created_at, "created_at");
-  const id = `rv:${hashObject(Buffer.from(`${JSON.stringify(semantic)}\n`, "utf8"))}` as ReverieId;
+  const id = `rv:${hashObject(Buffer.from(`${semanticPayload(semantic)}\n`, "utf8"))}` as ReverieId;
   const record: ReverieRecord = {
     ...semantic,
     type: "reverie",
@@ -2093,6 +2158,7 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
       alternatives: semantic.alternatives,
       sources: semantic.sources,
       supersedes: semantic.supersedes,
+      ...(semantic.region === undefined ? {} : { region: semantic.region }),
       author_email: trimText(record.author_email, "author_email"),
       session: record.session === null ? null : trimText(record.session, "session"),
       created_at: record.created_at,
@@ -2275,6 +2341,20 @@ function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
 export function canonicalRecord(record: NoteRecord): string {
   return `${JSON.stringify(canonicalRecordValue(record))}\n`;
 }
+
+const KNOWN_RECORD_TYPES = new Set<string>([
+  "reverie",
+  "lineage",
+  "session-summary",
+  "reveries-init",
+  "transition-summary",
+  "publication-attestation",
+  "correction",
+  "resolution",
+  "redaction",
+  "signature",
+  "occurrence",
+]);
 
 function asRecord(value: unknown): NoteRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("record must be a JSON object");
@@ -2509,6 +2589,7 @@ function validateRecord(record: NoteRecord, hashObject?: HashObject, limits: Rea
     for (const alternative of record.alternatives) trimNarrative(alternative, "alternatives item", limits);
     for (const source of record.sources) validateSource(source, limits);
     for (const id of record.supersedes) reverieId(id);
+    if (record.region !== undefined) normalizeRegion(record.region);
     trimNarrative(record.driving_event, "driving_event", limits);
     trimNarrative(record.decision, "decision", limits);
     trimNarrative(record.impact, "impact", limits);
@@ -2853,7 +2934,17 @@ export function parseNote(
     }
     try {
       if (!line || line.includes("\r")) throw new Error("invalid JSONL line");
-      const parsed = asRecord(JSON.parse(line));
+      const raw: unknown = JSON.parse(line);
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("record must be a JSON object");
+      const type = (raw as { type?: unknown }).type;
+      // Lean readers keep unknown bytes (legacy or future records) untouched
+      // and never interpret them. Tolerant mode skips them silently; strict
+      // mode still refuses a record this build cannot validate.
+      if (typeof type !== "string" || !KNOWN_RECORD_TYPES.has(type)) {
+        if (mode === "strict") throw new Error(`unknown record type: ${String(type)}`);
+        continue;
+      }
+      const parsed = asRecord(raw);
       validateRecord(parsed, options.hashObject, limits);
       if (mode === "strict" && canonicalRecord(parsed) !== `${line}\n`) throw new Error("record is not canonical JSON");
       records.push(parsed);
