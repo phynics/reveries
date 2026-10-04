@@ -1,70 +1,76 @@
-# Reveries V1 implementation shape
+# Reveries implementation shape
 
 ## Problem
 
-Reveries must enforce byte-level JSONL rules, causal decision continuity, and Git notes publication without making its helper authoritative. The hard part is the boundary between pure protocol rules and mutable Git state. If command handlers each coordinate parsing, validation, object resolution, and notes writes, those invariants will drift.
+Reveries must preserve byte-level JSONL rules, content-addressed applicability, and Git notes
+publication without making its helper authoritative. The hard part is the boundary between
+pure protocol rules and mutable Git state. If command handlers each coordinate parsing,
+validation, object resolution, and notes writes, those invariants drift.
 
-## Usage from the caller's view
+Reveries is subtractive: the smaller the authoritative surface, the easier it is to prove.
+Everything that decided when a commit or a push was allowed has been removed.
 
-The CLI completes whole operations:
+## Authoritative state
 
-```bash
-reveries show src/state.rs --staged --json
-reveries record new src/state.rs --from reverie.json
-reveries check --staged
-reveries summarize HEAD --from summary.json
-reveries sync --pull origin
-reveries push origin
+```
+Git objects            blobs, trees, and commits; evidence targets
+refs/notes/reveries    one JSONL record set per annotated object
+refs/reveries/retention  anchors annotated objects against a pruning gc
 ```
 
-The library keeps protocol work independent from Git:
-
-```ts
-const parsed = parseNote(noteText, "tolerant");
-const strict = validateNote(parsed);
-const projection = projectActiveReveries(strict.reveries);
-```
-
-Host adapters translate native events into `HookEvent` and pass them to one shared hook handler. Receive adapters translate proposed refs and hosted events into the same receive-check contract; neither adapter parses notes or decides continuity.
+No other ref, file, database, or service is authoritative. A reader with no Reveries installed
+can recover every decision with `git notes`.
 
 ## Shape
 
 The package has four modules grouped by the knowledge they own:
 
-- `protocol` owns record types, canonical JSONL, semantic IDs, strict and tolerant parsing, source syntax, and active projection.
-- `git` owns argv-based Git execution, object resolution, notes transactions, tree and history facts, remotes, and the common-directory lock.
-- `operations` owns complete user actions such as record, summarize, check, receive-check, search, sync, push, doctor, and initialization. Receive checks reuse these operations against a proposed notes snapshot opened from a bare repository.
-- `cli` and `hooks` parse external inputs and render typed outcomes.
+- `protocol` owns record types, canonical JSONL, semantic IDs, strict and tolerant parsing,
+  source syntax, region fingerprints, lineage, and active projection. Unknown record types are
+  skipped, never rejected, so a lean reader tolerates bytes written by another version.
+- `git` owns argv-based Git execution, object resolution, notes transactions, notes merge,
+  retention, and remotes.
+- `operations` owns the user actions: `show`, `record`, `link`, `sync`, `retain`, `push`, and
+  `doctor`. `search` and `history` are read-only companions.
+- `cli` parses arguments and renders typed outcomes. It holds no protocol logic.
 
-External JSON, CLI arguments, Git output, and host events are `unknown` until their boundary parser returns domain values. Blob IDs, commit IDs, object IDs, and reverie IDs use separate branded types. Protocol functions do not import process, filesystem, or child-process modules.
+External JSON, CLI arguments, and Git output are `unknown` until their boundary parser returns
+domain values. Object IDs and reverie IDs use branded types. Protocol functions do not import
+process, filesystem, or child-process modules.
 
-Every notes mutation reads `refs/notes/reveries`, applies the change through a unique temporary ref under `refs/notes/reveries-txn/`, validates the result, and updates the canonical ref with the old tip as a compare-and-swap guard, retrying with bounded backoff on contention. This protects linked worktrees, detects writers that bypass the helper, and never lets a killed writer block future writes.
+Every notes mutation reads `refs/notes/reveries`, applies the change through a unique temporary
+ref under `refs/notes/reveries-txn/`, validates the result, and updates the canonical ref with
+the old tip as a compare-and-swap guard, retrying with bounded backoff on contention. This
+protects linked worktrees and never lets a killed writer block future writes.
 
-The public interface is small because each operation hides canonicalization, validation, Git resolution, and mutation ordering. Callers provide intent and receive a typed result with exit code `0`, `1`, `2`, or `3`.
+## Why content addressing
 
-## Synthesis decision
+A decision attaches to an object, not a path. An unchanged rename or copy keeps the decision; an
+edit produces a new object and inherits nothing. A region narrows a blob to exact bytes without
+weakening universal applicability, because the fingerprint is derived from the bytes, not the
+line numbers.
 
-Both independent candidates chose a pure protocol core and an argv-based Git adapter. The implementation uses Terra's package layout and explicit capability grading. It uses Luna's temporary-notes-ref transaction because that design can detect an out-of-lock notes update before publication. A generic controller, service, and repository stack was rejected because it would expose internal stages and repeat protocol state across shallow interfaces.
+## Why explicit lineage
+
+An edit leaves a successor with no evidence. A `link` records `preserve`, `split`, `merge`,
+`derive`, or `retire` between endpoint objects, so the edge survives a rebase. Lineage is never
+inferred: a similarity hint may suggest an edge, but only recording it establishes one. An edge
+carries no decision, so it cannot become a back door around per-decision reasoning.
+
+## What was removed
+
+The ledger envelope, signing and trust, authority and roles, redaction, transitions and
+attestations, corrections and resolutions, occurrences, session summaries, the adoption
+boundary, the receive gate, hosted workflows, merge bots, and host adapters. Each of them
+decided when a commit, a push, or a merge was allowed. That decision belongs to the operator and
+to ordinary Git, not to an evidence store.
 
 ## Tradeoffs accepted
 
-- We accept explicit protocol serializers in exchange for byte-exact output that does not depend on a generic canonical-JSON package.
-- We accept real temporary Git repositories in integration tests in exchange for testing Git's actual notes, hash format, rename, and worktree behavior.
-- We accept `CORE` or `UNVERIFIED` adapter grades until host-specific conformance tests support a stronger claim.
-- We accept raw notes scans in V1 in exchange for keeping the disposable search index out of the first correctness boundary.
-
-## Alternatives considered
-
-- A repository-centric service object lost because command code would need to understand Git state transitions and protocol validation stages.
-- One module per execution step lost because `load`, `validate`, `transform`, and `save` would all expose the same record representation.
-- Direct writes to the canonical notes ref lost because a helper cannot compare the expected old tip after another writer bypasses its lock.
-
-## Open questions and risks
-
-- Which host and version can support a verified automatic-delivery grade after fixture tests are complete?
-- Which hook managers can the initializer recognize without guessing at their composition rules?
-- How much rename information can the outgoing checker derive safely before it must require `--successor`?
-
-## Next implementation step
-
-Build byte-exact protocol vectors and their failing tests before implementing canonicalization.
+- We accept explicit protocol serializers in exchange for byte-exact output.
+- We accept real temporary Git repositories in integration tests in exchange for testing Git's
+  actual notes, hash format, rename, and worktree behavior.
+- We accept raw notes scans in exchange for keeping a disposable search index out of the
+  correctness boundary.
+- We accept that a clone can hold evidence for an older version's record types; it keeps the
+  bytes and reports them without interpreting them.

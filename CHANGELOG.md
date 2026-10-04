@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.0.0 - 2026-10-04
+
+Reveries is now a small Git-native evidence system. The authoritative state is Git objects,
+`refs/notes/reveries`, and `refs/reveries/retention`; nothing else is required.
+
+- Define `reverie` (blob, tree, or exact region) and `lineage` as the only record types. A
+  reader skips unknown record types without interpreting or rejecting them, so earlier bytes
+  stay readable.
+- Add region evidence: identity is the blob plus the Git hash of the selected bytes; line
+  numbers are navigation hints only.
+- Replace commit-attached continuity with explicit `link` edges on endpoint objects, so an edge
+  survives a rebase. Kinds are `preserve`, `split`, `merge`, `derive`, and `retire`.
+- Collapse retention to a single `refs/reveries/retention` ref and expose `reveries retain`.
+- Remove the adoption boundary, mandatory session summaries, outgoing and receive gates,
+  hosted workflows, merge bots, host adapters, the ledger envelope, signing and trust,
+  authority and roles, redaction, transitions and attestations, corrections and resolutions,
+  and occurrence records.
+- Remove the `summarize`, `check`, `adopt`, `hooks`, `ledger`, `sign`, `authority`, `redact`,
+  `transition`, and `receive-check` commands. `doctor` reports integrity only and exits
+  non-zero only for damage.
+- Rewrite `scripts/direct-git-acceptance.mjs` to prove the 20 PRD acceptance criteria against
+  the built CLI and raw Git, and gate `npm run verify` on it. CI is one workflow on Node 22 and
+  the Git 2.39 container.
+
 ## 1.0.2 - 2026-08-25
 
 - Make initialization choices explicit, including local-only, no-host, and no-directive-email
