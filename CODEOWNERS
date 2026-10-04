@@ -1,4 +1,4 @@
 /.github/ @phynics
 /scripts/ @phynics
-/packages/reveries/src/receive.ts @phynics
+/packages/reveries/src @phynics
 /CODEOWNERS @phynics
