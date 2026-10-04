@@ -1,5 +1,7 @@
+import { access, readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+
 import {
-  analyzeContinuity,
   blobId,
   canonicalRecord,
   classifySignature,
@@ -16,7 +18,6 @@ import {
   createReverie,
   createTransition,
   createEvidenceSnapshot,
-  factGraphDiagnostics,
   LEDGER_REF,
   lineageId,
   lineagePayload,
@@ -27,7 +28,6 @@ import {
   parseLedgerManifest,
   parseNote,
   projectActiveReveries,
-  projectFactGraph,
   readLedgerManifest,
   redactionPayload,
   recordFactId,
@@ -57,7 +57,6 @@ import {
   type CorrectionRecord,
   type Diagnostic,
   type EvidenceSnapshot,
-  type FactGraphProjection,
   type FactTargetId,
   type LedgerManifest,
   ledgerManifestPayload,
@@ -105,9 +104,7 @@ import {
   type TrustStore,
   reverieId,
 } from "./protocol.ts";
-import type { SubjectPairing } from "./continuity.ts";
 import { suggestLineage, type LineageSuggestion } from "./lineage.ts";
-import { projectTransitionAttestation } from "./projection.ts";
 import {
   GitRepository,
   cloneEvidenceGrade,
@@ -298,34 +295,8 @@ export interface ShowResult {
   readonly diagnostics: readonly string[];
   readonly paths: readonly string[];
   readonly completeness: CompletenessInfo;
-  /** Structural fact projection over the note, including redacted facts. */
-  readonly factGraph: FactGraphProjection;
-  /**
-   * Occurrence records on this subject, split by whether they are about the
-   * occurrence on screen (RVR-014). Universal `active` output is unaffected.
-   */
-  readonly occurrences: readonly OccurrenceAnchor[];
   /** Lineage edges that name this subject as a predecessor or successor. */
   readonly lineage: readonly LineageRecord[];
-}
-
-/**
- * One occurrence record as it relates to a particular occurrence being shown
- * (RVR-014).
- *
- * The two groups are the display contract. `applicable` evidence is about the
- * occurrence on screen: either it is anchored at exactly this coordinate, or
- * explicit durable lineage derives this coordinate from its anchor. Anything
- * else is `anchored` — real evidence about a different occurrence, reported
- * with its own coordinate and never presented as if the shared blob made it
- * universal.
- */
-export interface OccurrenceAnchor {
-  readonly record: OccurrenceRecord;
-  readonly occurrence: OccurrenceCoordinate;
-  readonly applicable: boolean;
-  /** Why the record is not applicable here, when it is not. */
-  readonly reason: string | null;
 }
 
 export interface CheckResult {
@@ -957,8 +928,6 @@ export interface SnapshotNoteEntry {
   readonly object: ObjectId;
   readonly records: readonly NoteRecord[];
   readonly projection: ActiveProjection;
-  /** Fact-graph projection over the note's reverie, correction, and resolution records. */
-  readonly factGraph: FactGraphProjection;
   readonly objectType: string;
   /** Null when the note parses, validates, and projects cleanly; otherwise the first failure. */
   readonly error: string | null;
@@ -977,19 +946,8 @@ export interface EvidenceSnapshotView {
   readonly tip: ObjectId | null;
   readonly entries: readonly SnapshotNoteEntry[];
   readonly byId: ReadonlyMap<ReverieId, { readonly record: NoteRecord; readonly object: ObjectId }>;
-  readonly transitions: ReadonlyMap<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>;
-  readonly attestations: ReadonlyMap<CommitId, readonly PublicationAttestation[]>;
-  /** Lineage edges indexed by the commit whose note carries them (RVR-014). */
+  /** Lineage edges indexed by the commit whose note carries them. */
   readonly lineages: ReadonlyMap<CommitId, readonly LineageRecord[]>;
-  readonly backlinks: ReadonlyMap<ReverieId, readonly ObjectId[]>;
-  /** Structural fact projection across every entry: forks stay visible until resolved. */
-  readonly factGraph: FactGraphProjection;
-  /** Soft-redacted fact IDs, sorted: hidden from show/search, retained in bytes. */
-  readonly redacted: readonly string[];
-  /** First annotated object carrying each fact ID, for failure attribution. */
-  readonly factLocations: ReadonlyMap<string, ObjectId>;
-  readonly init: { readonly commit: CommitId; readonly record: ReveriesInit } | null;
-  readonly initError: string | null;
   readonly diagnostics: readonly Diagnostic[];
   readonly diagnosticsTruncated: boolean;
   readonly limits: Readonly<ResourceLimits>;
@@ -1012,15 +970,7 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     tip: null,
     entries: [],
     byId: new Map(),
-    transitions: new Map(),
-    attestations: new Map(),
     lineages: new Map(),
-    backlinks: new Map(),
-    factGraph: projectFactGraph([]),
-    redacted: [],
-    factLocations: new Map(),
-    init: null,
-    initError: null,
     diagnostics: [],
     diagnosticsTruncated: false,
     limits,
@@ -1101,19 +1051,6 @@ export class Reveries {
     return new Reveries(repository.withoutLazyFetch(), repository, undefined, signing);
   }
 
-  static async openBareForReceive(cwd: string, notesTip: ObjectId): Promise<Reveries> {
-    const repository = await GitRepository.openBare(cwd);
-    if (await repository.objectType(notesTip) !== "commit") {
-      throw new Error(`Proposed Reveries notes object is not a commit: ${notesTip}`);
-    }
-    return new Reveries(repository.withoutLazyFetch(), repository, notesTip);
-  }
-
-  /**
-   * Grade the local evidence behind a result without touching the network.
-   * Accepts an already-loaded snapshot view to avoid rescanning notes, and
-   * an explicit object list whose local presence is required.
-   */
   async assessCompleteness(input: {
     readonly annotatedObjects?: readonly ObjectId[];
     readonly view?: EvidenceSnapshotView;
@@ -1329,134 +1266,6 @@ export class Reveries {
    * subject it names, so a wrong path fails here instead of becoming an
    * unverifiable claim in the notes.
    */
-  async recordOccurrence(input: RecordOccurrenceInput): Promise<OccurrenceResult> {
-    if (input.revision === "index") {
-      throw new Error(
-        "An occurrence coordinate needs a commit, and staged content has none: commit the change first, then record the occurrence at that commit",
-      );
-    }
-    const commit = await this.repository.resolveCommit(input.revision);
-    const resolved = await this.repository.resolveSubject({ path: input.path, revision: input.revision });
-    const occurrence: OccurrenceCoordinate = {
-      commit,
-      path: normalizeCoordinatePath(input.path),
-      subject: resolved.object,
-    };
-    const record = createOccurrence(
-      { ...input.semantic, occurrence },
-      input.metadata,
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(occurrence.subject, canonicalRecord(record));
-    });
-    return {
-      object: occurrence.subject,
-      record,
-      occurrence,
-      paths: input.revision === "index"
-        ? await this.repository.indexPathsForSubject(occurrence.subject)
-        : await this.repository.pathsForSubject(occurrence.subject, input.revision),
-    };
-  }
-
-  /**
-   * Record a durable subject pairing on the commit that establishes it
-   * (RVR-014). Every endpoint is resolved in the revision the edge names, and
-   * the edge is refused unless `parent` really is a direct parent of `commit`,
-   * because an unbound pairing could be applied to a change it does not
-   * describe.
-   */
-  async recordLineage(input: RecordLineageInput): Promise<LineageResult> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    const parent = await this.repository.resolveCommit(input.parent);
-    const direct = (await this.repository.run([
-      "show", "-s", "--format=%P", commit,
-    ])).stdout.trim().split(" ").filter((value) => value.length > 0);
-    if (!direct.includes(String(parent))) {
-      throw new Error(
-        `A lineage edge must bind the direct parent of ${commit}; ${parent} is not one of ${direct.join(", ") || "its parents"}`,
-      );
-    }
-    const from: LineageEndpoint[] = [];
-    for (const path of input.from) {
-      from.push(await this.lineageEndpoint(path, parent, "from"));
-    }
-    const to: LineageEndpoint[] = [];
-    for (const path of input.to) {
-      to.push(await this.lineageEndpoint(path, commit, "to"));
-    }
-    // Every predecessor must actually carry evidence: pairing an unannotated
-    // subject would create lineage about a decision that does not exist.
-    const annotated = new Set((await this.evidenceNotes()).map((entry) => String(entry.object)));
-    for (const endpoint of from) {
-      if (!annotated.has(String(endpoint.subject))) {
-        throw new Error(
-          `Lineage from endpoint ${endpoint.path} has no annotated evidence at ${parent}; record the decision before pairing it`,
-        );
-      }
-    }
-    // The edge must already satisfy the same authority rule the check will
-    // apply: every `from` occurrence disturbed by exactly this parent→commit
-    // change, every `to` occurrence present in its result. An unchanged move
-    // or copy disturbs nothing — the same subject is still reachable, so
-    // continuity already holds and no edge is needed — and recording one
-    // anyway would only fail later as contradictory-lineage. Refusing here
-    // names the real problem instead of deferring it to the check.
-    const changeTransitions = [
-      ...await this.commitTransitions(String(parent), String(commit)),
-      ...await this.treeSubjectTransitions(String(parent), String(commit), false),
-    ];
-    const disturbed = this.disturbedCoordinates(parent, changeTransitions);
-    const resultCoordinates = await this.coordinatesInCommit(commit);
-    const undisturbed = from.filter((endpoint) =>
-      !disturbed.has(coordinateKey(String(parent), endpoint.path, String(endpoint.subject))));
-    const absent = to.filter((endpoint) =>
-      !resultCoordinates.has(coordinateKey(String(commit), endpoint.path, String(endpoint.subject))));
-    if (undisturbed.length > 0 || absent.length > 0) {
-      throw new Error(
-        [
-          `A lineage edge may only pair occurrences this change disturbs with occurrences present in its result:`,
-          ...undisturbed.map((endpoint) =>
-            `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not disturbed by ${parent} to ${commit}; an unchanged move or copy needs no lineage edge`),
-          ...absent.map((endpoint) =>
-            `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not present in ${commit}`),
-        ].join(" "),
-      );
-    }
-    const record = createLineage(
-      {
-        v: 1,
-        kind: input.kind,
-        parent,
-        commit,
-        from,
-        to,
-        transition: input.transition ?? null,
-        ...input.semantic,
-      },
-      input.metadata,
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    if (record.transition !== null && !(await this.loadCachedEvidenceSnapshot({})).transitions.has(record.transition)) {
-      throw new Error(`Lineage transition ${record.transition} has no transition record`);
-    }
-    await this.mutateNotes(async (notes) => {
-      await notes.append(commit, canonicalRecord(record));
-    });
-    return { commit, record, from: record.from, to: record.to };
-  }
-
-  /**
-   * Record explicit lineage on the notes of its endpoints.
-   *
-   * Similarity may suggest an edge, never establish one, so this writes only
-   * what the caller names: no disturbance test and no continuity obligation.
-   * The same immutable record is written to every `to` endpoint's note when
-   * `to` is non-empty, otherwise to every `from` endpoint's note. Note-level
-   * union dedupes by record ID, so an edge stays discoverable from either end
-   * and survives a rebase because endpoints are object IDs.
-   */
   async link(input: LinkInput): Promise<LinkResult> {
     const commit = await this.repository.resolveCommit(input.commit);
     const parent = await this.repository.resolveCommit(input.parent);
@@ -1507,11 +1316,11 @@ export class Reveries {
   async show(input: ShowInput): Promise<ShowResult> {
     const target = await this.resolveTarget(input.target, input.revision ?? "HEAD");
     const note = await this.readEvidenceNote(target.object);
+    const completeness = await this.assessCompleteness({ annotatedObjects: [target.object] });
+    const diagnostics = completeness.authoritative
+      ? []
+      : [`Evidence may be incomplete (${completeness.grade}): ${completeness.reasons.join("; ")}`];
     if (note === null) {
-      const completeness = await this.assessCompleteness({ annotatedObjects: [target.object] });
-      const diagnostics = completeness.authoritative
-        ? []
-        : [`Evidence may be incomplete (${completeness.grade}): ${completeness.reasons.join("; ")}`];
       return {
         ...target,
         records: [],
@@ -1520,13 +1329,11 @@ export class Reveries {
         diagnostics,
         paths: target.paths,
         completeness,
-        factGraph: projectFactGraph([]),
-        occurrences: [],
-        lineage: await this.lineageTouching(target.object, input.includeRedacted === true),
+        lineage: await this.lineageForSubject(target.object),
       };
     }
     const parsed = parseNote(note, "tolerant", { verifyIds: false });
-    const diagnostics = parsed.diagnostics.map((diagnostic) => diagnostic.message);
+    for (const diagnostic of parsed.diagnostics) diagnostics.push(diagnostic.message);
     const validRecords: NoteRecord[] = [];
     for (const record of parsed.records) {
       if (record.type === "reverie") {
@@ -1536,282 +1343,46 @@ export class Reveries {
           continue;
         }
       }
-      if (record.type === "correction") {
-        const expected = `cr:${await this.repository.hashObject(`${correctionPayload(record)}\n`)}`;
+      if (record.type === "lineage") {
+        const expected = `lg:${await this.repository.hashObject(`${lineagePayload(record)}\n`)}`;
         if (expected !== record.id) {
-          diagnostics.push(`correction ID mismatch for ${record.id}`);
-          continue;
-        }
-      }
-      if (record.type === "resolution") {
-        const expected = `rs:${await this.repository.hashObject(`${resolutionPayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          diagnostics.push(`resolution ID mismatch for ${record.id}`);
-          continue;
-        }
-      }
-      if (record.type === "redaction") {
-        const expected = `rd:${await this.repository.hashObject(`${redactionPayload(record)}\n`)}`;
-        if (expected !== record.id) {
-          diagnostics.push(`redaction ID mismatch for ${record.id}`);
+          diagnostics.push(`lineage ID mismatch for ${record.id}`);
           continue;
         }
       }
       validRecords.push(record);
     }
-    const factGraph = projectFactGraph(validRecords);
-    const includeRedacted = input.includeRedacted === true;
-    const redacted = new Set(factGraph.redacted);
-    const visibleRecords = includeRedacted
-      ? validRecords
-      : validRecords.filter((record) => {
-        const id = recordFactId(record);
-        return id === null || !redacted.has(id);
-      });
-    const suppressed = validRecords.length - visibleRecords.length;
-    if (suppressed > 0) {
-      diagnostics.push(`${suppressed} redacted record(s) suppressed from display; history retains them`);
-    }
-    const activeFacts = new Set(factGraph.active.map((record) => recordFactId(record)));
     const projection = projectActiveReveries(
-      visibleRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
+      validRecords.filter((record): record is ReverieRecord => record.type === "reverie"),
     );
     diagnostics.push(...this.projectionDiagnostics(projection));
-    diagnostics.push(...factGraphDiagnostics(factGraph));
-    const completeness = await this.assessCompleteness({});
     return {
       ...target,
-      records: visibleRecords,
+      records: validRecords,
       active: projection.active,
       historical: projection.historical,
       diagnostics,
       paths: target.paths,
       completeness,
-      factGraph,
-      occurrences: await this.occurrenceAnchors(
-        target,
-        // A corrected or superseded occurrence is historical, so it is reported
-        // as history rather than as current evidence for this occurrence.
-        visibleRecords.filter((record): record is OccurrenceRecord =>
-          record.type === "occurrence" && activeFacts.has(record.id)),
-        input.revision ?? "HEAD",
-      ),
-      lineage: await this.lineageTouching(target.object, input.includeRedacted === true),
+      lineage: await this.lineageForSubject(target.object),
     };
   }
 
   /**
-   * Split the occurrence records on one subject into the ones that are about
-   * the occurrence on screen and the ones that are anchored elsewhere
-   * (RVR-014).
-   *
-   * A shared blob is exactly why this distinction matters: two paths holding
-   * one blob have different rationales, and reporting the `vendor/` decision as
-   * if it applied to `src/` because the object IDs match would be a false
-   * claim about applicability. Evidence about the current occurrence is
-   * applicable only when the anchor is this coordinate, or when explicit
-   * durable lineage derives this coordinate from the anchor. An unchanged
-   * descendant commit is therefore reported as anchored historical evidence —
-   * never silently re-applied to every occurrence.
+   * Every lineage edge that names this subject as a predecessor or successor.
+   * The note carries the edge on each endpoint, so a reader sees the relation
+   * from either end without a separate index.
    */
-  private async occurrenceAnchors(
-    target: {
-      readonly object: ObjectId;
-      readonly paths: readonly string[];
-      readonly requestedPath: string | null;
-    },
-    records: readonly OccurrenceRecord[],
-    revision: string,
-  ): Promise<readonly OccurrenceAnchor[]> {
-    if (records.length === 0) return [];
-    const shownPaths = new Set(
-      (target.requestedPath === null ? target.paths : [target.requestedPath]).map(normalizeCoordinatePath),
-    );
-    let shownCommit: CommitId | null = null;
-    try {
-      shownCommit = revision === "index" ? null : await this.repository.resolveCommit(revision);
-    } catch {
-      shownCommit = null;
-    }
-    const { derivation } = shownCommit === null
-      ? { derivation: new Map() as OccurrenceDerivation }
-      : await this.occurrenceDerivation(shownCommit);
-    const anchors: OccurrenceAnchor[] = [];
-    for (const record of records) {
-      const coordinate = record.occurrence;
-      // The direct anchor: this record is about this path holding this subject.
-      if (shownCommit !== null
-        && String(coordinate.commit) === String(shownCommit)
-        && coordinate.subject === target.object
-        && shownPaths.has(normalizeCoordinatePath(coordinate.path))) {
-        anchors.push({ record, occurrence: coordinate, applicable: true, reason: null });
-        continue;
-      }
-      const shownPath = target.requestedPath ?? target.paths[0];
-      const shown: OccurrenceCoordinate | null = shownCommit === null || shownPath === undefined ? null : {
-        commit: shownCommit,
-        path: normalizeCoordinatePath(shownPath),
-        subject: target.object,
-      };
-      const via = shown === null ? [] : deriveLineage(derivation, shown, coordinate);
-      if (via.length > 0) {
-        anchors.push({
-          record,
-          occurrence: coordinate,
-          applicable: true,
-          reason: `carried forward by lineage ${via.join(", ")}`,
-        });
-        continue;
-      }
-      anchors.push({
-        record,
-        occurrence: coordinate,
-        applicable: false,
-        reason: `anchored at ${coordinate.path}@${coordinate.commit}; it describes that occurrence, not this one`,
-      });
-    }
-    return anchors.sort((left, right) => (left.record.id < right.record.id ? -1 : left.record.id > right.record.id ? 1 : 0));
-  }
-
-  /**
-   * Every durable edge in the snapshot as a backward map from a coordinate to
-   * the coordinates it derives from. Used for display and path history, never
-   * for a continuity verdict, which re-derives authority per checked change.
-   */
-  /** Every durable lineage edge in the evidence, indexed by its commit. */
-  private async lineageEdges(): Promise<ReadonlyMap<CommitId, readonly LineageRecord[]>> {
-    const tip = this.proposedNotesTip ?? await this.repository.notesTip(NOTES_REF);
-    const key = `${String(tip)}`;
-    if (this.lineageIndex?.key === key) return this.lineageIndex.edges;
-    const view = await this.evidenceView();
-    this.lineageIndex = { key, edges: view.lineages };
-    return view.lineages;
-  }
-
-  /**
-   * Every durable edge in the snapshot as a backward map from a coordinate to
-   * the coordinates it derives from. Used for display and path history, never
-   * for a continuity verdict, which re-derives authority per checked change.
-   *
-   * Coordinates are bound to the commit that established them, so after an
-   * unrelated later commit no key matches the reference revision. Each edge is
-   * therefore also carried forward by same-path OID identity: when the
-   * reference revision still holds the same subject at the same path, and the
-   * edge's commit is a real ancestor of it, the walk may step from the current
-   * coordinate back to the edge's coordinate under the same edge ID. Without
-   * this an unrelated commit would silently drop an explicit trail; with it a
-   * moved path keeps its history until the path itself moves on. Branches can
-   * never borrow each other's lineage: the ancestry check refuses that.
-   */
-  private async occurrenceDerivation(reference: CommitId | null): Promise<{
-    readonly derivation: OccurrenceDerivation;
-    readonly silent: ReadonlySet<string>;
-  }> {
-    const index = await this.lineageEdges();
-    const derivation = new Map<string, { coordinate: OccurrenceCoordinate; lineage: LineageId }[]>();
-    const silent = new Set<string>();
-    const stepId = (from: OccurrenceCoordinate, lineage: LineageId): string =>
-      `${coordinateKey(String(from.commit), from.path, String(from.subject))}\u0001${lineage}`;
-    const link = (
-      at: OccurrenceCoordinate,
-      from: OccurrenceCoordinate,
-      lineage: LineageId,
-      bridge: boolean,
-    ): void => {
-      const key = coordinateKey(String(at.commit), at.path, String(at.subject));
-      const previous = coordinateKey(String(from.commit), from.path, String(from.subject));
-      const list = derivation.get(key) ?? [];
-      if (!list.some((entry) =>
-        entry.lineage === lineage
-        && coordinateKey(
-          String(entry.coordinate.commit),
-          entry.coordinate.path,
-          String(entry.coordinate.subject),
-        ) === previous)) {
-        list.push({ coordinate: from, lineage });
-        if (bridge) silent.add(stepId(from, lineage));
-      }
-      derivation.set(key, list);
-    };
-    for (const edges of index.values()) {
-      for (const edge of edges) {
-        for (const endpoint of edge.to) {
-          const at: OccurrenceCoordinate = {
-            commit: edge.commit,
-            path: endpoint.path,
-            subject: endpoint.subject,
-          };
-          for (const source of edge.from) {
-            link(at, { commit: edge.parent, path: source.path, subject: source.subject }, edge.id, false);
-          }
-          if (reference !== null && String(edge.commit) !== String(reference)) {
-            try {
-              const ancestor = await this.repository.run(
-                ["merge-base", "--is-ancestor", String(edge.commit), String(reference)],
-                { allowExitCodes: [0, 1] },
-              );
-              if (ancestor.exitCode !== 0) continue;
-              const current = await this.repository.resolveSubject({
-                path: endpoint.path,
-                revision: String(reference),
-              });
-              if (current.object !== endpoint.subject) continue;
-              link(
-                {
-                  commit: reference,
-                  path: normalizeCoordinatePath(endpoint.path),
-                  subject: endpoint.subject,
-                },
-                at,
-                edge.id,
-                true,
-              );
-            } catch {
-              // The path moved on or is unreadable at the reference revision:
-              // no bridge, and no claim about where it went.
-            }
-          }
-        }
+  private async lineageForSubject(object: ObjectId): Promise<readonly LineageRecord[]> {
+    const view = await this.loadEvidenceSnapshot({});
+    const edges: LineageRecord[] = [];
+    for (const list of view.lineages.values()) {
+      for (const edge of list) {
+        if ([...edge.from, ...edge.to].some((endpoint) => endpoint.subject === object)) edges.push(edge);
       }
     }
-    return { derivation, silent };
+    return edges.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
   }
-
-  /** Lineage edges that name a subject on either side of the relation. */
-  private async lineageTouching(
-    subject: ObjectId,
-    includeRedacted = false,
-  ): Promise<readonly LineageRecord[]> {
-    const index = await this.lineageEdges();
-    // Redactions of lineage edges live on commit notes, beside the edges, so
-    // the note-local graph that filters `records` never sees them: only the
-    // global redacted set hides them here.
-    const redacted = includeRedacted ? new Set<string>() : new Set((await this.evidenceView()).redacted);
-    const touching: LineageRecord[] = [];
-    for (const edges of index.values()) {
-      for (const edge of edges) {
-        if (redacted.has(edge.id)) continue;
-        if (edge.from.some((endpoint) => endpoint.subject === subject)
-          || edge.to.some((endpoint) => endpoint.subject === subject)) {
-          touching.push(edge);
-        }
-      }
-    }
-    return touching.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
-  }
-
-  /**
-   * Notes-mutation operation wrapper: owns the retry/replay policy while
-   * `GitRepository.withNotesWrite` owns ref updates and temporary-ref
-   * handling. The canonical-tip compare-and-swap stays the final
-   * publication guard; contention replays this pure mutation against the
-   * new tip with bounded backoff, and exhaustion throws
-   * `NotesContentionError` (explicit bounded contention, never silent loss).
-   *
-   * Replay contract: `mutation` may run more than once per call. Every read
-   * must go through `notes.read` inside the closure; no consumed iterators
-   * or single-use state may be captured outside it.
-   */
   async mutateNotes<T>(
     mutation: (notes: NotesTransaction) => Promise<T>,
     options: WithNotesWriteOptions = {},
@@ -1831,1090 +1402,6 @@ export class Reveries {
       undefined,
       options,
     );
-  }
-
-  async summarize(input: {
-    readonly commit: string;
-    readonly summary: SessionSummary;
-    readonly replace?: boolean;
-  }): Promise<void> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    validateNote([input.summary], { verifyIds: false });
-    await this.mutateNotes(async (notes) => {
-      if (input.replace !== true) {
-        await notes.append(commit, canonicalRecord(input.summary));
-        return;
-      }
-      const existing = await notes.read(commit);
-      const records = existing === null ? [] : parseNote(existing, "strict", { verifyIds: false }).records;
-      const retained = records.filter((record) => record.type !== "session-summary");
-      await notes.replace(commit, [input.summary, ...retained].map(canonicalRecord).join(""));
-    });
-  }
-
-  async commitWithSummary(input: {
-    readonly message: string;
-    readonly summary: SessionSummary;
-  }): Promise<CommitId> {
-    validateNote([input.summary], { verifyIds: false });
-    return this.repository.commitWithNote({
-      message: input.message,
-      note: canonicalRecord(input.summary),
-      validateNotesRef: (ref) => this.validateNotesRef(ref),
-    });
-  }
-
-  /**
-   * Resolved tree pair for a commit: ordered parent trees (`[]` for a root)
-   * plus the result tree. The pair plus causal fields is the RVR-004
-   * transition identity; it survives metadata-only amends and publication
-   * rewrites, while a rebase onto a changed tree yields a new pair.
-   */
-  async transitionTreesForCommit(commit: CommitId): Promise<TransitionTrees> {
-    const [parents, result] = await Promise.all([
-      this.repository.parentTreesForCommit(commit),
-      this.repository.resultTreeForCommit(commit),
-    ]);
-    return { parents, result };
-  }
-
-  /** Canonical `tr:` identity for a tree pair plus causal content. */
-  async transitionIdentityFor(input: TransitionInput): Promise<TransitionId> {
-    const format = await this.repository.objectFormat();
-    return transitionId(`tr:${hashBlobContent(`${transitionPayload(input)}\n`, format)}`);
-  }
-
-  /** Tree pair plus identity for an existing commit and causal content. */
-  async transitionIdentityForCommit(commit: CommitId, causal: TransitionCausal): Promise<
-    TransitionTrees & { readonly transition: TransitionId }
-  > {
-    const trees = await this.transitionTreesForCommit(commit);
-    const transition = await this.transitionIdentityFor({ ...causal, ...trees });
-    return { ...trees, transition };
-  }
-
-  /**
-   * Record a transition summary on its result tree object. Adapted evidence
-   * for a rebased transition cites the previous commit with a
-   * `derived-from` commit-kind source in its causal fields.
-   */
-  async recordTransition(input: {
-    readonly parents: readonly ObjectId[];
-    readonly result: ObjectId;
-    readonly causal: TransitionCausal;
-    readonly metadata: TransitionMetadata;
-  }): Promise<{ readonly record: TransitionSummary }> {
-    for (const parent of input.parents) {
-      if (!(await this.repository.treeExists(parent))) {
-        throw new Error(`Parent tree ${parent} is not a tree`);
-      }
-    }
-    if (!(await this.repository.treeExists(input.result))) {
-      throw new Error(`Result tree ${input.result} is not a tree`);
-    }
-    const format = await this.repository.objectFormat();
-    const record = createTransition(
-      { ...input.causal, parents: input.parents, result: input.result },
-      input.metadata,
-      (bytes) => hashBlobContent(bytes, format),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(input.result, canonicalRecord(record));
-    });
-    return { record };
-  }
-
-  /** Record a minimal publication attestation on its commit. */
-  async recordAttestation(input: {
-    readonly commit: string;
-    readonly transition: TransitionId;
-    readonly publisher: string;
-    readonly metadata: TransitionMetadata;
-  }): Promise<{ readonly record: PublicationAttestation }> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    const record = createAttestation(
-      { commit, transition: input.transition, publisher: input.publisher },
-      input.metadata,
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(commit, canonicalRecord(record));
-    });
-    return { record };
-  }
-
-  /**
-   * Append a correction fact to an existing object. Never rewrites an old
-   * canonical line: a correction that overlaps another correction's heads
-   * forms a visible fork until a resolution names every head.
-   */
-  async recordCorrection(input: {
-    readonly object: ObjectId;
-    readonly correction: CorrectionInput;
-    readonly metadata: ReverieMetadata;
-  }): Promise<{ readonly record: CorrectionRecord }> {
-    if (await this.repository.objectType(input.object) === null) {
-      throw new Error(`Cannot attach a correction to missing object ${input.object}`);
-    }
-    const format = await this.repository.objectFormat();
-    const record = createCorrection(
-      input.correction,
-      input.metadata,
-      (bytes) => hashBlobContent(bytes, format),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(input.object, canonicalRecord(record));
-    });
-    return { record };
-  }
-
-  /**
-   * Append a resolution fact that names conflicting heads. The fork
-   * converges only when `resolves` covers every terminal head; partial
-   * coverage stays visible as a fork.
-   */
-  async recordResolution(input: {
-    readonly object: ObjectId;
-    readonly resolution: ResolutionInput;
-    readonly metadata: ReverieMetadata;
-  }): Promise<{ readonly record: ResolutionRecord }> {
-    if (await this.repository.objectType(input.object) === null) {
-      throw new Error(`Cannot attach a resolution to missing object ${input.object}`);
-    }
-    const format = await this.repository.objectFormat();
-    const record = createResolution(
-      input.resolution,
-      input.metadata,
-      (bytes) => hashBlobContent(bytes, format),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(input.object, canonicalRecord(record));
-    });
-    return { record };
-  }
-
-  /**
-   * Append a soft-redaction fact. Normal display and search skip the target
-   * afterwards; history and snapshot bytes keep the immutable record.
-   */
-  async recordRedaction(input: {
-    readonly object: ObjectId;
-    readonly target: FactTargetId;
-    readonly reason: string;
-    readonly metadata: ReverieMetadata;
-  }): Promise<{ readonly record: RedactionRecord }> {
-    if (await this.repository.objectType(input.object) === null) {
-      throw new Error(`Cannot attach a redaction to missing object ${input.object}`);
-    }
-    const format = await this.repository.objectFormat();
-    const record = createRedaction(
-      { v: 1, target: input.target, reason: input.reason },
-      input.metadata,
-      (bytes) => hashBlobContent(bytes, format),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(input.object, canonicalRecord(record));
-    });
-    return { record };
-  }
-
-  /**
-   * Hard redaction (RVR-018): remove named facts from every local copy of the
-   * evidence and leave a verifiable discontinuity checkpoint behind.
-   *
-   * Soft redaction hides a record from normal projection while its bytes stay in
-   * the repository. This is the deliberate alternative, so it is deliberately
-   * narrow about what it claims:
-   *
-   * - Only the named ID-bearing facts, and the signatures that attest exactly
-   *   them, leave the snapshot. Everything else is copied byte for byte, so
-   *   surviving history keeps its identities and its continuity claims.
-   * - The rewritten notes commit is a **new root**, not a descendant: the
-   *   removed lines are not reachable from the new canonical tip.
-   * - The new genesis ledger checkpoint names that commit and no previous
-   *   ledger, which is what makes the discontinuity visible to a reader who
-   *   follows the envelope. Ordinary append-only verification does not apply
-   *   across it, and that is the point rather than a defect.
-   * - The local retention refs and the stale remote-tracking and quarantine refs
-   *   are deleted in one transaction with the two canonical moves.
-   * - Nothing here contacts a mirror, an archive, a bundle, or any other clone.
-   *   Those requests are returned as `remoteActions`, and `disclaimer` states
-   *   that local completion is not proof of deletion anywhere else.
-   */
-  async hardRedact(input: {
-    readonly targets: readonly FactTargetId[];
-    /** Non-sensitive justification kept in the tombstone redaction records. */
-    readonly reason: string;
-    readonly metadata: ReverieMetadata;
-    /** Expected canonical tips; omitted defaults to what is present now. */
-    readonly expectedNotes?: ObjectId | null;
-    readonly expectedLedger?: ObjectId | null;
-    /** Sign the discontinuity checkpoint when a signer is configured. */
-    readonly sign?: boolean;
-    readonly signingRole?: SignatureRole;
-  }): Promise<HardRedactionResult> {
-    const disclaimer = HARD_REDACTION_DISCLAIMER;
-    const format = await this.repository.objectFormat();
-    const notesBefore = await this.repository.notesTip();
-    const ledgerBefore = await this.repository.ledgerTip();
-    const empty = (diagnostics: string[], state: "unchanged" | "refused", extra: Partial<HardRedactionResult> = {}): HardRedactionResult => ({
-      ok: state !== "refused",
-      diagnostics,
-      state,
-      removed: [],
-      rewrittenSubjects: [],
-      notesBefore,
-      notesAfter: notesBefore,
-      ledgerBefore,
-      ledgerAfter: ledgerBefore,
-      severedRefs: [],
-      remoteActions: [],
-      disclaimer,
-      ...extra,
-    });
-
-    const targets = [...new Set(input.targets)].sort(compareUtf8Ids);
-    if (targets.length === 0) {
-      return empty(["Hard redaction requires at least one fact ID"], "refused");
-    }
-    if (notesBefore === null) {
-      return empty(["The local Reveries notes ref does not exist, so there is nothing to redact"], "unchanged");
-    }
-    const activeTransactions = await this.repository.listTemporaryNotesRefs();
-    if (activeTransactions.length > 0) {
-      return empty(
-        [`Hard redaction refused: ${activeTransactions.length} live Reveries note transaction(s) must finish or be repaired first`],
-        "refused",
-      );
-    }
-
-    // Locate every target before changing anything. An unknown ID is a refusal,
-    // not a silent no-op: an operator who named a wrong ID must not be told the
-    // repository was cleaned.
-    const view = await this.loadEvidenceSnapshot({});
-    const removedSet = new Set<string>(targets as readonly string[]);
-    const located = new Map<string, ObjectId[]>();
-    for (const entry of view.entries) {
-      for (const record of entry.records) {
-        const id = recordFactId(record);
-        if (id === null || !removedSet.has(id)) continue;
-        located.set(id, [...(located.get(id) ?? []), entry.object]);
-      }
-    }
-    const alreadyRemoved = new Set<string>(
-      view.entries.flatMap((entry) => entry.records.flatMap((record) => record.type === "redaction" ? [record.target] : [])),
-    );
-    const missing = targets.filter((id) => !located.has(id as string));
-    if (missing.length > 0) {
-      // A repeat of a completed redaction converges instead of failing: the
-      // record is gone because this operation already removed it and left a
-      // tombstone. An ID that was never here is still a refusal.
-      const unredacted = missing.filter((id) => !alreadyRemoved.has(id as string));
-      if (unredacted.length > 0) {
-        return empty([`Hard redaction refused: no record in this repository carries ${unredacted.join(", ")}`], "refused");
-      }
-      return empty(
-        [`Hard redaction already removed ${missing.join(", ")}; the sanitized snapshot is unchanged`],
-        "unchanged",
-      );
-    }
-    const rewritten = new Set<ObjectId>([...located.values()].flat());
-
-    // Build the sanitized bodies. Only the target lines and the signatures that
-    // attest exactly those targets are dropped; a signature over anything else
-    // still attests what it claims.
-    const sanitized = [...view.entries].map((entry) => {
-      const kept = entry.records.filter((record) => {
-        const id = recordFactId(record);
-        if (id !== null && removedSet.has(id)) return false;
-        return !(record.type === "signature" && removedSet.has(record.target));
-      });
-      const tombstones = targets
-        .filter((id) => located.get(id as string)?.includes(entry.object))
-        .map((id) => createRedaction(
-          { v: 1, target: id, reason: input.reason },
-          input.metadata,
-          (bytes) => hashBlobContent(bytes, format),
-        ));
-      // Surviving lines keep their relative order and their exact bytes; the
-      // tombstones are appended. A repeated hard redaction converges because an
-      // identical tombstone is written once rather than accumulated.
-      const lines = [...kept.map((record) => canonicalRecord(record))];
-      for (const tombstone of tombstones) {
-        const line = canonicalRecord(tombstone);
-        if (!lines.includes(line)) lines.push(line);
-      }
-      return { subject: entry.object, body: lines.join("") };
-    }).filter((note) => note.body.length > 0);
-
-    let notesAfter: ObjectId;
-    try {
-      notesAfter = await this.repository.createNotesSnapshotFromEmpty(
-        sanitized,
-        async (ref) => this.validateNotesRef(ref),
-      );
-    } catch (error: unknown) {
-      return empty([`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`], "refused");
-    }
-    if (notesAfter === notesBefore) {
-      return empty(["Hard redaction left the notes snapshot unchanged"], "unchanged", {
-        notesAfter,
-        ledgerAfter: ledgerBefore,
-      });
-    }
-
-    // The discontinuity checkpoint is a genesis checkpoint over the sanitized
-    // commit: `previous_ledger` is null because the old chain still describes
-    // history this repository has just removed.
-    const notesTree = await this.repository.treeForCommit(notesAfter);
-    let totals = { subjects: 0, records: 0, noteBytes: 0 };
-    for (const note of sanitized) {
-      totals = {
-        subjects: totals.subjects + 1,
-        records: totals.records + note.body.split("\n").filter((line) => line.length > 0).length,
-        noteBytes: totals.noteBytes + Buffer.byteLength(note.body, "utf8"),
-      };
-    }
-    let authority: string | null;
-    try {
-      authority = (await this.authorityStatus()).primary;
-    } catch (error: unknown) {
-      return empty(
-        [`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`],
-        "refused",
-        { notesAfter },
-      );
-    }
-    let checkpoint: ObjectId;
-    try {
-      const manifest = createLedgerManifest({
-        notes_commit: notesAfter,
-        notes_tree: notesTree,
-        previous_ledger: null,
-        retention_commit: null,
-        authority,
-        annotated_subjects: totals.subjects,
-        records: totals.records,
-        note_bytes: totals.noteBytes,
-      });
-      const signed = input.sign === false ? null : await this.signLedgerManifest(manifest, input.signingRole ?? "publisher");
-      checkpoint = await this.repository.commitLedgerCheckpoint({
-        manifest,
-        ...(signed === null ? {} : { signatures: signed }),
-      });
-    } catch (error: unknown) {
-      return empty(
-        [`Hard redaction refused: the discontinuity checkpoint could not be built: ${error instanceof Error ? error.message : String(error)}`],
-        "refused",
-        { notesAfter },
-      );
-    }
-    const verification = await this.verifyLedgerEnvelope(checkpoint);
-    if (!verification.ok) {
-      return empty(
-        [`Hard redaction refused: the discontinuity checkpoint failed verification: ${verification.diagnostics.join("; ")}`],
-        "refused",
-        { notesAfter },
-      );
-    }
-
-    const vault = await this.retentionVault();
-    const obsolete = await this.staleEvidenceRefs([notesBefore, ledgerBefore].filter((tip): tip is ObjectId => tip !== null));
-    const expectedNotes = input.expectedNotes === undefined ? notesBefore : input.expectedNotes;
-    const expectedLedger = input.expectedLedger === undefined ? ledgerBefore : input.expectedLedger;
-    try {
-      await this.repository.replaceEvidenceRefsAfterHardRedaction({
-        notesCommit: notesAfter,
-        ledgerCheckpoint: checkpoint,
-        expectedNotes,
-        expectedLedger,
-        expectedRetention: vault.commit,
-        obsoleteRefs: obsolete,
-      });
-    } catch (error: unknown) {
-      // Nothing moved: the candidate snapshot and checkpoint exist only as
-      // unreachable objects, so the report names the tips that are still live
-      // rather than the candidates it could not publish.
-      return empty(
-        [`Hard redaction refused: ${error instanceof Error ? error.message : String(error)}`],
-        "refused",
-      );
-    }
-
-    return {
-      ok: true,
-      diagnostics: [],
-      state: "redacted",
-      removed: targets,
-      rewrittenSubjects: [...rewritten].sort(compareUtf8Ids),
-      notesBefore,
-      notesAfter,
-      ledgerBefore,
-      ledgerAfter: checkpoint,
-      severedRefs: obsolete.map(({ ref }) => ref).sort(compareUtf8Ids),
-      remoteActions: await this.hardRedactionRemoteActions(),
-      disclaimer,
-    };
-  }
-
-  /**
-   * Local refs that still hold the pre-redaction evidence: fetched remote-tracking
-   * notes and envelopes plus every held quarantine candidate. Remote-tracking
-   * *code* branches are untouched because they are ordinary code, not evidence.
-   */
-  private async staleEvidenceRefs(removedTips: readonly ObjectId[]): Promise<{ ref: string; expected: ObjectId }[]> {
-    if (removedTips.length === 0) return [];
-    const listed = await this.repository.run(["for-each-ref", "--format=%(refname) %(objectname)"], {
-      allowExitCodes: [0, 1, 128],
-    });
-    const stale: { ref: string; expected: ObjectId }[] = [];
-    for (const line of listed.stdout.split("\n")) {
-      if (line.length === 0) continue;
-      const [ref, value] = line.split(" ");
-      if (ref === undefined || value === undefined) continue;
-      if (!isStaleEvidenceRef(ref)) continue;
-      const tip = objectId(value);
-      for (const removed of removedTips) {
-        if (tip === removed || await this.repository.isAncestor(tip, removed)) {
-          stale.push({ ref, expected: tip });
-          break;
-        }
-      }
-    }
-    return stale;
-  }
-
-  /**
-   * The remote-side work a hard redaction cannot do. It names each configured
-   * remote and the command an operator runs from a clone that has that remote
-   * configured; it never contacts the remote itself, so a mirror that ignores
-   * the request is never reported as done.
-   */
-  private async hardRedactionRemoteActions(): Promise<readonly HardRedactionRemoteAction[]> {
-    const roles = (await this.authorityStatus()).roles;
-    return [...(await this.configuredRemoteNames())].sort(compareUtf8Ids).map((remote) => ({
-      remote,
-      role: roles.get(remote) ?? "unassigned",
-      action: `git push ${remote} --delete refs/notes/reveries refs/heads/reveries-ledger`,
-    }));
-  }
-
-  /**
-   * Validate transition evidence for a tree pair without requiring a final
-   * commit ID, so squash and merge-group candidates validate before
-   * publication creates the commit. Fails closed when no transition record
-   * covers the exact pair, when several competing records cover it, or when
-   * an expected identity names no matching record.
-   */
-  async checkCandidateTransition(input: {
-    readonly parents: readonly ObjectId[];
-    readonly result: ObjectId;
-    readonly transition?: TransitionId;
-  }): Promise<TransitionCheckResult> {
-    for (const parent of input.parents) {
-      if (!(await this.repository.treeExists(parent))) {
-        return { ok: false, diagnostics: [`Parent tree ${parent} is not a tree`], coverage: "none", transition: null };
-      }
-    }
-    if (!(await this.repository.treeExists(input.result))) {
-      return { ok: false, diagnostics: [`Result tree ${input.result} is not a tree`], coverage: "none", transition: null };
-    }
-    const view = await this.loadCachedEvidenceSnapshot({});
-    const onResult = [...view.transitions.values()].filter(({ record }) =>
-      record.result === input.result
-      && record.parents.length === input.parents.length
-      && record.parents.every((parent, index) => parent === input.parents[index]));
-    const pair = `parents [${input.parents.join(", ")}] → ${input.result}`;
-    if (input.transition !== undefined) {
-      const match = onResult.find(({ record }) => record.id === input.transition);
-      if (match === undefined) {
-        return {
-          ok: false,
-          diagnostics: [`Transition ${input.transition} has no record for ${pair}`],
-          coverage: "none",
-          transition: null,
-        };
-      }
-      return { ok: true, diagnostics: [], coverage: "transition", transition: match.record.id };
-    }
-    if (onResult.length === 0) {
-      return {
-        ok: false,
-        diagnostics: [`No transition evidence for ${pair}; record a transition summary or adapted evidence`],
-        coverage: "none",
-        transition: null,
-      };
-    }
-    const ids = onResult.map(({ record }) => record.id).sort();
-    if (ids.length > 1) {
-      return {
-        ok: false,
-        diagnostics: [`${pair} has more than one transition explanation: ${ids.join(", ")}`],
-        coverage: "none",
-        transition: null,
-      };
-    }
-    return { ok: true, diagnostics: [], coverage: "transition", transition: ids[0] as TransitionId };
-  }
-
-  /**
-   * Validate a published commit's transition coverage: an exact attested
-   * transition wins; otherwise a readable V1 session summary covers the
-   * commit through the bridge projection. Commits with neither fail.
-   */
-  async checkCommitTransition(revision: string): Promise<TransitionCheckResult> {
-    const commit = await this.repository.resolveCommit(revision);
-    const trees = await this.transitionTreesForCommit(commit);
-    const view = await this.loadCachedEvidenceSnapshot({});
-    const projection = projectTransitionAttestation({
-      commit,
-      parents: trees.parents,
-      result: trees.result,
-      attestations: view.attestations.get(commit) ?? [],
-      transitions: [...view.transitions.values()].map((entry) => entry.record),
-    });
-    if (projection.transition !== null) {
-      return { ok: true, diagnostics: [], coverage: "transition", transition: projection.transition.id };
-    }
-    if (await this.projectV1SummaryForTransition(commit) !== null) {
-      return { ok: true, diagnostics: [], coverage: "v1-summary", transition: null };
-    }
-    return { ok: false, diagnostics: projection.diagnostics, coverage: "none", transition: null };
-  }
-
-  /**
-   * V1 bridge: project a commit's session summary onto its resolved tree
-   * pair when both sides are known. V1 summaries stay readable as
-   * transition coverage without inventing a `tr:` identity for them.
-   */
-  async projectV1SummaryForTransition(commit: CommitId): Promise<{
-    readonly parents: readonly ObjectId[];
-    readonly result: ObjectId;
-    readonly summary: SessionSummary;
-  } | null> {
-    const summary = await this.commitSessionSummary(commit);
-    if (summary === null) return null;
-    const trees = await this.transitionTreesForCommit(commit);
-    return { ...trees, summary };
-  }
-
-  /**
-   * Validate claimed transition evidence against the proposed notes tip.
-   * Used by the receive checker: every item needs a self-consistent
-   * transition record on its result tree. Never requires a final commit.
-   */
-  async checkProposedTransitions(
-    items: readonly { parents: readonly ObjectId[]; result: ObjectId; transition: TransitionId }[],
-  ): Promise<CheckResult> {
-    const diagnostics: string[] = [];
-    const format = await this.repository.objectFormat();
-    for (const item of items) {
-      const note = await this.readEvidenceNote(item.result);
-      if (note === null) {
-        diagnostics.push(`Transition ${item.transition} has no evidence on result tree ${item.result}`);
-        continue;
-      }
-      let records: readonly NoteRecord[];
-      try {
-        records = parseNote(note, "strict", { verifyIds: false }).records;
-      } catch (error: unknown) {
-        diagnostics.push(`Result tree ${item.result}: ${error instanceof Error ? error.message : String(error)}`);
-        continue;
-      }
-      const found = records.find((record): record is TransitionSummary =>
-        record.type === "transition-summary" && record.id === item.transition);
-      if (found === undefined) {
-        diagnostics.push(`Result tree ${item.result} carries no ${item.transition} transition record`);
-        continue;
-      }
-      const expected = `tr:${hashBlobContent(`${transitionPayload(found)}\n`, format)}`;
-      if (expected !== found.id) {
-        diagnostics.push(`Transition record ${found.id} fails identity verification`);
-        continue;
-      }
-      const parentsMatch = found.parents.length === item.parents.length
-        && found.parents.every((parent, index) => parent === item.parents[index]);
-      if (!parentsMatch || found.result !== item.result) {
-        diagnostics.push(`Transition ${found.id} does not match the claimed trees`);
-      }
-    }
-    return { ok: diagnostics.length === 0, diagnostics };
-  }
-
-  async synthesizeHostedSummary(input: HostedSummaryInput): Promise<HostedSummaryPlan> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    if (await this.commitSessionSummary(commit) !== null) {
-      return {
-        commit,
-        state: "already-summarized",
-        entries: [],
-        diagnostics: [`Commit ${commit} already has a valid session summary`],
-      };
-    }
-    const diagnostics: string[] = [];
-    if (input.sourceCommits.length === 0) {
-      return { commit, state: "unsummarizable", entries: [], diagnostics: [`Commit ${commit} has no source commits`] };
-    }
-    const [firstParent] = await this.commitParents(commit);
-    const changedFrom = firstParent === undefined
-      ? new Set<ObjectId>()
-      : new Set<ObjectId>((await this.commitTransitions(firstParent, commit)).map((transition) => transition.from));
-    const entries: SummaryEntry[] = [];
-    for (const source of input.sourceCommits) {
-      const sourceCommit = await this.repository.resolveCommit(source);
-      const summary = await this.commitSessionSummary(sourceCommit);
-      if (summary === null) {
-        diagnostics.push(`Source commit ${sourceCommit} has no valid session summary`);
-        continue;
-      }
-      for (const entry of summary.entries) {
-        entries.push({
-          ...entry,
-          sources: [...entry.sources, { relation: "derived-from", kind: "commit", ref: sourceCommit }],
-          retirements: entry.retirements.filter((retirement) => changedFrom.has(retirement.from_blob)),
-        });
-      }
-    }
-    if (entries.length === 0) {
-      return { commit, state: "unsummarizable", entries: [], diagnostics };
-    }
-    return { commit, state: "ready", entries, diagnostics };
-  }
-
-  async attachHostedSummary(input: AttachHostedSummaryInput): Promise<AttachHostedSummaryResult> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    validateNote([input.summary], { verifyIds: false });
-    const check = await this.checkCommitAgainst(commit, input.summary);
-    if (!check.ok) {
-      throw new Error(
-        `Session summary for ${commit} fails strict validation: ${check.diagnostics.join("; ")}`,
-      );
-    }
-    return this.mutateNotes(async (notes) => {
-      const existing = await notes.read(commit);
-      const records = existing === null
-        ? []
-        : parseNote(existing, "strict", { verifyIds: false }).records;
-      const summary = records.find((record): record is SessionSummary => record.type === "session-summary");
-      if (summary !== undefined) {
-        return {
-          commit,
-          state: "already-summarized" as const,
-          summary,
-          diagnostics: [`Commit ${commit} already has a session summary`],
-        };
-      }
-      await notes.append(commit, canonicalRecord(input.summary));
-      return { commit, state: "attached" as const, summary: input.summary, diagnostics: [] };
-    });
-  }
-
-  async publishNotes(input: PublishNotesInput): Promise<PublishNotesResult> {
-    const remote = input.remote;
-    const maximum = input.attempts ?? 3;
-    if (await this.repository.notesTip() === null) {
-      return {
-        ok: false,
-        attempts: 0,
-        remoteTip: null,
-        diagnostics: ["The local Reveries notes ref does not exist"],
-      };
-    }
-    const secretDiagnostics = await this.secretMaterialDiagnostics(await this.evidenceView());
-    if (secretDiagnostics.length > 0) {
-      return {
-        ok: false,
-        attempts: 0,
-        remoteTip: null,
-        diagnostics: secretDiagnostics,
-      };
-    }
-    const diagnostics: string[] = [];
-    for (let attempt = 1; attempt <= maximum; attempt += 1) {
-      const expected = await this.liveRepository.remoteObject(remote, NOTES_REF);
-      const incorporated = await this.checkRemoteNotesIncorporated(remote, expected);
-      if (!incorporated.ok) {
-        const synced = await this.syncPull(remote);
-        if (!synced.ok) {
-          return {
-            ok: false,
-            attempts: attempt,
-            remoteTip: expected,
-            diagnostics: [...incorporated.diagnostics, ...synced.diagnostics],
-          };
-        }
-      }
-      const lease = expected ?? "0".repeat((await this.repository.objectFormat()) === "sha1" ? 40 : 64);
-      const push = await this.liveRepository.run(
-        [
-          "push",
-          `--force-with-lease=${NOTES_REF}:${lease}`,
-          remote,
-          `${NOTES_REF}:${NOTES_REF}`,
-        ],
-        { allowExitCodes: [0, 1, 128] },
-      );
-      if (push.exitCode === 0) {
-        return { ok: true, attempts: attempt, remoteTip: await this.repository.notesTip(), diagnostics };
-      }
-      diagnostics.push(`Notes publication attempt ${attempt} was rejected: ${push.stderr.trim()}`);
-    }
-    return {
-      ok: false,
-      attempts: maximum,
-      remoteTip: await this.liveRepository.remoteObject(remote, NOTES_REF),
-      diagnostics,
-    };
-  }
-
-  async attachInitialization(input: { readonly commit: string; readonly record: ReveriesInit }): Promise<void> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    await this.mutateNotes(async (notes) => {
-      await notes.append(commit, canonicalRecord(input.record));
-    });
-  }
-
-  async attachAdoption(input: {
-    readonly commit: string;
-    readonly summary: SessionSummary;
-    readonly initialization: ReveriesInit;
-  }): Promise<void> {
-    const commit = await this.repository.resolveCommit(input.commit);
-    validateNote([input.summary, input.initialization], { verifyIds: false });
-    await this.mutateNotes(async (notes) => {
-      const existing = await notes.read(commit);
-      const records = existing === null
-        ? []
-        : parseNote(existing, "strict", { verifyIds: false }).records;
-      const summary = records.find((record) => record.type === "session-summary");
-      const initialization = records.find((record) => record.type === "reveries-init");
-      if (summary !== undefined && canonicalRecord(summary) !== canonicalRecord(input.summary)) {
-        throw new Error(`Commit ${commit} already has a different session summary`);
-      }
-      if (initialization !== undefined && canonicalRecord(initialization) !== canonicalRecord(input.initialization)) {
-        throw new Error(`Commit ${commit} already has a different initialization record`);
-      }
-      const retained = records.filter(
-        (record) => record.type !== "session-summary" && record.type !== "reveries-init",
-      );
-      await notes.replace(
-        commit,
-        [input.summary, input.initialization, ...retained].map(canonicalRecord).join(""),
-      );
-    });
-  }
-
-  async checkStaged(explicitSuccessors: ReadonlyMap<string, string> = new Map()): Promise<CheckResult> {
-    const transitions = [...await this.stagedTransitions()];
-    for (const [oldPath, newPath] of explicitSuccessors) {
-      const from = await this.repository.resolveSubject({ path: oldPath, revision: "HEAD" });
-      const to = await this.repository.resolveSubject({ path: newPath, revision: "index" });
-      if (from.type !== "blob" || to.type !== "blob") {
-        throw new Error(
-          `reveries check --successor maps file (blob) paths only, and it is a local aid rather than publication proof: a renamed-and-edited directory needs a durable lineage edge on the resulting commit (old: ${oldPath}, new: ${newPath})`,
-        );
-      }
-      const existing = transitions.findIndex((transition) => transition.oldPath === oldPath);
-      const mapped: DiffTransition = { from: from.object, to: to.object, oldPath, newPath };
-      if (existing < 0) transitions.push(mapped);
-      else transitions.splice(existing, 1, mapped);
-    }
-    const summary = emptySummary();
-    const tree = await this.treeSubjectTransitions("HEAD", "HEAD", true);
-    // No commit exists yet, so there is no durable lineage edge and no session
-    // summary to read: the staged gate stays fail-closed and says which route
-    // actually closes the obligation. `--successor` is a local aid for files and
-    // is never evidence that publication will pass.
-    return this.checkTransitions(
-      [...transitions, ...tree],
-      summary,
-      [],
-      STAGED_ROUTE_GUIDANCE,
-    );
-  }
-
-  async checkCommit(revision: string): Promise<CheckResult> {
-    const commit = await this.repository.resolveCommit(revision);
-    const diagnostics: string[] = [];
-    let summary: SessionSummary | null = null;
-    try {
-      const note = await this.strictRead(commit);
-      summary = note.records.find((record): record is SessionSummary => record.type === "session-summary") ?? null;
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    const check = await this.checkCommitAgainst(commit, summary);
-    return { ok: check.ok, diagnostics: [...diagnostics, ...check.diagnostics] };
-  }
-
-  private async checkCommitAgainst(commit: CommitId, summary: SessionSummary | null): Promise<CheckResult> {
-    const initialization = await this.findInitialization();
-    if (initialization === null) {
-      return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
-    }
-    const ancestor = await this.repository.run(
-      ["merge-base", "--is-ancestor", initialization.commit, commit],
-      { allowExitCodes: [0, 1] },
-    );
-    if (ancestor.exitCode !== 0) {
-      return { ok: false, diagnostics: ["Commit is not a descendant of the Reveries initialization boundary"] };
-    }
-    if (summary === null) {
-      return { ok: false, diagnostics: [`Commit ${commit} requires exactly one valid session summary`] };
-    }
-    const diagnostics: string[] = [];
-    for (const parent of await this.commitParents(commit)) {
-      const transitions = [...await this.commitTransitions(parent, commit)];
-      // Directory renames pair through durable lineage when one exists, and stay
-      // fail-closed without one: same-path identity is the only pairing inferred
-      // automatically, and similarity is never inferred at all.
-      const tree = await this.treeSubjectTransitions(parent, commit, false);
-      const disturbed = this.disturbedCoordinates(parent, [...transitions, ...tree]);
-      const lineage = await this.classifyLineage({ commit, parent, disturbed });
-      for (const use of lineage.used.filter((entry) => entry.authority === "contradictory")) {
-        diagnostics.push(`contradictory-lineage ${use.id} for ${commit}: ${use.detail}`);
-      }
-      const result = await this.checkTransitions([...transitions, ...tree], summary, lineage.pairings);
-      diagnostics.push(...result.diagnostics.map((diagnostic) => `${parent}: ${diagnostic}`));
-    }
-    return { ok: diagnostics.length === 0, diagnostics };
-  }
-
-  private async commitParents(commit: CommitId): Promise<readonly CommitId[]> {
-    const result = await this.repository.run(["show", "-s", "--format=%P", commit]);
-    return result.stdout.trim().split(" ").filter((parent) => parent.length > 0).map(commitId);
-  }
-
-  private async commitSessionSummary(commit: CommitId): Promise<SessionSummary | null> {
-    try {
-      const note = await this.strictRead(commit);
-      return note.records.find((record): record is SessionSummary => record.type === "session-summary") ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  async checkProposedRef(
-    localObject: CommitId,
-    remoteObject: ObjectId | null,
-    remoteRef: string,
-  ): Promise<CheckResult> {
-    const initialization = await this.findInitialization();
-    if (initialization === null) {
-      return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
-    }
-    const diagnostics = await this.checkOutgoingRange(
-      initialization.commit,
-      localObject,
-      remoteObject,
-      remoteRef,
-    );
-    return { ok: diagnostics.length === 0, diagnostics };
-  }
-
-  /**
-   * Validate a proposed notes tip as evidence, on the receiver side and before
-   * any authority is derived from it.
-   *
-   * Shape, identity, and sources are checked per note, and the addressed
-   * records are checked against the repository as well: an occurrence must
-   * still resolve at its coordinate, and a lineage edge must bind a direct
-   * parent whose endpoints hold the subjects it names. That second layer is
-   * what keeps a hand-written record from steering a check, and it runs on the
-   * proposed tip rather than the ref the receiver already holds.
-   */
-  async checkProposedEvidence(): Promise<CheckResult> {
-    if (this.proposedNotesTip === undefined) {
-      throw new Error("Proposed evidence is available only to a receive checker");
-    }
-    const diagnostics: string[] = [];
-    for (const entry of await this.evidenceNotes()) {
-      try {
-        await this.strictRead(entry.object);
-      } catch (error: unknown) {
-        diagnostics.push(`${entry.object}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    for (const diagnostic of await this.addressedEvidenceDiagnostics()) {
-      diagnostics.push(diagnostic);
-    }
-    diagnostics.push(...await this.secretMaterialDiagnostics(await this.evidenceView()));
-    return { ok: diagnostics.length === 0, diagnostics };
-  }
-
-  private async secretMaterialDiagnostics(view: EvidenceSnapshotView): Promise<string[]> {
-    const diagnostics: string[] = [];
-    for (const entry of view.entries) {
-      for (const record of entry.records) {
-        const id = recordFactId(record) ?? record.type;
-        if (!allSources(record).some((source) => source.kind === "confidential-pointer")) continue;
-        const factId = recordFactId(record);
-        const content = canonicalRecord(record).replace(/\n$/, "");
-        const contentId = await this.repository.hashObject(content);
-        const signed = factId !== null && entry.records.some((candidate) =>
-          candidate.type === "signature"
-          && candidate.domain === SIGNATURE_DOMAIN_RECORD
-          && candidate.target === factId
-          && candidate.subject === entry.object
-          && candidate.content_id === contentId);
-        if (!signed) {
-          diagnostics.push(
-            `Confidential pointer in evidence ${id} on ${entry.object} requires a signature over the enclosing record before publication.`,
-          );
-        }
-      }
-    }
-    return diagnostics;
-  }
-
-  private async secretMaterialDiagnosticsAtNotesCommit(notesCommit: ObjectId): Promise<string[]> {
-    const listed = await this.repository.listNotesAt(notesCommit);
-    const bodies = await this.repository.readNotesBatch(listed, {});
-    const view = await this.buildSnapshotView(notesCommit, listed, bodies, resolveLimits(), false);
-    return this.secretMaterialDiagnostics(view);
-  }
-
-  /**
-   * Coordinates of every occurrence and lineage record in the proposed
-   * evidence, checked against the repository. Coordinates, not objects: a
-   * record may name a real subject at a path that does not hold it.
-   */
-  private async addressedEvidenceDiagnostics(): Promise<readonly string[]> {
-    const view = await this.evidenceView();
-    const diagnostics: string[] = [];
-    for (const entry of view.entries) {
-      for (const record of entry.records) {
-        if (record.type === "occurrence") {
-          try {
-            await this.validateCoordinate(record.occurrence);
-          } catch (error: unknown) {
-            diagnostics.push(
-              `Occurrence ${record.id}: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-          continue;
-        }
-        if (record.type !== "lineage") continue;
-        try {
-          await this.validateLineageRecord(record);
-        } catch (error: unknown) {
-          diagnostics.push(`Lineage ${record.id}: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-    }
-    return diagnostics;
-  }
-
-  async checkOutgoing(remote: string): Promise<CheckResult> {
-    const initialization = await this.findInitialization();
-    if (initialization === null) {
-      return { ok: false, diagnostics: ["Reveries initialization boundary is missing"] };
-    }
-    const branchResult = await this.repository.run(
-      ["symbolic-ref", "--quiet", "--short", "HEAD"],
-      { allowExitCodes: [0, 1] },
-    );
-    const branch = branchResult.stdout.trim();
-    if (branchResult.exitCode !== 0 || branch.length === 0) {
-      return { ok: false, diagnostics: ["Outgoing checks require an attached branch"] };
-    }
-    const localObject = await this.repository.resolveCommit("HEAD");
-    const remoteObject = await this.repository.notesTip(`refs/remotes/${remote}/${branch}`);
-    const remoteNotes = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
-    if (remoteNotes === null) {
-      return {
-        ok: false,
-        diagnostics: [`Remote ${remote} notes state is unavailable; fetch it before publication`],
-      };
-    }
-    return this.checkOutgoingUpdates(remote, [{
-      localRef: `refs/heads/${branch}`,
-      localObject,
-      remoteRef: `refs/heads/${branch}`,
-      remoteObject,
-    }, {
-      localRef: NOTES_REF,
-      localObject: await this.repository.notesTip(),
-      remoteRef: NOTES_REF,
-      remoteObject: remoteNotes,
-    }]);
-  }
-
-  async checkOutgoingUpdates(remote: string, updates: readonly PushUpdate[]): Promise<CheckResult> {
-    const diagnostics: string[] = [];
-    // An import-only remote is a source of someone else's history. Publishing
-    // into it would assert that this repository authored what is already there.
-    // This is checked before the adoption boundary because a destination that
-    // cannot be published to is wrong regardless of whether the repository has
-    // been adopted, and reporting only the missing boundary would hide the one
-    // problem the operator has to fix in configuration.
-    const role = await this.roleOf(remote);
-    if (role !== null && !rolePublishable(role)) {
-      diagnostics.push(`Remote ${remote} is an ${role} remote and is not a publication destination`);
-    }
-    const initialization = await this.findInitialization();
-    if (initialization === null) {
-      diagnostics.push("Reveries initialization boundary is missing");
-      return { ok: false, diagnostics };
-    }
-    const notesUpdate = updates.find((update) => update.remoteRef === NOTES_REF);
-    const ledgerUpdate = updates.find((update) => update.remoteRef === LEDGER_REF);
-    // The ledger branch lives under refs/heads but carries evidence, not code,
-    // so it must not be held to session-summary and transition coverage.
-    const branchUpdates = updates.filter((update) =>
-      update.localRef.startsWith("refs/heads/")
-      && update.localRef !== LEDGER_REF
-      && update.localObject !== null);
-    if (branchUpdates.length > 0 && notesUpdate === undefined) {
-      diagnostics.push("The push publishes a branch without refs/notes/reveries");
-    }
-    if (notesUpdate !== undefined) {
-      const localNotes = await this.repository.notesTip();
-      if (notesUpdate.localObject !== localNotes) {
-        diagnostics.push("The pushed notes object is not the current local Reveries notes tip");
-      }
-      diagnostics.push(...(await this.checkRemoteNotesIncorporated(remote, notesUpdate.remoteObject)).diagnostics);
-      if (notesUpdate.localObject !== null) {
-        diagnostics.push(...await this.secretMaterialDiagnostics(await this.evidenceView()));
-      }
-    }
-    for (const update of branchUpdates) {
-      diagnostics.push(...await this.checkOutgoingRange(
-        initialization.commit,
-        commitId(update.localObject!),
-        update.remoteObject,
-        update.remoteRef,
-      ));
-    }
-    if (ledgerUpdate !== undefined && ledgerUpdate.localObject !== null) {
-      const verification = await this.verifyLedgerEnvelope(ledgerUpdate.localObject);
-      diagnostics.push(...verification.diagnostics);
-      if (verification.ok) {
-        const stored = await this.repository.readLedgerManifestAt(ledgerUpdate.localObject);
-        if (stored !== null) {
-          const manifest = readLedgerManifest(stored);
-          if (manifest.notes_commit !== null) {
-            diagnostics.push(...await this.secretMaterialDiagnosticsAtNotesCommit(manifest.notes_commit));
-          }
-        }
-      }
-      if (verification.ok && ledgerUpdate.remoteObject !== null) {
-        if (!(await this.repository.objectExists("commit", ledgerUpdate.remoteObject))) {
-          diagnostics.push(
-            `Remote ledger ${ledgerUpdate.remoteObject} is unavailable locally; fetch it and rebuild from the current remote tip before publishing`,
-          );
-        } else if (!(await this.repository.isAncestor(ledgerUpdate.remoteObject, ledgerUpdate.localObject))) {
-          diagnostics.push(
-            `The proposed ledger ${ledgerUpdate.localObject} does not extend remote ledger ${ledgerUpdate.remoteObject}; fetch and rebuild from the current remote tip before publishing`,
-          );
-        }
-      }
-    }
-    try {
-      await this.validateNotesRef(NOTES_REF);
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    return { ok: diagnostics.length === 0, diagnostics };
   }
 
   async search(input: SearchInput): Promise<readonly SearchHit[]> {
@@ -3013,56 +1500,49 @@ export class Reveries {
       // extant coordinate from the log is still a valid starting point for the
       // explicit lineage walk.
     }
-    const walk = await this.occurrenceDerivation(start?.commit ?? null);
     if (start !== null) {
-      history.push(...await this.lineageHistory(walk.derivation, walk.silent, start, seen));
+      history.push(...await this.lineageHistory(start, seen));
     }
     return history;
   }
 
   /**
-   * Follow explicit lineage backwards from a path at its current revision,
-   * appending the earlier coordinates a rename-plus-edit, split, or join would
-   * otherwise hide. Ordering stays deterministic: commit descending, then path.
-   *
-   * A path that no longer resolves at the reference revision (deleted, or
-   * moved on) contributes nothing here: the `git log` walk above already
-   * reported the commits that touched it, and there is no current coordinate
-   * to walk backwards from.
+   * Follow explicit lineage backwards from a coordinate, appending the earlier
+   * coordinates a rename-plus-edit, split, or join would otherwise hide. Only
+   * recorded lineage is followed; similarity is never consulted, and the walk
+   * is deterministic: commit descending, then path.
    */
   private async lineageHistory(
-    derivation: OccurrenceDerivation,
-    silent: ReadonlySet<string>,
     start: OccurrenceCoordinate,
     seen: Set<string>,
   ): Promise<readonly HistoryEntry[]> {
-    const view = await this.loadCachedEvidenceSnapshot({});
+    const view = await this.loadEvidenceSnapshot({});
     if (view.lineages.size === 0) return [];
-    const startKey = coordinateKey(String(start.commit), start.path, String(start.subject));
-    // Collect every coordinate the edges derive this one from. The start itself
-    // is left out: `git log` already reported it. Bridge steps are
-    // traversal-only for the same reason: they name the coordinate the walk
-    // already stands on, so emitting them would duplicate the entry the
-    // current revision (or an earlier edge step) already produced.
-    const earlier: { coordinate: OccurrenceCoordinate; lineage: LineageId }[] = [];
-    const visited = new Set<string>([startKey]);
+    const edges = [...view.lineages.values()].flat();
+    const key = (commit: string, path: string, subject: string): string =>
+      `${commit}\u0000${normalizeCoordinatePath(path)}\u0000${subject}`;
+    const visited = new Set<string>([key(String(start.commit), start.path, String(start.subject))]);
     const queue: OccurrenceCoordinate[] = [start];
+    const earlier: { coordinate: OccurrenceCoordinate; lineage: LineageId }[] = [];
     while (queue.length > 0) {
       const coordinate = queue.shift() as OccurrenceCoordinate;
-      for (const step of derivation.get(coordinateKey(
-        String(coordinate.commit),
-        coordinate.path,
-        String(coordinate.subject),
-      )) ?? []) {
-        const previous = coordinateKey(
-          String(step.coordinate.commit),
-          step.coordinate.path,
-          String(step.coordinate.subject),
-        );
-        if (visited.has(previous)) continue;
-        visited.add(previous);
-        if (!silent.has(`${previous}\u0001${step.lineage}`)) earlier.push(step);
-        queue.push(step.coordinate);
+      for (const edge of edges) {
+        const matches = edge.to.some((endpoint) =>
+          endpoint.subject === coordinate.subject
+          && normalizeCoordinatePath(endpoint.path) === normalizeCoordinatePath(coordinate.path));
+        if (!matches) continue;
+        for (const endpoint of edge.from) {
+          const previous = key(String(edge.parent), endpoint.path, String(endpoint.subject));
+          if (visited.has(previous)) continue;
+          visited.add(previous);
+          const next: OccurrenceCoordinate = {
+            commit: edge.parent,
+            path: normalizeCoordinatePath(endpoint.path),
+            subject: endpoint.subject,
+          };
+          earlier.push({ coordinate: next, lineage: edge.id });
+          queue.push(next);
+        }
       }
     }
     const entries: HistoryEntry[] = [];
@@ -3115,37 +1595,6 @@ export class Reveries {
    * from Git and rewrites the index. The index is never authority: every view
    * derives from note bodies either way.
    */
-  async loadCachedEvidenceSnapshot(options: SnapshotLoadOptions = {}): Promise<EvidenceSnapshotView> {
-    const ref = options.ref ?? NOTES_REF;
-    const limits = resolveLimits(options.limits);
-    const tip = await this.repository.notesTip(ref);
-    if (tip === null) return emptySnapshotView(limits);
-    const raw = await this.repository.readSnapshotIndex(tip);
-    if (raw !== null) {
-      try {
-        const payload = parseSnapshotIndexPayload(raw, tip);
-        const cached = new Map<ObjectId, string | null>(
-          payload.bodies.map((entry) => [objectId(entry.object), entry.body] as const),
-        );
-        return await this.buildSnapshotView(tip, await this.repository.listNotes(ref), cached, limits, true);
-      } catch (error: unknown) {
-        if (!(error instanceof SnapshotIndexCorruptError)) throw error;
-      }
-    }
-    const listed = await this.repository.listNotes(ref);
-    const bodies = await this.repository.readNotesBatch(listed, { limits: options.limits });
-    const view = await this.buildSnapshotView(tip, listed, bodies, limits, false);
-    await this.repository.writeSnapshotIndex(tip, JSON.stringify({
-      v: 1,
-      tip,
-      bodies: listed.map((entry) => ({
-        object: entry.object,
-        body: bodies.get(entry.object) ?? null,
-      })),
-    }));
-    return view;
-  }
-
   private async buildSnapshotView(
     tip: ObjectId,
     listed: readonly NoteListEntry[],
@@ -3180,41 +1629,6 @@ export class Reveries {
         const parsed = parseNote(body, "strict", { limits });
         records = validateNote(parsed, { limits });
         for (const record of records) {
-          if (record.type === "transition-summary") {
-            const expected = `tr:${hashBlobContent(`${transitionPayload(record)}\n`, format)}`;
-            if (expected !== record.id) {
-              throw new Error(`Transition ID mismatch for ${record.id}; expected ${expected}`);
-            }
-            continue;
-          }
-          if (record.type === "correction") {
-            const expected = `cr:${hashBlobContent(`${correctionPayload(record)}\n`, format)}`;
-            if (expected !== record.id) {
-              throw new Error(`Correction ID mismatch for ${record.id}; expected ${expected}`);
-            }
-            continue;
-          }
-          if (record.type === "resolution") {
-            const expected = `rs:${hashBlobContent(`${resolutionPayload(record)}\n`, format)}`;
-            if (expected !== record.id) {
-              throw new Error(`Resolution ID mismatch for ${record.id}; expected ${expected}`);
-            }
-            continue;
-          }
-          if (record.type === "redaction") {
-            const expected = `rd:${hashBlobContent(`${redactionPayload(record)}\n`, format)}`;
-            if (expected !== record.id) {
-              throw new Error(`Redaction ID mismatch for ${record.id}; expected ${expected}`);
-            }
-            continue;
-          }
-          if (record.type === "occurrence") {
-            const expected = `oc:${hashBlobContent(`${occurrencePayload(record)}\n`, format)}`;
-            if (expected !== record.id) {
-              throw new Error(`Occurrence ID mismatch for ${record.id}; expected ${expected}`);
-            }
-            continue;
-          }
           if (record.type === "lineage") {
             const expected = `lg:${hashBlobContent(`${lineagePayload(record, limits)}\n`, format)}`;
             if (expected !== record.id) {
@@ -3235,7 +1649,6 @@ export class Reveries {
           object: entry.object,
           records: [],
           projection: projectActiveReveries([]),
-          factGraph: projectFactGraph([]),
           objectType: await this.snapshotObjectType(details, entry.object),
           error: message,
           snapshot: createEvidenceSnapshot({ notesTip: tip, records: [], limits }),
@@ -3245,17 +1658,12 @@ export class Reveries {
       const projection = projectActiveReveries(
         records.filter((record): record is ReverieRecord => record.type === "reverie"),
       );
-      const factGraph = projectFactGraph(records);
-      const projectionDiagnostics = [
-        ...this.projectionDiagnostics(projection),
-        ...factGraphDiagnostics(factGraph),
-      ];
+      const projectionDiagnostics = this.projectionDiagnostics(projection);
       const objectType = await this.snapshotObjectType(details, entry.object);
       entries.push({
         object: entry.object,
         records,
         projection,
-        factGraph,
         objectType,
         error: projectionDiagnostics.length > 0 ? projectionDiagnostics.join("; ") : null,
         snapshot: createEvidenceSnapshot({ notesTip: tip, records, limits }),
@@ -3271,80 +1679,21 @@ export class Reveries {
         byId.set(record.id, { record, object: entry.object });
       }
     }
-    const backlinkSets = new Map<ReverieId, Set<ObjectId>>();
-    for (const entry of entries) {
-      for (const record of entry.records) {
-        for (const source of allSources(record)) {
-          if (source.kind !== "note") continue;
-          const set = backlinkSets.get(source.ref as ReverieId) ?? new Set<ObjectId>();
-          set.add(entry.object);
-          backlinkSets.set(source.ref as ReverieId, set);
-        }
-      }
-    }
-    const backlinks = new Map<ReverieId, readonly ObjectId[]>(
-      [...backlinkSets].map(([id, objects]) => [id, [...objects].sort()]),
-    );
-    const transitions = new Map<TransitionId, { readonly record: TransitionSummary; readonly object: ObjectId }>();
-    const attestationLists = new Map<CommitId, PublicationAttestation[]>();
     const lineageLists = new Map<CommitId, LineageRecord[]>();
     for (const entry of entries) {
       for (const record of entry.records) {
-        if (record.type === "transition-summary") {
-          if (!transitions.has(record.id)) transitions.set(record.id, { record, object: entry.object });
-        } else if (record.type === "publication-attestation") {
-          const list = attestationLists.get(record.commit) ?? [];
-          list.push(record);
-          attestationLists.set(record.commit, list);
-        } else if (record.type === "lineage") {
-          const list = lineageLists.get(record.commit) ?? [];
-          list.push(record);
-          lineageLists.set(record.commit, list);
-        }
+        if (record.type !== "lineage") continue;
+        const list = lineageLists.get(record.commit) ?? [];
+        list.push(record);
+        lineageLists.set(record.commit, list);
       }
     }
-    const attestations = new Map<CommitId, readonly PublicationAttestation[]>(attestationLists);
     const lineages = new Map<CommitId, readonly LineageRecord[]>(lineageLists);
-    const globalRecords = entries.flatMap((entry) => entry.records);
-    const factGraph = projectFactGraph(globalRecords);
-    const redacted = [...factGraph.redacted];
-    const factLocations = new Map<string, ObjectId>();
-    for (const entry of entries) {
-      for (const record of entry.records) {
-        const id = recordFactId(record);
-        if (id !== null && !factLocations.has(id)) factLocations.set(id, entry.object);
-      }
-    }
-    let init: EvidenceSnapshotView["init"] = null;
-    let initError: string | null = null;
-    for (const entry of entries) {
-      for (const record of entry.records) {
-        if (record.type !== "reveries-init") continue;
-        if (init !== null) {
-          initError = "More than one Reveries initialization boundary exists";
-          break;
-        }
-        if (entry.objectType !== "commit") {
-          initError = "The Reveries initialization record is not attached to a commit";
-          break;
-        }
-        init = { commit: commitId(entry.object), record };
-      }
-      if (initError !== null) break;
-    }
     return {
       tip,
       entries,
       byId,
-      transitions,
-      attestations,
       lineages,
-      backlinks,
-      factGraph,
-      redacted,
-      factLocations,
-      init,
-      initError,
       diagnostics,
       diagnosticsTruncated,
       limits,
@@ -3357,7 +1706,6 @@ export class Reveries {
       },
     };
   }
-
   private async noteObjectType(object: ObjectId): Promise<string> {
     return (await this.repository.run(["cat-file", "-t", object])).stdout.trim();
   }
@@ -3387,64 +1735,19 @@ export class Reveries {
    * instead of rescanning every note.
    */
   async validateNotesSnapshot(view: EvidenceSnapshotView): Promise<void> {
-    let initialization: ObjectId | null = null;
     for (const entry of view.entries) {
       try {
         if (entry.error !== null) throw new Error(entry.error);
-        if (entry.records.some((record) => record.type === "reveries-init")) {
-          if (entry.objectType !== "commit") {
-            throw new Error(`Initialization record ${entry.object} is not attached to a commit`);
-          }
-          if (initialization !== null) {
-            throw new Error("More than one Reveries initialization boundary exists");
-          }
-          initialization = entry.object;
+        // A blob or tree may carry a reverie or a lineage edge; a commit may
+        // carry neither, because a decision is about content, not history.
+        if ((entry.objectType === "blob" || entry.objectType === "tree")
+          && entry.records.some((record) => record.type !== "reverie" && record.type !== "lineage")) {
+          throw new Error(`${entry.objectType === "blob" ? "Blob" : "Tree"} ${entry.object} has a non-reverie protocol record`);
         }
-        // A signature is a global fact about an annotated subject, so it may
-        // ride on blob, tree, and commit notes alongside the records that live
-        // there. It is not evidence about the subject's content, so it never
-        // disqualifies the subject as a transition result or publication.
-        // A lineage edge is a fact about object endpoints, so it rides the note
-        // of every endpoint subject: `to` when one exists, otherwise `from`.
-        // Lineage is protocol evidence in its own right, not a file reverie, so
-        // a blob carrying it is still a valid endpoint.
-        if (entry.objectType === "blob" && entry.records.some((record) =>
-          record.type !== "reverie"
-          && record.type !== "occurrence"
-          && record.type !== "correction"
-          && record.type !== "resolution"
-          && record.type !== "redaction"
-          && record.type !== "signature"
-          && record.type !== "lineage")) {
-          throw new Error(`Blob ${entry.object} has a non-reverie protocol record`);
-        }
-        if (entry.objectType === "commit" && entry.records.some((record) =>
-          record.type === "reverie"
-          || record.type === "occurrence"
-          || record.type === "correction"
-          || record.type === "resolution")) {
+        if (entry.objectType === "commit" && entry.records.some((record) => record.type === "reverie")) {
           throw new Error(`Commit ${entry.object} has a file reverie record`);
         }
-        if (entry.objectType === "commit"
-          && entry.records.some((record) => record.type === "transition-summary")) {
-          throw new Error(`Commit ${entry.object} has a tree transition record`);
-        }
-        if (entry.objectType === "tree"
-          && entry.records.some((record) =>
-            record.type !== "reverie"
-            && record.type !== "occurrence"
-            && record.type !== "transition-summary"
-            && record.type !== "correction"
-            && record.type !== "resolution"
-            && record.type !== "redaction"
-            && record.type !== "signature"
-            && record.type !== "lineage")) {
-          throw new Error(`Tree ${entry.object} has a non-tree protocol record`);
-        }
         for (const record of entry.records) {
-          if (record.type === "publication-attestation" && record.commit !== entry.object) {
-            throw new Error(`Attestation for ${record.commit} is attached to ${entry.object}`);
-          }
           // A lineage edge is about object endpoints, not about the change it
           // was recorded beside, so it may ride any endpoint subject's note.
           if (record.type === "lineage" && record.commit !== entry.object) {
@@ -3452,20 +1755,6 @@ export class Reveries {
             if (!endpoints.includes(String(entry.object))) {
               throw new Error(`Lineage edge ${record.id} is attached to ${entry.object}, which is not one of its endpoints`);
             }
-          }
-          // An occurrence rides the note of the subject it names, and its
-          // coordinate must still resolve to that subject. Without this a
-          // record could claim a path that never held this content.
-          if (record.type === "occurrence") {
-            if (record.occurrence.subject !== entry.object) {
-              throw new Error(
-                `Occurrence ${record.id} names subject ${record.occurrence.subject} but is attached to ${entry.object}`,
-              );
-            }
-            await this.validateCoordinate(record.occurrence);
-          }
-          if (record.type === "lineage") {
-            await this.validateLineageRecord(record);
           }
         }
         if (entry.objectType !== "blob" && entry.objectType !== "commit" && entry.objectType !== "tree"
@@ -3477,29 +1766,15 @@ export class Reveries {
         throw new NotesRefValidationError(entry.object, error);
       }
     }
-    // Cross-note forks: corrections on different notes may supersede the same
-    // heads. Sync and mutation stay fail-closed on them; only a candidate
-    // whose resolution names every head passes validation. Session summaries
-    // attach per commit, so summary forks stay a per-note diagnostic and are
-    // excluded from the global check.
-    const globalDiagnostics = factGraphDiagnostics({ ...view.factGraph, summaryFork: false });
+    // Cross-note forks: two records may supersede the same predecessor from
+    // different notes. A fork or cycle is damage a reader must not ignore.
+    const reveries = view.entries.flatMap((entry) =>
+      entry.records.filter((record): record is ReverieRecord => record.type === "reverie"));
+    const globalDiagnostics = this.projectionDiagnostics(projectActiveReveries(reveries));
     if (globalDiagnostics.length > 0) {
-      const involved = new Set<string>([
-        ...view.factGraph.forks.flat(),
-        ...view.factGraph.cycles.flat(),
-        ...(view.factGraph.conflicts ?? []),
-      ]);
-      let annotated: ObjectId | null = null;
-      for (const id of involved) {
-        const location = view.factLocations.get(id);
-        if (location !== undefined) {
-          annotated = location;
-          break;
-        }
-      }
       const firstEntry = view.entries[0];
       throw new NotesRefValidationError(
-        annotated ?? (firstEntry !== undefined ? firstEntry.object : view.tip as ObjectId),
+        firstEntry !== undefined ? firstEntry.object : view.tip as ObjectId,
         new Error(globalDiagnostics.join("; ")),
       );
     }
@@ -3573,56 +1848,23 @@ export class Reveries {
   }
 
   async cachedSearch(input: SearchInput): Promise<readonly SearchHit[]> {
-    return this.searchWithView(await this.loadCachedEvidenceSnapshot({}), input);
+    return this.searchWithView(await this.loadEvidenceSnapshot({}), input);
   }
 
   private async searchWithView(view: EvidenceSnapshotView, input: SearchInput): Promise<readonly SearchHit[]> {
     const revision = input.revision ?? "HEAD";
-    let revisionCommit: CommitId | null = null;
-    try {
-      if (revision !== "index") revisionCommit = await this.repository.resolveCommit(revision);
-    } catch {
-      revisionCommit = null;
-    }
-    const occurrenceWalk = revisionCommit === null
-      ? { derivation: new Map() as OccurrenceDerivation, silent: new Set<string>() }
-      : await this.occurrenceDerivation(revisionCommit);
     const allowed = input.all === true
       ? new Set(view.entries.map((entry) => entry.object as string))
       : new Set((await this.snapshotTargets(view, revision)).map((entry) => entry.object as string));
-    const redacted = input.includeRedacted === true ? new Set<string>() : new Set(view.redacted);
     const hits: SearchHit[] = [];
     for (const entry of view.entries) {
       if (!allowed.has(entry.object as string)) continue;
       for (const record of entry.records) {
-        const id = recordFactId(record);
-        if (id !== null && redacted.has(id)) continue;
         if (input.query !== undefined && !searchText(record).includes(input.query.toLocaleLowerCase())) continue;
         if (input.source !== undefined && !allSources(record).some((source) => source.ref === input.source)) continue;
         if (input.author !== undefined && recordAuthor(record) !== input.author) continue;
         const paths = await this.pathsForObject(entry.object, revision);
-        hits.push(record.type === "occurrence"
-          ? {
-              object: entry.object,
-              record,
-              paths,
-              occurrence: record.occurrence,
-              applicable: revisionCommit !== null && paths.some((path) => {
-                const current: OccurrenceCoordinate = {
-                  commit: revisionCommit as CommitId,
-                  path: normalizeCoordinatePath(path),
-                  subject: entry.object,
-                };
-                const anchor = record.occurrence;
-                if (String(anchor.commit) === String(current.commit)
-                  && normalizeCoordinatePath(anchor.path) === current.path
-                  && anchor.subject === current.subject) {
-                  return true;
-                }
-                return deriveLineage(occurrenceWalk.derivation, current, anchor).length > 0;
-              }),
-            }
-          : { object: entry.object, record, paths });
+        hits.push({ object: entry.object, record, paths });
       }
     }
     return hits;
@@ -3664,22 +1906,19 @@ export class Reveries {
    * while the canonical ref is left exactly as it was. An archive is not a
    * synchronization source and is refused before any fetch.
    */
+  /**
+   * Fetch a remote's notes and merge them into the canonical ref.
+   *
+   * The union is a plain `cat_sort_uniq` merge, so it is deterministic and
+   * idempotent. There is no quarantine and no promotion gate: a reader
+   * discovers a conflicting duplicate ID from `reveries doctor`, which never
+   * blocks the union.
+   */
   async syncPull(remote: string): Promise<SyncResult> {
-    const role = await this.roleOf(remote);
-    if (role !== null && !roleSyncSource(role)) {
-      return {
-        ok: false,
-        diagnostics: [`Remote ${remote} is an ${role} remote and is not a source of Reveries evidence`],
-        state: "fetched",
-        conflicts: [],
-      };
-    }
-    const promotes = role === null || rolePromotion(role) === "promote";
     const fetched = await this.liveRepository.fetchNotes(remote);
     if (fetched === "absent") {
       return { ok: true, diagnostics: [], state: "remote-notes-absent", conflicts: [] };
     }
-    const localNotes = await this.repository.notesTip();
     const remoteNotes = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
     if (remoteNotes === null) {
       return {
@@ -3689,148 +1928,19 @@ export class Reveries {
         conflicts: [],
       };
     }
-    let quarantineRef: string | null = null;
-    let conflict: SyncConflict | null = null;
-    // A non-primary sync takes the same path and the same validation, then stops
-    // short of the compare-and-swap. Promotion is withheld by construction, so
-    // an import cannot reach canonical state even if a caller expects it to.
-    const promotion: WithNotesWriteOptions = promotes
-      ? {}
-      : {
-          promote: false,
-          onCandidate: async (candidate: ObjectId) => {
-            quarantineRef = await this.repository.quarantineNotes(remote, candidate);
-          },
-        };
     try {
-      await this.repository.mergeFetchedNotes(
-        remote,
-        async (ref) => {
-          await this.validateNotesRef(ref);
-          const findings = await this.secretMaterialDiagnostics(await this.loadEvidenceSnapshot({ ref }));
-          if (findings.length > 0) throw new Error(findings.join("; "));
-        },
-        async (candidateRef, candidate, error) => {
-          quarantineRef = await this.repository.quarantineNotes(remote, candidate);
-          conflict = await this.describeSyncConflict({
-            remote,
-            candidateRef,
-            candidate,
-            error,
-            localNotes,
-            remoteNotes,
-            quarantineRef,
-          });
-        },
-        promotion,
-      );
-      if (quarantineRef !== null) {
-        // A quarantined union is a success: the evidence is held, validated, and
-        // inspectable. Reporting it as a failure would train an operator to
-        // ignore this state, which is how silent promotion happens.
-        return {
-          ok: true,
-          diagnostics: [
-            `Notes from ${remote} are validated but quarantined at ${quarantineRef}; `
-            + `canonical ${NOTES_REF} is unchanged because ${remote} is ${role}`,
-          ],
-          state: "fetched",
-          conflicts: [],
-          quarantineRef,
-        };
-      }
-      return { ok: true, diagnostics: [], state: "fetched", conflicts: [], quarantineRef: null };
+      await this.repository.mergeFetchedNotes(remote, (ref) => this.validateNotesRef(ref));
     } catch (error: unknown) {
-      const diagnostics = [error instanceof Error ? error.message : String(error)];
-      if (quarantineRef !== null) {
-        diagnostics.push(`Invalid fetched notes union quarantined at ${quarantineRef}`);
-      }
       return {
         ok: false,
-        diagnostics,
+        diagnostics: [error instanceof Error ? error.message : String(error)],
         state: "fetched",
-        conflicts: conflict === null ? [] : [conflict],
-        quarantineRef,
+        conflicts: [],
       };
     }
+    return { ok: true, diagnostics: [], state: "fetched", conflicts: [] };
   }
 
-  private async describeSyncConflict(input: {
-    readonly remote: string;
-    readonly candidateRef: string;
-    readonly candidate: ObjectId;
-    readonly error: unknown;
-    readonly localNotes: ObjectId | null;
-    readonly remoteNotes: ObjectId;
-    readonly quarantineRef: string;
-  }): Promise<SyncConflict> {
-    const message = input.error instanceof Error ? input.error.message : String(input.error);
-    const conflictType = syncConflictType(message);
-    const annotatedObject = input.error instanceof NotesRefValidationError
-      ? input.error.annotatedObject
-      : null;
-    const records = annotatedObject === null || conflictType === "secret-material"
-      ? []
-      : await this.describeConflictRecords(
-          annotatedObject,
-          input.candidateRef,
-          input.localNotes,
-          input.remoteNotes,
-        );
-    return {
-      kind: "invalid-notes-union",
-      conflictType,
-      message,
-      annotatedObject,
-      records,
-      provenance: {
-        localNotes: input.localNotes,
-        remoteNotes: input.remoteNotes,
-        candidate: input.candidate,
-        quarantineRef: input.quarantineRef,
-      },
-      resolutionActions: [
-        { kind: "inspect-quarantine", ref: input.quarantineRef },
-        { kind: "construct-replacement-candidate", sourceRef: input.quarantineRef },
-        { kind: "retry-sync", remote: input.remote },
-      ],
-    };
-  }
-
-  private async describeConflictRecords(
-    object: ObjectId,
-    candidateRef: string,
-    localNotes: ObjectId | null,
-    remoteNotes: ObjectId,
-  ): Promise<readonly SyncConflictRecord[]> {
-    const candidate = await this.repository.readNoteFromRef(candidateRef, object);
-    if (candidate === null) return [];
-    const local = localNotes === null ? null : await this.repository.readNoteAt(localNotes, object);
-    const remote = await this.repository.readNoteAt(remoteNotes, object);
-    const localLines = new Set(noteLines(local));
-    const remoteLines = new Set(noteLines(remote));
-    return noteLines(candidate).map((canonicalLine) => ({
-      recordId: recordIdFromCanonicalLine(canonicalLine),
-      canonicalLine,
-      origins: recordOrigins(canonicalLine, localLines, remoteLines),
-    }));
-  }
-
-  /**
-   * Publish HEAD and refs/notes/reveries in one atomic Git transaction.
-   *
-   * The single transaction is the only thing this command adds: a plain
-   * `git push origin HEAD refs/notes/reveries` is equally valid, and the two
-   * refspecs in one push are already atomic on the server. This uses an
-   * explicit lease for each ref so a concurrent remote advance fails the whole
-   * transaction closed rather than publishing a partial set.
-   *
-   * It no longer runs an outgoing continuity check. Refusing a push because a
-   * commit lacks a session summary made publication a workflow gate; a reader
-   * now discovers unresolved continuity from the evidence itself, and Git's own
-   * `--force-with-lease` is the operator's tool for refusing history rewrites.
-   * The aggregate result therefore reports what Git did, not permission.
-   */
   async push(remote: string): Promise<CheckResult> {
     const branchResult = await this.repository.run(
       ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -3857,20 +1967,6 @@ export class Reveries {
     return { ok: true, diagnostics: [] };
   }
 
-  async postCommitCheck(): Promise<CheckResult> {
-    const initialization = await this.findInitialization();
-    if (initialization === null) return { ok: true, diagnostics: [] };
-    const descendant = await this.repository.run(
-      ["merge-base", "--is-ancestor", initialization.commit, "HEAD"],
-      { allowExitCodes: [0, 1] },
-    );
-    return descendant.exitCode === 0 ? this.checkCommit("HEAD") : { ok: true, diagnostics: [] };
-  }
-
-  /**
-   * Read the configured retention policy. An unset key means the default, which keeps
-   * only the annotated objects that currently carry an active reverie.
-   */
   async retentionPolicy(): Promise<RetentionPolicy> {
     const result = await this.repository.run(["config", "--get", "reveries.retention"], {
       allowExitCodes: [0, 1],
@@ -3884,7 +1980,7 @@ export class Reveries {
   }
 
   private async retentionSelection(policy: RetentionPolicy): Promise<readonly RetentionSubject[]> {
-    const view = await this.loadCachedEvidenceSnapshot({});
+    const view = await this.loadEvidenceSnapshot({});
     const byObject = new Map(view.entries.map((entry) => [entry.object as string, entry]));
     const subjects: { readonly object: ObjectId; readonly type: RetentionSubject["type"]; readonly reveries: readonly ReverieRecord[] }[] = [];
     for (const listEntry of await this.repository.listNotes()) {
@@ -3987,1123 +2083,6 @@ export class Reveries {
    * Fails closed: any structural disagreement is a diagnostic, never a warning.
    * A notes tip that merely leads the envelope is staleness, reported by
    * `ledgerStatus`, not a verification failure.
-   */
-  async verifyLedgerEnvelope(revision?: string): Promise<CheckResult> {
-    const diagnostics: string[] = [];
-    const checkpoint = revision === undefined ? await this.repository.ledgerTip() : await this.repository.resolveCommit(revision);
-    if (checkpoint === null) return { ok: false, diagnostics: ["The Reveries ledger branch does not exist"] };
-    if (!(await this.repository.isLedgerCheckpoint(checkpoint))) {
-      return { ok: false, diagnostics: [`${checkpoint} is not a Reveries ledger checkpoint`] };
-    }
-
-    // The envelope may carry only the manifest, the grafted notes subtree, and
-    // the signature lines over the manifest. `review/` belongs to RVR-019 and is
-    // rejected until that contract is agreed. RVR-009 amended RVR-005's two-entry
-    // allow-list to exactly three; no existing check is dropped.
-    const entries = await this.repository.ledgerTreeEntries(checkpoint);
-    const allowed = new Set([LEDGER_MANIFEST_PATH, LEDGER_NOTES_PATH, LEDGER_SIGNATURES_PATH]);
-    for (const entry of entries) {
-      if (!allowed.has(entry.path)) diagnostics.push(`Ledger tree entry ${entry.path} is not part of the ledger envelope`);
-    }
-
-    let manifest: LedgerManifest | null = null;
-    const stored = await this.repository.readLedgerManifestAt(checkpoint);
-    if (stored === null) {
-      diagnostics.push("Ledger checkpoint has no manifest.json");
-    } else {
-      const parsed = parseLedgerManifest(stored, "tolerant");
-      manifest = parsed.manifest;
-      for (const diagnostic of parsed.diagnostics) diagnostics.push(`Ledger manifest: ${diagnostic.message}`);
-    }
-
-    if (manifest === null) return { ok: false, diagnostics };
-
-    // Parent roles are positional and validated, never inferred: the manifest
-    // names the previous ledger, the notes commit, and the optional retention
-    // checkpoint, and the commit must carry exactly those parents in that order.
-    const parents = await this.repository.ledgerParents(checkpoint);
-    const expected: readonly ObjectId[] = [
-      manifest.previous_ledger,
-      manifest.notes_commit,
-      manifest.retention_commit,
-    ].filter((parent): parent is CommitId => parent !== null);
-    if (parents.length !== expected.length || parents.some((parent, index) => parent !== expected[index])) {
-      diagnostics.push(
-        `Ledger parents [${parents.join(", ") || "none"}] do not match the manifest `
-        + `[previous_ledger ${manifest.previous_ledger ?? "null"}, notes_commit ${manifest.notes_commit ?? "null"}, `
-        + `retention_commit ${manifest.retention_commit ?? "null"}]`,
-      );
-    }
-
-    // The grafted subtree must be the exact notes tree the manifest claims, and
-    // that tree must belong to the notes commit the manifest claims. Comparing
-    // both directions is what detects a graft swap.
-    let notesTree: ObjectId | null = null;
-    try {
-      notesTree = await this.repository.notesTreeAt(checkpoint);
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    if (notesTree !== null && manifest.notes_tree !== null && notesTree !== manifest.notes_tree) {
-      diagnostics.push(`Ledger notes subtree ${notesTree} does not match manifest notes_tree ${manifest.notes_tree}`);
-    }
-    if (manifest.notes_commit !== null) {
-      if (await this.repository.objectType(manifest.notes_commit) !== "commit") {
-        diagnostics.push(`Ledger manifest notes_commit ${manifest.notes_commit} is not available as a commit`);
-      } else if (notesTree !== null && (await this.repository.treeForCommit(manifest.notes_commit)) !== notesTree) {
-        diagnostics.push(`Ledger notes commit ${manifest.notes_commit} does not carry the grafted notes tree ${notesTree}`);
-      }
-    }
-
-    if (manifest.retention_commit !== null
-      && !(await this.repository.isRetentionCommit(manifest.retention_commit))) {
-      diagnostics.push(`Ledger retention_commit ${manifest.retention_commit} is not a retention checkpoint`);
-    }
-
-    // Append-only: every canonical line the previous checkpoint carried must
-    // still be present. Comparing per-subject line sets is stronger than tree
-    // monotonicity, because a modified note blob can still lose a line.
-    if (manifest.previous_ledger !== null && notesTree !== null) {
-      const previous = await this.repository.isLedgerCheckpoint(manifest.previous_ledger)
-        ? await this.repository.ledgerNotesLines(manifest.previous_ledger)
-        : new Map<ObjectId, readonly string[]>();
-      const current = await this.repository.ledgerNotesLines(checkpoint);
-      for (const [subject, lines] of previous) {
-        const now = new Set(current.get(subject) ?? []);
-        for (const line of lines) {
-          if (!now.has(line)) {
-            diagnostics.push(`Ledger update removes canonical line from ${subject}, which is not append-only`);
-            break;
-          }
-        }
-      }
-    }
-
-    // The same append-only rule covers signature lines (RVR-009): a later
-    // checkpoint may add attestations, never drop or rewrite one. Without this a
-    // trusted signature could be silently retracted by the next checkpoint.
-    // The stronger guarantee is that once a chain is signed it stays signed, so
-    // dropping the signer cannot be used to shed accountability.
-    if (manifest.previous_ledger !== null) {
-      const previousSignatures = await this.repository.readLedgerSignaturesAt(manifest.previous_ledger);
-      const currentSignatures = await this.repository.readLedgerSignaturesAt(checkpoint);
-      if (previousSignatures !== null && currentSignatures === null) {
-        diagnostics.push("Ledger update drops the signatures entry of a signed checkpoint");
-      }
-      const nowLines = new Set(
-        (currentSignatures ?? "").split("\n").filter((line) => line.length > 0),
-      );
-      for (const line of (previousSignatures ?? "").split("\n")) {
-        if (line.length > 0 && !nowLines.has(line)) {
-          diagnostics.push(`Ledger update removes signature ${line}, which is not append-only`);
-          break;
-        }
-      }
-    }
-
-    if (notesTree !== null) {
-      const totals = Reveries.summarizeNoteLines(await this.repository.ledgerNotesLines(checkpoint));
-      if (manifest.annotated_subjects !== totals.subjects) {
-        diagnostics.push(`Ledger manifest annotated_subjects ${manifest.annotated_subjects} does not match ${totals.subjects}`);
-      }
-      if (manifest.records !== totals.records) {
-        diagnostics.push(`Ledger manifest records ${manifest.records} does not match ${totals.records}`);
-      }
-      if (manifest.note_bytes !== totals.noteBytes) {
-        diagnostics.push(`Ledger manifest note_bytes ${manifest.note_bytes} does not match ${totals.noteBytes}`);
-      }
-    }
-
-    // The manifest signature binds the exact notes, ledger, and retention tips
-    // because all three are inside the signed bytes. Structural verification does
-    // not depend on it: an unsigned or untrusted checkpoint is still a valid
-    // envelope, so trust is reported separately and never silently required.
-    //
-    // The entry is a growing log, so only the newest line can cover *this*
-    // manifest; earlier lines were checked against their own checkpoint when it
-    // was current. Every line must still be a manifest-domain signature, so a
-    // record-domain signature can never be smuggled into the envelope.
-    const signatures = await this.repository.readLedgerSignaturesAt(checkpoint);
-    if (signatures !== null) {
-      const records = this.parseSignatureLines(signatures);
-      if (records.length === 0) {
-        diagnostics.push("Ledger signatures entry carries no signature records");
-      }
-      for (const record of records) {
-        if (record.domain !== SIGNATURE_DOMAIN_MANIFEST) {
-          diagnostics.push(`Ledger signature ${record.id} is not a manifest-domain signature`);
-        }
-      }
-      const newest = records[records.length - 1];
-      if (newest !== undefined) {
-        const contentId = await this.signatureContentId(Buffer.from(ledgerManifestPayload(manifest), "utf8"));
-        if (newest.content_id !== contentId) {
-          diagnostics.push(
-            `Ledger signature ${newest.id} covers content ${newest.content_id}, not this manifest ${contentId}`,
-          );
-        }
-      }
-    }
-
-    return { ok: diagnostics.length === 0, diagnostics };
-  }
-
-  /** Informational totals recomputed from a set of per-subject canonical lines. */
-  private static summarizeNoteLines(lines: ReadonlyMap<ObjectId, readonly string[]>): {
-    readonly subjects: number;
-    readonly records: number;
-    readonly noteBytes: number;
-  } {
-    let records = 0;
-    let noteBytes = 0;
-    for (const body of lines.values()) {
-      records += body.length;
-      noteBytes += [...body].reduce((total, line) => total + Buffer.byteLength(`${line}\n`, "utf8"), 0);
-    }
-    return { subjects: lines.size, records, noteBytes };
-  }
-
-  /** The canonical lines the local notes ref currently holds, keyed by subject. */
-  private async canonicalNotesLines(notesTip: ObjectId): Promise<Map<ObjectId, readonly string[]>> {
-    const lines = new Map<ObjectId, readonly string[]>();
-    for (const entry of await this.repository.listNotes()) {
-      const body = await this.repository.readNoteAt(notesTip, entry.object);
-      if (body === null) continue;
-      lines.set(entry.object, body.split("\n").filter((line) => line.length > 0));
-    }
-    return lines;
-  }
-
-  /**
-   * Advance the ledger envelope. The new checkpoint's first parent is the
-   * current ledger tip, so every update is a fast-forward, and the notes it
-   * carries may only add canonical lines. Nothing moves when either check fails.
-   */
-  async buildLedgerCheckpoint(input: {
-    /**
-     * The primary remote this checkpoint is published on behalf of. Omitted
-     * resolves it from configuration, which is how RVR-017 finally gives the
-     * reserved `authority` field a value; pass `null` to declare a checkpoint
-     * with no authority at all.
-     */
-    readonly authority?: string | null;
-    /** The local ledger tip this ref update expects to replace; defaults to the current tip. */
-    readonly expectedLedger?: ObjectId | null;
-    /**
-     * The ledger checkpoint this new manifest extends. Defaults to the local
-     * expected tip; callers may supply a validated remote-tracking base when
-     * bootstrapping a fresh clone whose local ledger ref is absent.
-     */
-    readonly previousLedger?: ObjectId | null;
-    readonly retentionCommit?: ObjectId | null;
-    /**
-     * Sign the manifest into a `signatures` tree entry. Defaults to true when a
-     * signer is configured. Passing false builds an unsigned RVR-005 checkpoint,
-     * which remains valid: an absent signature entry is a normal state.
-     */
-    readonly sign?: boolean;
-    readonly signingRole?: SignatureRole;
-  }): Promise<LedgerCheckpointResult> {
-    const expectedLocalLedger = input.expectedLedger !== undefined ? input.expectedLedger : await this.repository.ledgerTip();
-    const notesTip = await this.repository.notesTip();
-    const notesTree = notesTip === null ? null : await this.repository.treeForCommit(notesTip);
-    const retentionCommit = input.retentionCommit !== undefined
-      ? input.retentionCommit
-      : (await this.repository.readRetention()).commit;
-    let totals = { subjects: 0, records: 0, noteBytes: 0 };
-    if (notesTip !== null) {
-      // The totals come from the canonical notes ref rather than from the ledger
-      // being built, so a manifest never describes itself.
-      totals = Reveries.summarizeNoteLines(await this.canonicalNotesLines(notesTip));
-    }
-
-    // The reserved authority field names the single remote this repository
-    // publishes on behalf of (RVR-017). The signed bytes do not change, because
-    // the field already existed and RVR-009 already signs it; only its meaning
-    // stops being reserved.
-    let authority: string | null;
-    let resolvedAuthority: AuthorityStatus;
-    try {
-      resolvedAuthority = await this.authorityStatus();
-      // Explicit null is intentionally distinct from omission. It controls
-      // only the manifest stamp, never which trusted primary supplies an
-      // existing ledger chain on a fresh clone.
-      authority = input.authority !== undefined ? input.authority : resolvedAuthority.primary;
-    } catch (error: unknown) {
-      return {
-        ok: false,
-        diagnostics: [error instanceof Error ? error.message : String(error)],
-        state: "refused",
-        checkpoint: null,
-        previousLedger: expectedLocalLedger,
-        notesTip,
-      };
-    }
-
-    // The local ref expectation and the manifest's predecessor are distinct on
-    // a fresh clone. Keep CAS expectation null so the local branch is created
-    // only if still absent, while extending a verified primary tracking tip.
-    let previousLedger = input.previousLedger !== undefined ? input.previousLedger : expectedLocalLedger;
-    if (input.previousLedger === undefined && expectedLocalLedger === null && resolvedAuthority.primary !== null) {
-      const primary = resolvedAuthority.primary;
-      const trackingRef = `refs/remotes/${primary}/reveries-ledger`;
-      const tracked = await this.repository.ledgerTip(trackingRef);
-      if (tracked !== null) {
-        if (resolvedAuthority.state !== "configured" && resolvedAuthority.state !== "inferred") {
-          return {
-            ok: false,
-            diagnostics: [`Cannot use ${trackingRef} as a ledger base because the publishing authority is ${resolvedAuthority.state}`],
-            state: "refused",
-            checkpoint: null,
-            previousLedger: null,
-            notesTip,
-          };
-        }
-        const base = await this.verifyLedgerEnvelope(tracked);
-        if (!base.ok) {
-          return {
-            ok: false,
-            diagnostics: [`The primary ledger base ${tracked} is invalid: ${base.diagnostics.join("; ")}`],
-            state: "refused",
-            checkpoint: null,
-            previousLedger: null,
-            notesTip,
-          };
-        }
-        previousLedger = tracked;
-      }
-    }
-    if (previousLedger !== null) {
-      const base = await this.verifyLedgerEnvelope(previousLedger);
-      if (!base.ok) {
-        return {
-          ok: false,
-          diagnostics: [`The ledger base ${previousLedger} is invalid: ${base.diagnostics.join("; ")}`],
-          state: "refused",
-          checkpoint: null,
-          previousLedger,
-          notesTip,
-        };
-      }
-    }
-
-    let manifest: LedgerManifest;
-    try {
-      manifest = createLedgerManifest({
-        notes_commit: notesTip,
-        notes_tree: notesTree,
-        previous_ledger: previousLedger,
-        retention_commit: retentionCommit,
-        authority,
-        annotated_subjects: totals.subjects,
-        records: totals.records,
-        note_bytes: totals.noteBytes,
-      });
-    } catch (error: unknown) {
-      return {
-        ok: false,
-        diagnostics: [error instanceof Error ? error.message : String(error)],
-        state: "refused",
-        checkpoint: null,
-        previousLedger,
-        notesTip,
-      };
-    }
-
-    // Sign before committing, so the signature and the envelope it covers are
-    // built together and a signing failure moves no ref at all.
-    let signatures: string | undefined;
-    if (input.sign !== false) {
-      const signed = await this.signLedgerManifest(manifest, input.signingRole ?? "publisher");
-      if (signed !== null) {
-        // The signature entry is an append-only log of manifest attestations.
-        // A signature covers one manifest, so every checkpoint necessarily has a
-        // different one; carrying the previous lines forward is what makes the
-        // entry grow-only and preserves the whole chain of attestations instead
-        // of replacing the previous checkpoint's.
-        const carried = previousLedger === null
-          ? []
-          : (await this.repository.readLedgerSignaturesAt(previousLedger) ?? "")
-            .split("\n")
-            .filter((line) => line.length > 0);
-        signatures = [...carried, signed.trimEnd()].join("\n").concat("\n");
-      }
-    }
-    const checkpoint = await this.repository.commitLedgerCheckpoint({ manifest, ...(signatures === undefined ? {} : { signatures }) });
-    if (checkpoint === await this.repository.ledgerTip()) {
-      return {
-        ok: true,
-        diagnostics: [],
-        state: "unchanged",
-        checkpoint,
-        previousLedger,
-        notesTip,
-      };
-    }
-
-    // A proposed checkpoint is verified on its own object before it can become
-    // the branch tip, so an append-only or structural failure never publishes.
-    const verification = await this.verifyLedgerEnvelope(checkpoint);
-    if (!verification.ok) {
-      return {
-        ok: false,
-        diagnostics: verification.diagnostics,
-        state: "refused",
-        checkpoint: null,
-        previousLedger,
-        notesTip,
-      };
-    }
-    try {
-      await this.repository.updateLedgerRef({ next: checkpoint, expected: expectedLocalLedger });
-    } catch (error: unknown) {
-      return {
-        ok: false,
-        diagnostics: [error instanceof Error ? error.message : String(error)],
-        state: "refused",
-        checkpoint: null,
-        previousLedger,
-        notesTip,
-      };
-    }
-    return {
-      ok: true,
-      diagnostics: [],
-      state: "created",
-      checkpoint,
-      previousLedger,
-      notesTip,
-    };
-  }
-
-  /**
-   * Verify the ledger envelope, then move the local notes ref to the notes
-   * commit the envelope transports. The ref move is guarded by an
-   * expected-old-OID compare-and-swap, so it never overwrites a tip the caller
-   * did not expect and never runs against an unverified envelope.
-   */
-  // Signatures and signed checkpoints (RVR-009)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * The canonical bytes a signature over a fact record commits to: the record's
-   * canonical line without its trailing LF. Signing the line rather than the
-   * parsed object is what makes the signature unforgeable by reordering keys.
-   */
-  private async signatureContentId(bytes: Uint8Array): Promise<ObjectId> {
-    return this.repository.hashObject(Buffer.from(bytes).toString("utf8"));
-  }
-
-  /**
-   * Sign a fact record and append the signature to the same annotated subject.
-   *
-   * A signature is a separate record referencing its target by ID, so rotating a
-   * key adds a second signature and leaves every semantic ID untouched. Returns
-   * `unavailable` rather than throwing when no signer is configured, so an
-   * unsigned repository is an ordinary state.
-   */
-  async signRecord(input: {
-    readonly target: NoteRecord;
-    readonly subject: ObjectId;
-    readonly role: SignatureRole;
-    readonly metadata: ReverieMetadata;
-  }): Promise<SignRecordResult> {
-    const signer = this.signing.signer;
-    if (signer === undefined) {
-      return { ok: true, diagnostics: [], state: "unavailable", record: null };
-    }
-    // Only ID-bearing facts can be attested. A session summary, an init record,
-    // and a publication attestation have no stable semantic ID to reference, so
-    // signing one would produce a signature that no reader could resolve.
-    const target = input.target;
-    const attested = target.type === "reverie"
-      || target.type === "transition-summary"
-      || target.type === "correction"
-      || target.type === "resolution"
-      || target.type === "redaction"
-      || target.type === "occurrence"
-      || target.type === "lineage";
-    if (!attested) {
-      return {
-        ok: false,
-        diagnostics: [`A ${target.type} record has no identity to attest`],
-        state: "unavailable",
-        record: null,
-      };
-    }
-    // The canonical line without its trailing LF: the exact bytes the ID
-    // ecosystem already treats as a record's identity.
-    const content = canonicalRecord(target).replace(/\n$/, "");
-    const contentId = await this.signatureContentId(Buffer.from(content, "utf8"));
-    const draft = {
-      domain: SIGNATURE_DOMAIN_RECORD,
-      role: input.role,
-      target: target.id,
-      subject: input.subject,
-      signer: signer.signer,
-      key_id: signer.keyId,
-      algorithm: signer.algorithm,
-      signature: "",
-      content_id: contentId,
-    };
-    // The signature covers everything but the signature itself, so it is computed
-    // over the draft payload and then folded into the finished record.
-    const provisional = createSignature(
-      { ...draft, signature: "placeholder" },
-      input.metadata,
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    const signature = signer.sign(Buffer.from(signingPayload(provisional), "utf8"));
-    const record = createSignature(
-      { ...draft, signature: Buffer.from(signature).toString("base64") },
-      input.metadata,
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    await this.mutateNotes(async (notes) => {
-      await notes.append(input.subject, canonicalRecord(record));
-    });
-    return { ok: true, diagnostics: [], state: "signed", record };
-  }
-
-  /** Verify one signature record and classify it. Never throws for bad bytes. */
-  verifySignatureRecord(record: SignatureRecord, policy: SigningPolicy = { requiredRoles: [] }): SignatureTrustReport {
-    const verifier = this.signing.verifier;
-    const payload = Buffer.from(signingPayload(record), "utf8");
-    const verified = verifier === undefined
-      ? false
-      : verifier.verify({
-        payload,
-        signature: Buffer.from(record.signature, "base64"),
-        keyId: record.key_id,
-      });
-    return classifySignature(record, {
-      verdict: { verified },
-      trust: this.signing.trust ?? { keys: [] },
-      policy,
-    });
-  }
-
-  /**
-   * The effective role policy: explicit `SigningOptions.requiredRoles` when the
-   * caller stated one, otherwise `reveries.signingRoles`. This is where the Q4
-   * decision lives — without this read the `policy-satisfying` trust state would
-   * be unreachable and the decision would be hollow.
-   *
-   * An explicit option wins outright, including an explicit empty list, so a
-   * caller's intent is never silently overridden by repository configuration.
-   */
-  async signingPolicy(): Promise<SigningPolicy> {
-    if (this.signing.requiredRoles !== undefined) {
-      return { requiredRoles: this.signing.requiredRoles };
-    }
-    return { requiredRoles: await this.readSigningRoles() };
-  }
-
-  /**
-   * Read the declared remote roles (RVR-017). Two additive encodings, one map:
-   *
-   * - Legacy flat keys, unchanged: `reveries.remoteRole.<remote>` holds the
-   *   role. Git forbids `/` in such a key, so flat names stay slash-free.
-   * - Slash-name subsection keys: `reveries.remoteRole/<remote>.role` holds
-   *   the role (stored as subsection `[reveries "remoteRole/<remote>"]`, key
-   *   `role`; written via
-   *   `git config reveries.remoteRole/<remote>.role <role>`). The `/` after
-   *   `remoteRole` versus `.` keeps the two forms structurally distinct, and
-   *   only the trailing `.role` suffix is stripped, so a remote whose own
-   *   name contains dots still resolves exactly.
-   *
-   * An absent key yields no roles, which is the ordinary V1 state. An unknown
-   * role throws, naming the offending value and the valid set, because
-   * silently ignoring a typo would leave a repository believing it has an
-   * authority boundary it does not have.
-   */
-  private async readRemoteRoles(): Promise<Record<string, RemoteRole>> {
-    const result = await this.repository.run(
-      ["config", "--get-regexp", REMOTE_ROLE_CONFIG_PATTERN],
-      { allowExitCodes: [0, 1] },
-    );
-    return parseRemoteRoleConfigLines(result.stdout);
-  }
-
-  /**
-   * The publishing remotes this repository has adopted, from the initialization
-   * record when it exists and from configuration otherwise. This is the same
-   * resolution `doctor` already uses, so authority and the remote loop can never
-   * disagree about which remotes publish.
-   */
-  private async publishingRemotes(): Promise<readonly string[]> {
-    const initialization = await this.findInitialization();
-    if (initialization !== null) return initialization.record.publishing_remotes;
-    const configured = await this.repository.run(
-      ["config", "--get-all", "reveries.publishingRemote"],
-      { allowExitCodes: [0, 1] },
-    );
-    return configured.stdout.trim().split("\n").filter(Boolean);
-  }
-
-  private async configuredRemoteNames(): Promise<readonly string[]> {
-    return (await this.repository.run(["remote"])).stdout.trimEnd().split("\n").filter(Boolean);
-  }
-
-  /**
-   * The configured remote a remote-tracking revision belongs to, or null.
-   *
-   * `refs/remotes/<remote>/reveries-ledger` is the shape an operator names by
-   * hand, and the remote in it is exactly whose evidence the revision carries.
-   *
-   * This is the single entry point for that question. The matcher resolves by
-   * longest exact `refs/remotes/<name>/` prefix, so a remote whose name contains
-   * a slash (`team/vendor`) resolves to itself rather than to its first segment
-   * — and the command layer calls this instead of parsing the ref itself. It
-   * previously did, and the two answers disagreed: the command layer read
-   * `team` from `refs/remotes/team/vendor/reveries-ledger` and applied *that*
-   * remote's role to another remote's evidence, refusing promotions the direct
-   * API allowed. One question, one answer.
-   */
-  async trackingRemote(revision: string | undefined): Promise<string | null> {
-    if (revision === undefined) return null;
-    return matchTrackingRefRemote(revision, await this.configuredRemoteNames());
-  }
-
-  /**
-   * Resolve the authoritative publication configuration (RVR-017). This is the
-   * single place roles are resolved, so the doctor report, the sync routing, the
-   * push refusal, and the manifest stamp can never read a different primary.
-   */
-  async authorityStatus(): Promise<AuthorityStatus> {
-    const [publishing, declared, known] = await Promise.all([
-      this.publishingRemotes(),
-      this.readRemoteRoles(),
-      this.configuredRemoteNames(),
-    ]);
-    const resolution: AuthorityResolution = resolveAuthorityRoles(publishing, declared, known);
-    return {
-      state: resolution.state,
-      primary: resolution.primary,
-      roles: resolution.roles,
-      notice: resolution.notice,
-      diagnostics: resolution.diagnostics,
-    };
-  }
-
-  /**
-   * The effective role of a remote, or null when it declared none. A remote with
-   * no declared role keeps the pre-RVR-017 behaviour, so a repository that never
-   * adopted roles publishes and syncs exactly as it did before.
-   */
-  private async roleOf(remote: string): Promise<RemoteRole | null> {
-    const { roles } = await this.authorityStatus();
-    return roles.get(remote) ?? null;
-  }
-
-  /**
-   * Read the configured role requirements. A comma-separated list of roles, in
-   * the order written. An absent or empty key requires no role. An unknown role
-   * is refused with a diagnostic naming the offending value and the valid set,
-   * because silently ignoring a typo would leave a repository believing it has a
-   * policy it does not have.
-   */
-  private async readSigningRoles(): Promise<readonly SignatureRole[]> {
-    const result = await this.repository.run(["config", "--get", "reveries.signingRoles"], {
-      allowExitCodes: [0, 1],
-    });
-    const value = result.stdout.trim();
-    if (value === "") return [];
-    const names = value
-      .split(",")
-      .map((name) => name.trim())
-      .filter((name) => name.length > 0);
-    for (const name of names) {
-      if (!(SIGNATURE_ROLES as readonly string[]).includes(name)) {
-        throw new Error(
-          `reveries.signingRoles must name roles from ${SIGNATURE_ROLES.join(", ")}; found ${name}`,
-        );
-      }
-    }
-    return names as readonly SignatureRole[];
-  }
-
-  /**
-   * Signatures over fact records in the current notes snapshot, keyed by the
-   * record they attest. Multiple signatures per target are expected: that is
-   * what a key rotation and a multi-role review both produce.
-   */
-  async signatureReports(): Promise<Map<string, SignatureTrustReport[]>> {
-    const reports = new Map<string, SignatureTrustReport[]>();
-    // Resolve the policy once: reading configuration per record would be both
-    // wasteful and, for a bad value, repeated failure.
-    const policy = await this.signingPolicy();
-    const notesTip = await this.repository.notesTip();
-    if (notesTip === null) return reports;
-    for (const entry of await this.repository.listNotes()) {
-      const body = await this.repository.readNoteAt(notesTip, entry.object);
-      if (body === null) continue;
-      for (const record of this.parseSignatureLines(body)) {
-        const report = this.verifySignatureRecord(record, policy);
-        reports.set(record.target, [...(reports.get(record.target) ?? []), report]);
-      }
-    }
-    return reports;
-  }
-
-  private parseSignatureLines(body: string): SignatureRecord[] {
-    const records: SignatureRecord[] = [];
-    for (const line of body.split("\n")) {
-      if (!line) continue;
-      let value: unknown;
-      try {
-        value = JSON.parse(line);
-      } catch {
-        // A malformed line is a note-level diagnostic handled by the snapshot
-        // validator; the signature pass only reads what it can understand.
-        continue;
-      }
-      if (value && typeof value === "object" && (value as { type?: unknown }).type === "signature") {
-        records.push(value as SignatureRecord);
-      }
-    }
-    return records;
-  }
-
-  /**
-   * Sign the ledger manifest and return the canonical signature lines, or null
-   * when this repository has no signer. The signed bytes are exactly
-   * `ledgerManifestPayload`, which already contains the notes, ledger, and
-   * retention tips, so the checkpoint is bound without new manifest fields.
-   */
-  async signLedgerManifest(manifest: LedgerManifest, role: SignatureRole = "publisher"): Promise<string | null> {
-    const signer = this.signing.signer;
-    if (signer === undefined) return null;
-    const content = ledgerManifestPayload(manifest);
-    const contentId = await this.signatureContentId(Buffer.from(content, "utf8"));
-    // The subject is the commit the signature travels with. A genesis checkpoint
-    // with no notes, previous ledger, or retention commit has no such commit yet,
-    // so it falls back to the manifest's own hash, which is still a stable and
-    // verifiable object ID for the exact bytes being signed.
-    const subject = manifest.notes_commit
-      ?? manifest.previous_ledger
-      ?? manifest.retention_commit
-      ?? await this.signatureContentId(Buffer.from(content, "utf8"));
-    const draft = {
-      domain: SIGNATURE_DOMAIN_MANIFEST,
-      role,
-      target: "ledger-manifest",
-      subject,
-      signer: signer.signer,
-      key_id: signer.keyId,
-      algorithm: signer.algorithm,
-      signature: "",
-      content_id: contentId,
-    };
-    const provisional = createSignature(
-      { ...draft, signature: "placeholder" },
-      { author_email: signer.signer, session: null, created_at: LEDGER_SIGNATURE_TIMESTAMP },
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    const signature = signer.sign(Buffer.from(signingPayload(provisional), "utf8"));
-    const record = createSignature(
-      { ...draft, signature: Buffer.from(signature).toString("base64") },
-      { author_email: signer.signer, session: null, created_at: LEDGER_SIGNATURE_TIMESTAMP },
-      (bytes) => this.repository.hashObjectSync(bytes),
-    );
-    return canonicalRecord(record);
-  }
-
-  /**
-   * Report how signing relates to local evidence. Mirrors the RVR-005 ledger
-   * rule that only genuinely broken evidence is damage: an absent signer, an
-   * unknown key, and an unsigned-but-valid checkpoint are all ordinary.
-   */
-  async signatureStatus(): Promise<SignatureStatus> {
-    const counts: Record<TrustState, number> = {
-      unknown: 0,
-      valid: 0,
-      trusted: 0,
-      "policy-satisfying": 0,
-      invalid: 0,
-      revoked: 0,
-    };
-    const diagnostics: string[] = [];
-    const policy = await this.signingPolicy();
-    const requiredRoles = policy.requiredRoles;
-    const reports = await this.signatureReports();
-    for (const entries of reports.values()) {
-      for (const report of entries) {
-        counts[report.state] += 1;
-        if (report.state === "invalid" || report.state === "revoked") {
-          diagnostics.push(
-            `Signature ${report.id} over ${report.target} by ${report.signer} is ${report.state}`,
-          );
-        }
-      }
-    }
-    const checkpoint = await this.repository.ledgerTip();
-    if (checkpoint === null) {
-      return { state: "absent", counts, checkpoint: null, checkpointSigned: false, requiredRoles, diagnostics };
-    }
-    const stored = await this.repository.readLedgerSignaturesAt(checkpoint);
-    if (stored === null) {
-      return { state: "unsigned", counts, checkpoint, checkpointSigned: false, requiredRoles, diagnostics };
-    }
-    // The checkpoint's own attestations are counted with the record signatures so
-    // a reader sees one trust picture rather than two partial ones.
-    let checkpointSigned = false;
-    for (const record of this.parseSignatureLines(stored)) {
-      const report = this.verifySignatureRecord(record, policy);
-      counts[report.state] += 1;
-      if (report.state === "policy-satisfying" || report.state === "trusted") {
-        checkpointSigned = true;
-      }
-      if (report.state === "invalid" || report.state === "revoked") {
-        diagnostics.push(`Checkpoint signature ${report.id} is ${report.state}`);
-      }
-    }
-    return {
-      state: "signed",
-      counts,
-      checkpoint,
-      checkpointSigned,
-      requiredRoles,
-      diagnostics,
-    };
-  }
-
-  /**
-   * Whether an envelope may become canonical state through the envelope route.
-   *
-   * The notes route (`syncPull`) withholds promotion for non-primary roles by
-   * construction, but the envelope route carries the *same* evidence through a
-   * different transport. Without this gate, a direct API caller could route
-   * around the quarantine decision via `materializeNotesFromLedger` with a
-   * mirror/import-only remote-tracking revision — or with the same checkpoint
-   * named by raw OID, which carries no provenance at all. Withholding is
-   * therefore a property of the evidence enforced here, not of whichever
-   * caller or spelling runs first.
-   *
-   * A remote with no declared role keeps its pre-role behaviour: it promotes.
-   * A contradictory configuration is not an undeclared remote, and nothing
-   * promotes while the repository cannot say which remote is authoritative.
-   * The local ledger tip (`revision === undefined`) carries no foreign
-   * provenance to judge, so it is allowed through to verification. An explicit
-   * revision that names no configured remote is an unknown source: refused
-   * whenever any role is declared, allowed only in a repository that never
-   * adopted roles at all.
-   */
-  private async envelopePromotionPolicy(
-    revision: string | undefined,
-  ): Promise<{ readonly allowed: boolean; readonly diagnostic: string | null }> {
-    const authority = await this.authorityStatus();
-    if (authority.state === "invalid") {
-      return {
-        allowed: false,
-        diagnostic: `Authority configuration is invalid, so no envelope may become canonical state: ${authority.diagnostics.join("; ")}`,
-      };
-    }
-    const match = await this.trackingRemote(revision);
-    const remote = match ?? null;
-    if (remote === null) {
-      // An explicit revision with no configured remote-tracking provenance —
-      // a raw OID, a local branch, a tag — cannot be attributed to any role.
-      // Refuse it as an unknown source whenever roles are declared; a legacy
-      // repository without roles keeps its historical behaviour.
-      if (revision !== undefined && authority.roles.size > 0) {
-        return {
-          allowed: false,
-          diagnostic: `The revision ${revision} names no configured remote, so its evidence cannot be attributed to a role; materialize was refused`,
-        };
-      }
-      return { allowed: true, diagnostic: null };
-    }
-    const role = await this.roleOf(remote);
-    if (role === null) return { allowed: true, diagnostic: null };
-    if (rolePromotion(role) === "promote") return { allowed: true, diagnostic: null };
-    return {
-      allowed: false,
-      diagnostic: `${remote} is an ${role} remote, so its evidence is quarantined rather than promoted, and the ledger envelope transports the same notes; materialize was refused`,
-    };
-  }
-
-  async materializeNotesFromLedger(input: {
-    /** The local notes tip this call expects to replace; null when absent. */
-    readonly expectedNotes: ObjectId | null;
-    /**
-     * The envelope to materialize. Defaults to the local ledger branch tip; a
-     * fresh clone passes its remote-tracking ref, because that is the only
-     * place an ordinary branch fetch leaves the envelope.
-     */
-    readonly revision?: string;
-  }): Promise<LedgerMaterializeResult> {
-    const { revision } = input;
-    // The promotion decision runs before verification or any ref move, so a
-    // withheld envelope never reaches canonical state through this route and
-    // the local refs are left exactly as they were.
-    const promotion = await this.envelopePromotionPolicy(revision);
-    if (!promotion.allowed) {
-      return {
-        ok: false,
-        diagnostics: [promotion.diagnostic ?? "The ledger envelope was refused"],
-        state: "unchanged",
-        notesTip: await this.repository.notesTip(),
-      };
-    }
-    const verification = await this.verifyLedgerEnvelope(revision);
-    if (!verification.ok) {
-      return { ok: false, diagnostics: verification.diagnostics, state: "unchanged", notesTip: await this.repository.notesTip() };
-    }
-    const checkpoint = revision === undefined ? await this.repository.ledgerTip() : await this.repository.resolveCommit(revision);
-    const manifest = checkpoint === null
-      ? null
-      : readLedgerManifest((await this.repository.readLedgerManifestAt(checkpoint)) as string);
-    if (manifest === null || manifest.notes_commit === null) {
-      return {
-        ok: false,
-        diagnostics: ["The verified ledger envelope transports no notes commit"],
-        state: "unchanged",
-        notesTip: await this.repository.notesTip(),
-      };
-    }
-    const secretDiagnostics = await this.secretMaterialDiagnosticsAtNotesCommit(manifest.notes_commit);
-    if (secretDiagnostics.length > 0) {
-      return {
-        ok: false,
-        diagnostics: secretDiagnostics,
-        state: "unchanged",
-        notesTip: await this.repository.notesTip(),
-      };
-    }
-    const current = await this.repository.notesTip();
-    if (current === manifest.notes_commit) {
-      return { ok: true, diagnostics: [], state: "unchanged", notesTip: current };
-    }
-    // The envelope REPLACES the notes ref rather than unioning into it, so a
-    // local tip the envelope does not contain must never be overwritten here.
-    // An absent ref is the fresh-clone case the envelope exists for, and a
-    // strict ancestor is a fast-forward; every other state is refused exactly
-    // as the caller-facing gate does, so direct API callers get the same
-    // protection as the command layer.
-    if (current !== null && !(await this.repository.isAncestor(current, manifest.notes_commit))) {
-      return {
-        ok: false,
-        diagnostics: [
-          `The local ${NOTES_REF} carries notes the ledger envelope does not contain, so it was left unchanged`,
-        ],
-        state: "unchanged",
-        notesTip: current,
-      };
-    }
-    const format = await this.repository.objectFormat();
-    const absent = "0".repeat(format === "sha1" ? 40 : 64);
-    const moved = await this.repository.run(
-      ["update-ref", NOTES_REF, manifest.notes_commit, input.expectedNotes ?? absent],
-      { allowExitCodes: [0, 1, 128] },
-    );
-    if (moved.exitCode !== 0) {
-      return {
-        ok: false,
-        diagnostics: [`The local ${NOTES_REF} ref changed while materializing the ledger envelope`],
-        state: "unchanged",
-        notesTip: await this.repository.notesTip(),
-      };
-    }
-    return { ok: true, diagnostics: [], state: "materialized", notesTip: manifest.notes_commit };
-  }
-
-  /** Report how the ledger envelope relates to local notes state. */
-  /**
-   * Compare each configured mirror's checkpoint against the primary's (RVR-017).
-   *
-   * A mirror is a replica, so the check is about agreement rather than
-   * correctness: the mirror must name the same authority, and it must not carry
-   * a notes commit the primary does not, which is what an independent write to a
-   * replica looks like. The signature comparison only runs when the primary's own
-   * checkpoint is signed; otherwise the mirror is reported `unsigned`, because
-   * demanding a signature nothing produces would make the check unpassable rather
-   * than strict.
-   *
-   * This is deliberately network-free. It reads only local remote-tracking refs,
-   * so `doctor` stays a local operation and a mirror that has not been fetched is
-   * `unavailable` rather than a fetch.
-   */
-  async verifyMirrorEnvelopes(): Promise<readonly MirrorStatus[]> {
-    const authority = await this.authorityStatus();
-    // An invalid authority configuration already reported itself, and its
-    // diagnostics are not mirror problems. Re-reporting them here would
-    // duplicate every message and make one root cause look like several.
-    if (authority.state === "invalid") return [];
-    const mirrors = [...authority.roles]
-      .filter(([, role]) => role === "mirror")
-      .map(([remote]) => remote)
-      .sort();
-    if (mirrors.length === 0) return [];
-    const local = await this.repository.ledgerTip();
-    const localStored = local === null ? null : await this.repository.readLedgerManifestAt(local);
-    const localManifest = localStored === null
-      ? null
-      : parseLedgerManifest(localStored, "tolerant").manifest;
-    const primarySigned = (await this.signatureStatus()).checkpointSigned;
-
-    const statuses: MirrorStatus[] = [];
-    for (const remote of mirrors) {
-      const ref = `refs/remotes/${remote}/reveries-ledger`;
-      const checkpoint = await this.repository.ledgerTip(ref);
-      if (checkpoint === null) {
-        // A mirror that has not been fetched is an ordinary state. The message
-        // stays in `diagnostics` because that is the detail field, but `doctor`
-        // promotes it to a notice by state, so an unfetched mirror is never
-        // reported as damage.
-        statuses.push({
-          remote,
-          state: "unavailable",
-          checkpoint: null,
-          signature: null,
-          diagnostics: [`Mirror ${remote} has no fetched ledger checkpoint at ${ref}`],
-        });
-        continue;
-      }
-      const stored = await this.repository.readLedgerManifestAt(checkpoint);
-      const manifest = stored === null ? null : parseLedgerManifest(stored, "tolerant").manifest;
-      if (manifest === null) {
-        statuses.push({
-          remote,
-          state: "divergent",
-          checkpoint,
-          signature: null,
-          diagnostics: [`Mirror ${remote} checkpoint ${checkpoint} has no readable ledger manifest`],
-        });
-        continue;
-      }
-      const diagnostics: string[] = [];
-      // The envelope structure itself must hold before its claims are compared,
-      // so a malformed mirror is damage rather than a trusted peer opinion.
-      const envelope = await this.verifyLedgerEnvelope(checkpoint);
-      diagnostics.push(...envelope.diagnostics.map((entry) => `Mirror ${remote}: ${entry}`));
-      let mismatchedAuthority = false;
-      if (manifest.authority !== authority.primary) {
-        mismatchedAuthority = true;
-        diagnostics.push(
-          `Mirror ${remote} names authority ${manifest.authority ?? "none"}, not the primary ${authority.primary ?? "none"}`,
-        );
-      }
-      if (localManifest?.notes_commit != null && manifest.notes_commit !== localManifest.notes_commit) {
-        const incorporated = manifest.notes_commit === null
-          ? 1
-          : (await this.repository.run(
-            ["merge-base", "--is-ancestor", manifest.notes_commit, localManifest.notes_commit],
-            { allowExitCodes: [0, 1] },
-          )).exitCode;
-        if (incorporated !== 0) {
-          diagnostics.push(
-            `Mirror ${remote} transports notes commit ${manifest.notes_commit ?? "none"}, `
-            + `which the primary checkpoint does not contain`,
-          );
-        }
-      }
-      const signatureState = primarySigned
-        ? await this.mirrorSignatureState(checkpoint, manifest)
-        : null;
-      if (primarySigned && signatureState === null) {
-        diagnostics.push(
-          `Mirror ${remote} checkpoint ${checkpoint} carries no signature over its own manifest, `
-          + `while the primary checkpoint is signed`,
-        );
-      } else if (signatureState === "invalid" || signatureState === "revoked") {
-        diagnostics.push(`Mirror ${remote} manifest signature is ${signatureState}`);
-      }
-      const state: MirrorState = mismatchedAuthority
-        ? "authority-mismatch"
-        : diagnostics.length > 0
-          ? "divergent"
-          : signatureState === null ? "unsigned" : "matching";
-      statuses.push({ remote, state, checkpoint, signature: signatureState, diagnostics });
-    }
-    return statuses;
-  }
-
-  /**
-   * The trust state of a checkpoint's newest manifest signature, or null when the
-   * checkpoint carries none. A mirror has to sign *its own* manifest bytes, so
-   * this compares `content_id` against the mirror's manifest rather than reusing
-   * the primary's verdict.
-   */
-  private async mirrorSignatureState(
-    checkpoint: ObjectId,
-    manifest: LedgerManifest,
-  ): Promise<TrustState | null> {
-    const stored = await this.repository.readLedgerSignaturesAt(checkpoint);
-    if (stored === null) return null;
-    const records = this.parseSignatureLines(stored);
-    const newest = records[records.length - 1];
-    if (newest === undefined) return null;
-    const contentId = await this.signatureContentId(Buffer.from(ledgerManifestPayload(manifest), "utf8"));
-    if (newest.content_id !== contentId) return "invalid";
-    return this.verifySignatureRecord(newest, await this.signingPolicy()).state;
-  }
-
-  /** Report how the ledger envelope relates to local notes state. */
-  async ledgerStatus(): Promise<LedgerStatus> {
-    const notesTip = await this.repository.notesTip();
-    const tip = await this.repository.ledgerTip();
-    if (tip === null) {
-      return {
-        state: "absent",
-        tip: null,
-        notesCommit: null,
-        notesTip,
-        previousLedger: null,
-        retentionCommit: null,
-        annotatedSubjects: 0,
-        diagnostics: [],
-      };
-    }
-    const stored = await this.repository.readLedgerManifestAt(tip);
-    let manifest: LedgerManifest | null = null;
-    const diagnostics: string[] = [];
-    if (stored === null) {
-      diagnostics.push("Ledger checkpoint has no manifest.json");
-    } else {
-      const parsed = parseLedgerManifest(stored, "tolerant");
-      manifest = parsed.manifest;
-      for (const diagnostic of parsed.diagnostics) diagnostics.push(`Ledger manifest: ${diagnostic.message}`);
-    }
-    const verification = manifest === null ? { ok: false, diagnostics } : await this.verifyLedgerEnvelope(tip);
-    const annotatedSubjects = manifest?.annotated_subjects ?? 0;
-    if (!verification.ok) {
-      return {
-        state: "invalid",
-        tip,
-        notesCommit: manifest?.notes_commit ?? null,
-        notesTip,
-        previousLedger: manifest?.previous_ledger ?? null,
-        retentionCommit: manifest?.retention_commit ?? null,
-        annotatedSubjects,
-        diagnostics: [...diagnostics, ...verification.diagnostics],
-      };
-    }
-    // A structurally valid envelope that no longer describes the local notes
-    // ref is stale. That is an ordinary unpublished state, not damage.
-    const state: LedgerState = notesTip !== manifest?.notes_commit ? "stale" : "valid";
-    return {
-      state,
-      tip,
-      notesCommit: manifest?.notes_commit ?? null,
-      notesTip,
-      previousLedger: manifest?.previous_ledger ?? null,
-      retentionCommit: manifest?.retention_commit ?? null,
-      annotatedSubjects,
-      diagnostics: [],
-    };
-  }
-
-  /**
-   * Report the health of the evidence, and nothing else.
-   *
-   * Doctor used to answer four questions at once: whether the evidence was
-   * sound, whether local hooks were installed, whether a ledger envelope agreed
-   * with the notes ref, and whether signatures covered it. The last three were
-   * enforcement, and they reported "damaged" for choices an operator is
-   * entitled to make. What remains is integrity: `ok` is false only for damage
-   * a reader must not ignore, namely a record the protocol cannot parse or a
-   * retained object that is no longer reachable. Everything else is a notice.
    */
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
@@ -5243,65 +2222,6 @@ export class Reveries {
       pruned.push(entry.ref);
     }
     return { pruned: pruned.sort(), kept: kept.sort() };
-  }
-
-  private async checkRemoteNotesIncorporated(remote: string, remoteObject: ObjectId | null): Promise<CheckResult> {
-    if (remoteObject === null) {
-      const established = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
-      return established === null
-        ? { ok: true, diagnostics: [] }
-        : {
-            ok: false,
-            diagnostics: [`Remote ${remote} notes ref is absent despite established remote notes history`],
-          };
-    }
-    const localObject = await this.repository.notesTip();
-    if (localObject === null || !await this.repository.objectExists("commit", remoteObject)) {
-      return {
-        ok: false,
-        diagnostics: [`Remote ${remote} notes are unavailable locally; fetch and merge them before publication`],
-      };
-    }
-    const incorporated = await this.repository.run(
-      ["merge-base", "--is-ancestor", remoteObject, localObject],
-      { allowExitCodes: [0, 1] },
-    );
-    return incorporated.exitCode === 0
-      ? { ok: true, diagnostics: [] }
-      : { ok: false, diagnostics: [`Remote ${remote} notes have not been incorporated`] };
-  }
-
-  private async checkOutgoingRange(
-    initialization: CommitId,
-    localObject: CommitId,
-    remoteObject: ObjectId | null,
-    remoteRef: string,
-  ): Promise<readonly string[]> {
-    const containsInitialization = await this.repository.run(
-      ["merge-base", "--is-ancestor", initialization, localObject],
-      { allowExitCodes: [0, 1] },
-    );
-    if (containsInitialization.exitCode !== 0) {
-      return [`${remoteRef}: outgoing branch must merge or rebase the Reveries initialization boundary`];
-    }
-    const argumentsList = ["rev-list", localObject];
-    if (remoteObject !== null) argumentsList.push(`^${remoteObject}`);
-    const result = await this.repository.run(argumentsList, { allowExitCodes: [0, 128] });
-    if (result.exitCode !== 0) {
-      return [`${remoteRef}: cannot establish the exact outgoing commit range`];
-    }
-    const diagnostics: string[] = [];
-    for (const value of result.stdout.trim().split("\n").filter((line) => line.length > 0).reverse()) {
-      const commit = commitId(value);
-      const postInitialization = await this.repository.run(
-        ["merge-base", "--is-ancestor", initialization, commit],
-        { allowExitCodes: [0, 1] },
-      );
-      if (postInitialization.exitCode !== 0) continue;
-      const check = await this.checkCommit(commit);
-      diagnostics.push(...check.diagnostics.map((diagnostic) => `${remoteRef} ${commit}: ${diagnostic}`));
-    }
-    return diagnostics;
   }
 
   private async resolveTarget(target: string, revision: string): Promise<{
@@ -5451,85 +2371,6 @@ export class Reveries {
    * cannot resolve fails closed here, and a missing object inside an incomplete
    * clone is reported as incompleteness rather than as a broken claim.
    */
-  private async validateCoordinate(coordinate: OccurrenceCoordinate): Promise<void> {
-    let resolved;
-    try {
-      resolved = await this.repository.resolveSubject({
-        path: coordinate.path,
-        revision: String(coordinate.commit),
-      });
-    } catch (error: unknown) {
-      await this.gradedFailure(error, [coordinate.commit, coordinate.subject]);
-      throw new Error(
-        `Occurrence coordinate ${coordinate.path}@${coordinate.commit} does not resolve: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (resolved.object !== coordinate.subject) {
-      throw new Error(
-        `Occurrence coordinate ${coordinate.path}@${coordinate.commit} holds ${resolved.object}, not ${coordinate.subject}`,
-      );
-    }
-  }
-
-  /**
-   * A lineage edge is checked against the repository before it can influence
-   * any verdict: the parent must be a direct parent of the commit, every
-   * endpoint must resolve in the revision it names, and every predecessor must
-   * carry evidence. Anything else is a claim about a change this edge does not
-   * describe, so it fails closed rather than being stored and ignored.
-   */
-  private async validateLineageRecord(record: LineageRecord): Promise<void> {
-    const parents = (await this.repository.run([
-      "show", "-s", "--format=%P", String(record.commit),
-    ])).stdout.trim().split(" ").filter((value) => value.length > 0);
-    if (!parents.includes(String(record.parent))) {
-      throw new Error(
-        `Lineage ${record.id} binds parent ${record.parent}, which is not a direct parent of commit ${record.commit}`,
-      );
-    }
-    for (const endpoint of record.from) {
-      await this.validateLineageEndpoint(endpoint, record.parent, record, "from");
-    }
-    for (const endpoint of record.to) {
-      await this.validateLineageEndpoint(endpoint, record.commit, record, "to");
-    }
-    if (record.transition !== null) {
-      const view = await this.loadCachedEvidenceSnapshot({});
-      if (!view.transitions.has(record.transition)) {
-        throw new Error(`Lineage ${record.id} names transition ${record.transition}, which has no transition record`);
-      }
-    }
-  }
-
-  private async validateLineageEndpoint(
-    endpoint: LineageEndpoint,
-    revision: CommitId,
-    record: LineageRecord,
-    field: string,
-  ): Promise<void> {
-    let resolved;
-    try {
-      resolved = await this.repository.resolveSubject({ path: endpoint.path, revision: String(revision) });
-    } catch (error: unknown) {
-      await this.gradedFailure(error, [revision, endpoint.subject]);
-      throw new Error(
-        `Lineage ${record.id} ${field} endpoint ${endpoint.path} does not resolve at ${revision}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (resolved.object !== endpoint.subject) {
-      throw new Error(
-        `Lineage ${record.id} ${field} endpoint ${endpoint.path} holds ${resolved.object} at ${revision}, not ${endpoint.subject}`,
-      );
-    }
-    if (field !== "from") return;
-    const annotated = (await this.readEvidenceNote(endpoint.subject)) !== null;
-    if (!annotated) {
-      throw new Error(
-        `Lineage ${record.id} pairs ${endpoint.path}, which has no annotated evidence to pair`,
-      );
-    }
-  }
-
   private async validateNotesRef(ref: string): Promise<void> {
     await this.validateNotesSnapshot(await this.loadEvidenceSnapshot({ ref }));
   }
@@ -5548,159 +2389,6 @@ export class Reveries {
     return false;
   }
 
-  private async findInitialization(): Promise<{ readonly commit: CommitId; readonly record: ReveriesInit } | null> {
-    const view = await this.loadCachedEvidenceSnapshot({});
-    if (view.initError !== null) throw new Error(view.initError);
-    return view.init;
-  }
-
-  /**
-   * Staged blob transitions. Rename detection is deliberately absent: `-M`
-   * would let Git's similarity score decide that a renamed-and-edited blob is
-   * the predecessor of the new one, and a copied record would then discharge
-   * the obligation without anyone asserting the relation. An unchanged rename
-   * keeps the same blob OID, so it is filtered below by the subject still being
-   * reachable and never needs a pairing.
-   */
-  private async stagedTransitions(): Promise<readonly DiffTransition[]> {
-    const result = await this.repository.run([
-      "diff", "--cached", "--raw", "-z", "--abbrev=64", "HEAD",
-    ]);
-    const successorBlobs = new Set((await this.repository.listIndex()).map((entry) => entry.object));
-    return this.parseTransitions(result.stdout).filter(
-      (transition) => transition.to !== undefined || !successorBlobs.has(transition.from),
-    );
-  }
-
-  /**
-   * Committed blob transitions for one parent, without similarity pairing. A
-   * renamed-and-edited blob is a deletion plus an addition, so the annotated
-   * predecessor has no successor until an explicit durable lineage edge or a
-   * causal retirement says what happened to it.
-   */
-  private async commitTransitions(parent: string, commit: string): Promise<readonly DiffTransition[]> {
-    const result = await this.repository.run([
-      "diff-tree", "--raw", "-z", "--abbrev=64", "-r", "--no-commit-id", parent, commit,
-    ]);
-    const successorBlobs = new Set((await this.repository.listTree(commit)).map((entry) => entry.object));
-    return this.parseTransitions(result.stdout).filter(
-      (transition) => transition.to !== undefined || !successorBlobs.has(transition.from),
-    );
-  }
-
-  private parseTransitions(raw: string): readonly DiffTransition[] {
-    const fields = raw.split("\0");
-    const transitions: DiffTransition[] = [];
-    let index = 0;
-    while (index < fields.length) {
-      const header = fields[index];
-      if (header === undefined || header.length === 0) break;
-      index += 1;
-      const parts = header.split(" ");
-      const oldValue = parts[2];
-      const newValue = parts[3];
-      const status = parts[4] ?? "";
-      if (oldValue === undefined || newValue === undefined) throw new Error("Malformed Git raw diff header");
-      const oldPath = fields[index];
-      const renamed = status.startsWith("R") || status.startsWith("C");
-      const newPath = renamed ? fields[index + 1] : oldPath;
-      index += renamed ? 2 : 1;
-      if (zeroObject(oldValue)) continue;
-      if (!isFullObjectId(oldValue)) throw new Error("Git diff returned an abbreviated predecessor object ID");
-      if (oldValue === newValue) continue;
-      const from = blobId(oldValue);
-      if (zeroObject(newValue)) transitions.push({ from, ...(oldPath === undefined ? {} : { oldPath }) });
-      else {
-        if (!isFullObjectId(newValue)) throw new Error("Git diff returned an abbreviated successor object ID");
-        transitions.push({
-          from,
-          to: blobId(newValue),
-          ...(oldPath === undefined ? {} : { oldPath }),
-          ...(newPath === undefined ? {} : { newPath }),
-        });
-      }
-    }
-    return transitions;
-  }
-
-  private async projectionFor(blob: ObjectId): Promise<ActiveProjection> {
-    return (await this.strictRead(blob)).projection;
-  }
-
-  /**
-   * Tree-subject continuity pairs between two revisions (RVR-013). A
-   * descendant blob edit produces a new ancestor tree OID, so every
-   * annotated old ancestor tree needs an explicit disposition. Pairing is
-   * by identical directory path and never by similarity or by notes evidence
-   * on unrelated trees: an unchanged move or copy keeps the same OID
-   * reachable and needs no disposition, while a vanished directory path
-   * yields a successor-less pair that a durable lineage edge (RVR-014) or a
-   * causal retirement must resolve.
-   *
-   * The revision root tree is paired explicitly because `ls-tree -r -t`
-   * lists nested subtrees but never the root itself; without this pair a
-   * reverie on the exact root tree would record and show but never oblige.
-   * Root transition summaries (RVR-004) co-locate on the same note
-   * unaffected: placement already allows both record kinds on trees.
-   *
-   * Membership comes from one `git notes list` snapshot, so unannotated
-   * directories cost no note reads (RVR-012).
-   */
-  private async treeSubjectTransitions(
-    oldRevision: string,
-    newRevision: string,
-    newIsIndex: boolean,
-  ): Promise<readonly DiffTransition[]> {
-    const oldRoot = await this.repository.resultTreeForCommit(await this.repository.resolveCommit(oldRevision));
-    const newTree = newIsIndex
-      ? await this.repository.indexTree()
-      : await this.repository.resultTreeForCommit(await this.repository.resolveCommit(newRevision));
-    const annotated = new Set((await this.evidenceNotes()).map((entry) => entry.object as string));
-    const transitions: DiffTransition[] = [];
-    const oldEntries = (await this.repository.listTreeIncludingTrees(oldRevision))
-      .filter((entry) => entry.type === "tree");
-    if (oldEntries.length !== 0) {
-      const newEntries = await this.repository.listTreeIncludingTrees(newTree);
-      const newOids = new Set(newEntries.map((entry) => entry.object as string));
-      // Same-path successors are trees only: replacing a directory with a file
-      // at the same path leaves a successor-less pair that requires retirement.
-      // Same-path successors are trees only: replacing a directory with a file
-      // at the same path leaves a successor-less pair that requires retirement.
-      const newByPath = new Map(
-        newEntries
-          .filter((entry) => entry.type === "tree")
-          .map((entry) => [entry.path, entry.object]),
-      );
-      const seen = new Set<string>();
-      for (const old of oldEntries) {
-        const from = old.object as string;
-        if (seen.has(from)) continue;
-        seen.add(from);
-        // Universal applicability: the exact subtree still exists somewhere.
-        if (newOids.has(from)) continue;
-        if (!annotated.has(from)) continue;
-        const successor = newByPath.get(old.path);
-        transitions.push(successor === undefined
-          ? { from: old.object, oldPath: old.path }
-          : { from: old.object, to: successor, oldPath: old.path, newPath: old.path });
-      }
-    }
-    if (oldRoot !== newTree && annotated.has(oldRoot as string)) {
-      transitions.push({ from: oldRoot, to: newTree, oldPath: ".", newPath: "." });
-    }
-    return transitions;
-  }
-
-  /**
-   * Suggest lineage candidates for a change using Git's similarity detection
-   * (RVR-014).
-   *
-   * This is the only place in the product that asks Git to detect renames, and
-   * nothing here can discharge an obligation: the rows are unconfirmed
-   * proposals, and the authoritative matcher deliberately runs with rename
-   * detection off. Turning a suggestion into evidence requires recording a
-   * lineage edge and a per-decision disposition.
-   */
   async suggestLineage(input: {
     readonly staged?: boolean;
     readonly revision?: string;
@@ -5723,8 +2411,9 @@ export class Reveries {
     } else {
       const revision = input.revision ?? "HEAD";
       commit = await this.repository.resolveCommit(revision);
-      const parents = await this.commitParents(commit);
-      parent = parents[0] ?? null;
+      const parents = (await this.repository.run(["rev-list", "--parents", "-n", "1", commit]))
+        .stdout.trim().split(" ").slice(1);
+      parent = parents[0] === undefined ? null : commitId(parents[0]);
       if (parent === null) return { suggestions: [], parent: null, commit };
       raw = (await this.repository.run([
         "diff-tree", "--raw", "-z", "--abbrev=64", "-r", "-M50%", "-C50%", "--no-commit-id", String(parent), String(commit),
@@ -5744,176 +2433,4 @@ export class Reveries {
     return { suggestions, parent, commit };
   }
 
-  private async checkTransitions(
-    transitions: readonly DiffTransition[],
-    summary: SessionSummary,
-    pairings: readonly SubjectPairing[] = [],
-    guidance: string | null = null,
-  ): Promise<CheckResult> {
-    const predecessors = new Map<ObjectId, ActiveProjection>();
-    const successors = new Map<ObjectId, ActiveProjection>();
-    const subjects = new Set<ObjectId>();
-    for (const transition of transitions) {
-      subjects.add(transition.from);
-      if (transition.to !== undefined) subjects.add(transition.to);
-    }
-    for (const pairing of pairings) {
-      subjects.add(pairing.from);
-      for (const successor of pairing.to) subjects.add(successor);
-    }
-    for (const subject of subjects) {
-      if (await this.readEvidenceNote(subject) !== null) {
-        const projection = await this.projectionFor(subject);
-        predecessors.set(subject, projection);
-        successors.set(subject, projection);
-      }
-    }
-    const report = analyzeContinuity({ transitions, pairings, predecessors, successors, summary });
-    const diagnostics = [
-      ...report.conflicts,
-      ...report.obligations.map((obligation) => {
-        const where = obligation.missing_at === undefined || obligation.missing_at.length === 0
-          ? ""
-          : ` (no disposition at ${obligation.missing_at.join(", ")})`;
-        const route = obligation.to_blob === undefined && guidance !== null ? ` ${guidance}` : "";
-        return `${obligation.id} from ${obligation.from_blob}: ${obligation.reason}${where}${route}`;
-      }),
-    ];
-    return { ok: report.ok, diagnostics };
-  }
-
-  /**
-   * Classify every lineage edge that claims this exact parent→commit change
-   * (RVR-014), and turn the authoritative ones into successor sets.
-   *
-   * An edge is bound to a direct parent and a result commit, so authority
-   * cannot be borrowed: an edge for another commit, another parent, or an
-   * endpoint that is not part of this change is history or a contradiction,
-   * never a pairing. Edges are read from the note of the commit they describe,
-   * because that is the only place placement allows them.
-   */
-  async classifyLineage(input: {
-    readonly commit: CommitId;
-    readonly parent: CommitId;
-    /**
-     * Coordinates this change disturbs, as `parent\0path\0subject`. A
-     * subject OID alone is not enough: the same object at another path is a
-     * different occurrence, so an edge may only claim the path it names.
-     */
-    readonly disturbed: ReadonlySet<string>;
-  }): Promise<{
-    readonly pairings: SubjectPairing[];
-    readonly used: LineageUse[];
-    readonly historyOnly: LineageId[];
-  }> {
-    // Every known edge is classified, not only the ones on this commit: an edge
-    // that describes another change is history, and saying so is the honest
-    // answer. The authority pass itself reads only this commit's edges.
-    const index = await this.lineageEdges();
-    const edges: LineageRecord[] = [...(index.get(input.commit) ?? [])];
-    const historyOnly: LineageId[] = [];
-    const pairings: SubjectPairing[] = [];
-    const used: LineageUse[] = [];
-    // Every other edge in the evidence is history: it describes a different
-    // change and can never authorize this one.
-    for (const [commit, recorded] of index) {
-      if (String(commit) === String(input.commit)) continue;
-      for (const edge of recorded) historyOnly.push(edge.id);
-    }
-    if (edges.length === 0) return { pairings, used, historyOnly };
-    const resultCoordinates = await this.coordinatesInCommit(input.commit);
-    for (const edge of edges) {
-      if (String(edge.commit) !== String(input.commit)) {
-        historyOnly.push(edge.id);
-        continue;
-      }
-      if (String(edge.parent) !== String(input.parent)) {
-        historyOnly.push(edge.id);
-        continue;
-      }
-      const undisturbed = edge.from.filter((endpoint) =>
-        !input.disturbed.has(coordinateKey(String(edge.parent), endpoint.path, String(endpoint.subject))));
-      const absent = edge.to.filter((endpoint) =>
-        !resultCoordinates.has(coordinateKey(String(edge.commit), endpoint.path, String(endpoint.subject))));
-      if (undisturbed.length > 0 || absent.length > 0) {
-        used.push({
-          id: edge.id,
-          authority: "contradictory",
-          detail: [
-            ...undisturbed.map((endpoint) =>
-              `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not a subject this commit disturbs`),
-            ...absent.map((endpoint) =>
-              `${endpoint.path} at ${endpoint.subject.slice(0, 12)} is not present in ${input.commit}`),
-          ].join("; "),
-        });
-        continue;
-      }
-      const to = edge.to.map((endpoint) => endpoint.subject).sort();
-      for (const endpoint of edge.from) {
-        pairings.push({ from: endpoint.subject, to, lineage: edge.id });
-      }
-      used.push({
-        id: edge.id,
-        authority: "authoritative",
-        detail: `pairs ${edge.from.map((endpoint) => endpoint.path).join(", ")} with ${edge.to.length === 0 ? "no successor" : edge.to.map((endpoint) => endpoint.path).join(", ")}`,
-      });
-    }
-    return { pairings, used, historyOnly };
-  }
-
-  /**
-   * The evidence view every lineage-aware read uses.
-   *
-   * A receive checker evaluates a *proposed* notes tip, so it must read the
-   * edges from that candidate rather than from the ref the receiver currently
-   * holds. Otherwise the gate would rule on continuity using yesterday's
-   * evidence and reject a push that the proposed notes actually justify — which
-   * is precisely the local-green/remote-red failure this protocol refuses to
-   * have.
-   */
-  private async evidenceView(): Promise<EvidenceSnapshotView> {
-    if (this.proposedNotesTip === undefined) return this.loadCachedEvidenceSnapshot({});
-    const limits = resolveLimits();
-    const listed = await this.repository.listNotesAt(this.proposedNotesTip);
-    const bodies = await this.repository.readNotesBatch(listed, {});
-    return this.buildSnapshotView(this.proposedNotesTip, listed, bodies, limits, false);
-  }
-
-  /**
-   * Every coordinate a commit's tree holds: each path and the blob or tree
-   * found there, plus the root tree at `.`.
-   *
-   * Paths matter as much as objects. Two paths can hold the same object, and an
-   * edge that names the right object at the wrong path is a claim about a
-   * different occurrence, so authority is matched on the whole coordinate.
-   */
-  private async coordinatesInCommit(commit: CommitId): Promise<ReadonlySet<string>> {
-    const coordinates = new Set<string>();
-    try {
-      for (const entry of await this.repository.listTreeIncludingTrees(commit)) {
-        coordinates.add(coordinateKey(String(commit), entry.path, String(entry.object)));
-      }
-      const root = await this.repository.resultTreeForCommit(commit);
-      coordinates.add(coordinateKey(String(commit), ".", String(root)));
-    } catch {
-      // An unreadable tree leaves the set empty, which makes every edge
-      // contradictory rather than authoritative: fail closed.
-    }
-    return coordinates;
-  }
-
-  /** Coordinates of the annotated predecessors a change disturbs. */
-  private disturbedCoordinates(
-    parent: CommitId,
-    transitions: readonly DiffTransition[],
-  ): Set<string> {
-    const disturbed = new Set<string>();
-    for (const transition of transitions) {
-      if (transition.oldPath === undefined) continue;
-      disturbed.add(coordinateKey(String(parent), transition.oldPath, String(transition.from)));
-    }
-    return disturbed;
-  }
 }
-import { access, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";

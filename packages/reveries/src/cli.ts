@@ -7,9 +7,8 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { initializeRepository, type HelperInvocation } from "./install.ts";
-import { INTERNAL_ATOMIC_PUSH_ENV, NOTES_REF } from "./git.ts";
 import { SUGGESTION_NOTICE, suggestionCommand } from "./lineage.ts";
-import { Reveries, type PushUpdate } from "./operations.ts";
+import { Reveries } from "./operations.ts";
 import {
   LINEAGE_KINDS,
   blobId,
@@ -255,27 +254,6 @@ function parseArguments(
     index += 1;
   }
   return { positionals, values, flags };
-}
-
-function parsePushUpdates(input: string): PushUpdate[] {
-  return input.split("\n")
-    .filter((line) => line.trim().length > 0)
-    .map((line) => {
-      const fields = line.split(" ");
-      if (fields.length !== 4 || fields.some((field) => field.length === 0 || field.includes("\0"))) {
-        throw new UsageError("pre-push received a malformed ref update");
-      }
-      const [localRef, localValue, remoteRef, remoteValue] = fields;
-      if (localRef === undefined || localValue === undefined || remoteRef === undefined || remoteValue === undefined) {
-        throw new UsageError("pre-push received a malformed ref update");
-      }
-      return {
-        localRef,
-        localObject: /^0+$/.test(localValue) ? null : objectId(localValue),
-        remoteRef,
-        remoteObject: /^0+$/.test(remoteValue) ? null : objectId(remoteValue),
-      };
-    });
 }
 
 function one(parsed: ParsedArguments, name: string, required = false): string | undefined {
@@ -862,37 +840,6 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     }
     if (command === "--help") {
       io.stdout(HELP);
-      return 0;
-    }
-    if (command === "pre-push") {
-      const remote = argv[1];
-      if (remote === undefined) throw new UsageError("pre-push requires the remote name from Git");
-      const updates = parsePushUpdates(await io.stdin());
-      const publishesBranch = updates.some(
-        (update) => update.localRef.startsWith("refs/heads/") && update.localObject !== null,
-      );
-      if (publishesBranch && (io.environment ?? process.env)[INTERNAL_ATOMIC_PUSH_ENV] !== "1") {
-        const diagnostics = [
-          "Raw branch publication is disabled; use reveries push for atomic publication or --no-verify for an explicit bypass",
-        ];
-        emit(io, false, command, undefined, diagnostics);
-        return 1;
-      }
-      // Reveries no longer decides which commits may be published. The command
-      // survives so an existing hook does not break, and it only reports what
-      // Git already knows: which refs are moving.
-      emit(io, false, command, updates.map((update) => ({
-        localRef: update.localRef,
-        remoteRef: update.remoteRef,
-        localObject: update.localObject,
-      })));
-      return 0;
-    }
-    if (command === "post-commit") {
-      // A retired enforcement hook. It used to refuse a commit without a session
-      // summary; a commit is now always allowed, so the command reports nothing
-      // and exits zero rather than breaking an installed hook.
-      emit(io, false, command, { ok: true, diagnostics: [] });
       return 0;
     }
     if (command === "init") {
