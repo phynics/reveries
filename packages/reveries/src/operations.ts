@@ -127,7 +127,6 @@ import {
   type SignatureVerifier,
   type WithNotesWriteOptions,
 } from "./git.ts";
-import { helperInvocationAvailable, helperInvocationFingerprint, hookInvocation } from "./install.ts";
 import { assertNoSecretMaterial, SECRET_SCAN_WARNING, scanSecretMaterial } from "./sensitive-evidence.ts";
 
 export interface RecordTarget {
@@ -394,31 +393,9 @@ export type SyncResult =
     };
 
 export interface DoctorResult extends CheckResult {
-  readonly state: "prepared" | "adopted" | "damaged";
+  readonly state: "healthy" | "damaged";
   readonly notices: readonly string[];
-  readonly protection: DoctorProtection;
   readonly retention: RetentionStatus;
-  /**
-   * The ledger envelope state. `stale` means the envelope is valid but the
-   * local notes ref has moved past it, which is an ordinary unpublished state
-   * and never damage; only `invalid` is a diagnostic.
-   */
-  readonly ledger: LedgerStatus;
-  /**
-   * Signing and trust state. Additive field: `cli.ts` human rendering is owned
-   * by a separate task, so these names are stable API, not display strings.
-   * Presence and unknown keys are notices, never damage.
-   */
-  readonly signatures: SignatureStatus;
-  /**
-   * Primary authority, mirrors, and import quarantine (RVR-017). Additive
-   * field: a repository that declared no role is `inferred` or `unconfigured`
-   * and is never damaged, so its presence is a notice. `cli.ts` human rendering
-   * is owned separately, so these names are stable API, not display strings.
-   */
-  readonly authority: AuthorityStatus;
-  /** One entry per configured mirror, in remote-name order. */
-  readonly mirrors: readonly MirrorStatus[];
 }
 
 /**
@@ -3853,6 +3830,21 @@ export class Reveries {
     }));
   }
 
+  /**
+   * Publish HEAD and refs/notes/reveries in one atomic Git transaction.
+   *
+   * The single transaction is the only thing this command adds: a plain
+   * `git push origin HEAD refs/notes/reveries` is equally valid, and the two
+   * refspecs in one push are already atomic on the server. This uses an
+   * explicit lease for each ref so a concurrent remote advance fails the whole
+   * transaction closed rather than publishing a partial set.
+   *
+   * It no longer runs an outgoing continuity check. Refusing a push because a
+   * commit lacks a session summary made publication a workflow gate; a reader
+   * now discovers unresolved continuity from the evidence itself, and Git's own
+   * `--force-with-lease` is the operator's tool for refusing history rewrites.
+   * The aggregate result therefore reports what Git did, not permission.
+   */
   async push(remote: string): Promise<CheckResult> {
     const branchResult = await this.repository.run(
       ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -3864,40 +3856,19 @@ export class Reveries {
     }
     const branchRef = `refs/heads/${branch}`;
     const branchRemote = await this.liveRepository.remoteObject(remote, branchRef);
-    const notesRemote = await this.liveRepository.remoteObject(remote, NOTES_REF);
-    // The envelope is the third member of the atomic publication transaction.
-    // Reading its local tip decides whether a ledger refspec is published at
-    // all; reading the remote tip arms its lease. A repository that never built
-    // a checkpoint publishes branch plus notes only.
-    const ledgerTip = await this.repository.ledgerTip();
-    const ledgerRemote = await this.liveRepository.remoteObject(remote, LEDGER_REF);
-    const check = await this.checkOutgoingUpdates(remote, [{
-      localRef: branchRef,
-      localObject: await this.repository.resolveCommit("HEAD"),
-      remoteRef: branchRef,
-      remoteObject: branchRemote,
-    }, {
-      localRef: NOTES_REF,
-      localObject: await this.repository.notesTip(),
-      remoteRef: NOTES_REF,
-      remoteObject: notesRemote,
-    }, ...(ledgerTip === null ? [] : [{
-      localRef: LEDGER_REF,
-      localObject: ledgerTip,
-      remoteRef: LEDGER_REF,
-      remoteObject: ledgerRemote,
-    }])]);
-    if (!check.ok) return check;
-    // One atomic transaction for all three refs: the leases are the values the
-    // check above approved, so a concurrent remote advance fails the whole
-    // transaction closed instead of publishing a partial set.
-    await this.liveRepository.pushAtomically(remote, {
-      branchRef,
-      expectedBranch: branchRemote,
-      expectedNotes: notesRemote,
-      ...(ledgerTip === null ? {} : { includeLedger: true as const, expectedLedger: ledgerRemote }),
-    });
-    return check;
+    const notesTip = await this.repository.notesTip();
+    const notesRemote = notesTip === null ? null : await this.liveRepository.remoteObject(remote, NOTES_REF);
+    try {
+      await this.liveRepository.pushAtomically(remote, {
+        branchRef,
+        expectedBranch: branchRemote,
+        includeNotes: notesTip !== null,
+        ...(notesTip === null ? {} : { expectedNotes: notesRemote }),
+      });
+    } catch (error: unknown) {
+      return { ok: false, diagnostics: [error instanceof Error ? error.message : String(error)] };
+    }
+    return { ok: true, diagnostics: [] };
   }
 
   async postCommitCheck(): Promise<CheckResult> {
@@ -5137,6 +5108,17 @@ export class Reveries {
     };
   }
 
+  /**
+   * Report the health of the evidence, and nothing else.
+   *
+   * Doctor used to answer four questions at once: whether the evidence was
+   * sound, whether local hooks were installed, whether a ledger envelope agreed
+   * with the notes ref, and whether signatures covered it. The last three were
+   * enforcement, and they reported "damaged" for choices an operator is
+   * entitled to make. What remains is integrity: `ok` is false only for damage
+   * a reader must not ignore, namely a record the protocol cannot parse or a
+   * retained object that is no longer reachable. Everything else is a notice.
+   */
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
     const notices: string[] = [];
@@ -5153,100 +5135,20 @@ export class Reveries {
       ["config", "--get", "notes.reveries.mergeStrategy"],
       { allowExitCodes: [0, 1] },
     );
-    if (strategy.stdout.trim() !== "cat_sort_uniq") diagnostics.push("notes.reveries.mergeStrategy is not cat_sort_uniq");
-    const initialization = await this.findInitialization();
-    const configuredRemotes = initialization === null
-      ? (await this.repository.run(["config", "--get-all", "reveries.publishingRemote"], { allowExitCodes: [0, 1] }))
-          .stdout.trim().split("\n").filter(Boolean)
-      : initialization.record.publishing_remotes;
-    const remotes = (await this.repository.run(["remote"])).stdout.trimEnd().split("\n").filter(Boolean);
-    if (initialization === null) {
-      notices.push("Reveries is prepared; the adoption boundary has not been committed and annotated yet");
-      const localOnly = await this.repository.run(["config", "--get", "reveries.localOnly"], { allowExitCodes: [0, 1] });
-      if (configuredRemotes.length === 0 && localOnly.stdout.trim() !== "true") {
-        diagnostics.push("Prepared publishing choice is missing");
-      }
-    }
-    let unsafeGenericPush = false;
-    for (const remote of new Set([...configuredRemotes, ...remotes])) {
-        const push = await this.repository.run(
-          ["config", "--get-all", `remote.${remote}.push`],
-          { allowExitCodes: [0, 1] },
-        );
-        const pushValues = push.stdout.split("\n")
-          .map((value) => value.trim())
-          .filter((value) => value.length > 0 && !value.startsWith("^"));
-        if (pushValues.length > 0) {
-          diagnostics.push(`Remote ${remote} has unsafe generic push refspecs; use reveries push`);
-          unsafeGenericPush = true;
-        }
-        if (!configuredRemotes.includes(remote)) continue;
-        const fetch = await this.repository.run(
-          ["config", "--get-all", `remote.${remote}.fetch`],
-          { allowExitCodes: [0, 1] },
-        );
-        if (!fetch.stdout.includes(`refs/notes/remotes/${remote}/reveries*`)) {
-          diagnostics.push(`Publishing remote ${remote} lacks the Reveries fetch refspec`);
-        }
-        const remoteTip = await this.repository.notesTip(`refs/notes/remotes/${remote}/reveries`);
-        const localTip = await this.repository.notesTip();
-        if (remoteTip !== null && localTip !== null) {
-          const incorporated = await this.repository.run(
-            ["merge-base", "--is-ancestor", remoteTip, localTip],
-            { allowExitCodes: [0, 1] },
-          );
-          if (incorporated.exitCode !== 0) diagnostics.push(`Remote ${remote} notes have not been incorporated`);
-        }
-    }
-    const commonDirectory = await this.repository.commonDirectory();
-    const helperCommand = await this.repository.run(["config", "--get", "reveries.helperCommand"], { allowExitCodes: [0, 1] });
-    const helperArgs = await this.repository.run(["config", "--get-all", "reveries.helperArg"], { allowExitCodes: [0, 1] });
-    const helperVerification = await this.repository.run(["config", "--get", "reveries.helperVerification"], { allowExitCodes: [0, 1] });
-    const expectedFingerprint = await this.repository.run(["config", "--get", "reveries.helperFingerprint"], { allowExitCodes: [0, 1] });
-    const verification = helperVerification.stdout.trim();
-    const helper = helperCommand.exitCode === 0
-      ? {
-          command: helperCommand.stdout.trim(),
-          args: helperArgs.exitCode === 0 ? helperArgs.stdout.trimEnd().split("\n") : [],
-          verification: verification === "self" ? "self" as const : "probe" as const,
-        }
-      : undefined;
-    const requiredHooks = configuredRemotes.length === 0
-      ? ["post-commit"] as const
-      : ["pre-push", "post-commit"] as const;
-    let localHookComplete = configuredRemotes.length > 0 && !unsafeGenericPush;
-    for (const name of requiredHooks) {
-      try {
-        const hook = await readFile(join(commonDirectory, "hooks", name), "utf8");
-        const expected = helper === undefined
-          ? null
-          : `# reveries:begin\nexec ${hookInvocation(helper, name)}\n# reveries:end`;
-        if (expected === null || !hook.includes(expected)) {
-          diagnostics.push(`${name} enforcement is partial`);
-          if (configuredRemotes.length > 0) localHookComplete = false;
-        }
-      } catch {
-        diagnostics.push(`${name} hook is missing`);
-        if (configuredRemotes.length > 0) localHookComplete = false;
-      }
-    }
-    const helperAvailable = await helperInvocationAvailable(helper);
-    const actualFingerprint = await helperInvocationFingerprint(helper);
-    if (!helperAvailable
-      || expectedFingerprint.exitCode !== 0
-      || actualFingerprint !== expectedFingerprint.stdout.trim()) {
-      diagnostics.push("The configured Reveries hook runner is unavailable or changed");
-      if (configuredRemotes.length > 0) localHookComplete = false;
+    if (strategy.stdout.trim() !== "cat_sort_uniq") {
+      notices.push(
+        "notes.reveries.mergeStrategy is not cat_sort_uniq; two clones' notes refs will not combine by union",
+      );
     }
     try {
-      await access(join(commonDirectory, "NOTES_MERGE_PARTIAL"));
+      await access(join(await this.repository.commonDirectory(), "NOTES_MERGE_PARTIAL"));
       diagnostics.push("An unresolved Git notes merge is in progress");
     } catch {
       // No unresolved notes merge marker exists.
     }
-    // Retired-lock leftovers and disposable transaction refs are
-    // collectible and diagnosable, never damage: they are reported as
-    // notices and must never flip `ok` to false by themselves.
+    // A retired lock directory and disposable transaction refs are
+    // collectible leftovers, never damage: they are reported as notices so an
+    // operator can clean them up, and they never flip `ok` to false.
     try {
       const lockPath = this.repository.writeLockPath();
       const lockStat = await stat(lockPath).catch(() => null);
@@ -5282,7 +5184,7 @@ export class Reveries {
       // A temp-ref listing failure is not a diagnosis.
     }
     try {
-      await this.validateNotesRef("refs/notes/reveries");
+      await this.validateNotesRef(NOTES_REF);
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
@@ -5304,143 +5206,16 @@ export class Reveries {
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
-    const protection: DoctorProtection = {
-      helper: helperAvailable ? "available" : "unavailable",
-      local: unsafeGenericPush
-        ? "partial"
-        : configuredRemotes.length === 0
-          ? "not-configured"
-          : localHookComplete
-            ? "complete"
-            : "partial",
-      receiveSide: "unknown",
-    };
-    let ledger: LedgerStatus = {
-      state: "absent",
-      tip: null,
-      notesCommit: null,
-      notesTip: null,
-      previousLedger: null,
-      retentionCommit: null,
-      annotatedSubjects: 0,
-      diagnostics: [],
-    };
-    try {
-      ledger = await this.ledgerStatus();
-      // Only a structurally invalid envelope is damage. `absent` means the
-      // repository never adopted the ledger, and `stale` means it simply has
-      // not been rebuilt over the newest notes; both are notices.
-      if (ledger.state === "invalid") diagnostics.push(...ledger.diagnostics);
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    let signatures: SignatureStatus = {
-      state: "absent",
-      counts: {
-        unknown: 0,
-        valid: 0,
-        trusted: 0,
-        "policy-satisfying": 0,
-        invalid: 0,
-        revoked: 0,
-      },
-      checkpoint: null,
-      checkpointSigned: false,
-      requiredRoles: this.signing.requiredRoles ?? [],
-      diagnostics: [],
-    };
-    try {
-      signatures = await this.signatureStatus();
-      // Only a broken attestation is damage. An unsigned repository, an unknown
-      // key, and an untrusted-but-valid signature are all ordinary states, which
-      // is the same rule the ledger envelope follows for `absent` and `stale`.
-      diagnostics.push(...signatures.diagnostics);
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    notices.push(
-      `Signatures: ${signatures.state}; checkpoint ${signatures.checkpoint ?? "none"}; `
-      + `signed ${signatures.checkpointSigned ? "yes" : "no"}; `
-      + `${signatures.counts["policy-satisfying"]} policy-satisfying, `
-      + `${signatures.counts.unknown} unknown, ${signatures.counts.valid} valid, `
-      + `${signatures.counts.trusted} trusted, ${signatures.counts.invalid} invalid, `
-      + `${signatures.counts.revoked} revoked.`,
-    );
-    notices.push(
-      `Protection: helper ${protection.helper}; local ${protection.local}; receive-side ${protection.receiveSide}. `
-      + "Local hooks are not a security boundary and may be bypassed with --no-verify.",
-    );
     notices.push(
       `Retention: policy ${retention.policy}; ${retention.state}; `
       + `${retention.retained.length} of ${retention.expected.length} annotated subject(s) kept.`,
     );
-    notices.push(
-      `Ledger: ${ledger.state}; tip ${ledger.tip ?? "none"}; `
-      + `${ledger.annotatedSubjects} annotated subject(s) transported.`,
-    );
-    // Authority (RVR-017). Only a contradictory configuration is damage: a
-    // repository with no primary, an inferred one, or a mirror that has not been
-    // fetched are all ordinary states, which is the same rule the ledger and
-    // signature blocks follow.
-    let authority: AuthorityStatus = {
-      state: "absent",
-      primary: null,
-      roles: new Map(),
-      notice: "No publishing remote is configured; this repository publishes nothing.",
-      diagnostics: [],
-    };
-    let mirrors: readonly MirrorStatus[] = [];
-    try {
-      authority = await this.authorityStatus();
-      diagnostics.push(...authority.diagnostics);
-    } catch (error: unknown) {
-      // A malformed role value is a diagnostic, never a crash, so `doctor` still
-      // reports the rest of the repository.
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    try {
-      mirrors = await this.verifyMirrorEnvelopes();
-      for (const mirror of mirrors) {
-        // `unavailable` and `unsigned` are states a healthy repository can be in:
-        // a mirror nobody has fetched, or one that cannot be checked because the
-        // primary carries no signature. Only a contradiction is damage, and
-        // reporting the others as diagnostics would train an operator to ignore
-        // this block, which is how a real divergence would go unnoticed.
-        if (mirror.state === "divergent" || mirror.state === "authority-mismatch") {
-          diagnostics.push(...mirror.diagnostics);
-        }
-      }
-    } catch (error: unknown) {
-      diagnostics.push(error instanceof Error ? error.message : String(error));
-    }
-    notices.push(
-      `Authority: ${authority.state}; primary ${authority.primary ?? "none"}; `
-      + `${[...authority.roles].filter(([, role]) => role === "mirror").length} mirror(s), `
-      + `${[...authority.roles].filter(([, role]) => role === "archive").length} archive(s), `
-      + `${[...authority.roles].filter(([, role]) => role === "import-only").length} import-only.`,
-    );
-    for (const mirror of mirrors) {
-      // Detail a mirror reports goes in its notice rather than being repeated as
-      // a diagnostic, so the diagnostic list names each problem exactly once.
-      const alreadyReported = new Set(diagnostics);
-      const problems = mirror.diagnostics.filter((entry) => !alreadyReported.has(entry));
-      notices.push(
-        `Mirror ${mirror.remote}: ${mirror.state}; checkpoint ${mirror.checkpoint ?? "none"}`
-        + `${mirror.signature === null ? "" : `; signature ${mirror.signature}`}.`
-        + `${problems.length === 0 ? "" : ` ${problems.join(" ")}`}`,
-      );
-    }
     return {
       ok: diagnostics.length === 0,
       diagnostics,
       notices,
-      protection,
       retention,
-      ledger,
-      signatures,
-      authority,
-      mirrors,
-      state: diagnostics.length > 0 ? "damaged" : initialization === null ? "prepared" : "adopted",
+      state: diagnostics.length > 0 ? "damaged" : "healthy",
     };
   }
 
