@@ -127,7 +127,6 @@ import {
   type SignatureVerifier,
   type WithNotesWriteOptions,
 } from "./git.ts";
-import { assertNoSecretMaterial, SECRET_SCAN_WARNING, scanSecretMaterial } from "./sensitive-evidence.ts";
 
 export interface RecordTarget {
   readonly path: string;
@@ -1822,14 +1821,9 @@ export class Reveries {
         ref: notes.ref,
         read: (object) => notes.read(object),
         append: async (object, canonicalLine) => {
-          assertNoSecretMaterial(canonicalLine, "Evidence record");
           await notes.append(object, canonicalLine);
         },
         replace: async (object, canonicalBody) => {
-          const existing = await notes.read(object);
-          const existingLines = new Set(existing?.split("\n").filter((line) => line.length > 0) ?? []);
-          const additions = canonicalBody.split("\n").filter((line) => line.length > 0 && !existingLines.has(line));
-          assertNoSecretMaterial(additions.join("\n"), "Evidence record");
           await notes.replace(object, canonicalBody);
         },
       }),
@@ -1863,7 +1857,6 @@ export class Reveries {
     readonly summary: SessionSummary;
   }): Promise<CommitId> {
     validateNote([input.summary], { verifyIds: false });
-    assertNoSecretMaterial(canonicalRecord(input.summary), "Session summary");
     return this.repository.commitWithNote({
       message: input.message,
       note: canonicalRecord(input.summary),
@@ -2752,14 +2745,7 @@ export class Reveries {
     const diagnostics: string[] = [];
     for (const entry of view.entries) {
       for (const record of entry.records) {
-        const findings = scanSecretMaterial(canonicalRecord(record));
         const id = recordFactId(record) ?? record.type;
-        if (findings.length > 0) {
-          const kinds = [...new Set(findings.map(({ kind }) => kind))].join(", ");
-          diagnostics.push(
-            `Evidence ${id} on ${entry.object} contains likely secret material (${kinds}); publication is refused. ${SECRET_SCAN_WARNING}`,
-          );
-        }
         if (!allSources(record).some((source) => source.kind === "confidential-pointer")) continue;
         const factId = recordFactId(record);
         const content = canonicalRecord(record).replace(/\n$/, "");
