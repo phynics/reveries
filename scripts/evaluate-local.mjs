@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 /**
  * LOCAL evaluation for the lean Reveries core.
  *
- * The 20 PRD acceptance criteria are proved by scripts/direct-git-acceptance.mjs
+ * The 25 PRD acceptance criteria are proved by scripts/direct-git-acceptance.mjs
  * against the built CLI and raw Git. This runner executes the build, typecheck,
  * full test suite, script tests, and that acceptance, then maps every criterion
  * to its passing step. No network, hosted runner, or external service is used.
@@ -101,7 +101,7 @@ async function validateSkills() {
 }
 
 // `--report-only` is the CI mode: the workflow runs each gate as its own step
-// for clear failure attribution, then calls this runner to map the 20 criteria
+// for clear failure attribution, then calls this runner to map the 25 criteria
 // and validate the Skills without re-running build, typecheck, or the suite.
 const reportOnly = process.argv.includes("--report-only");
 const reportIndex = process.argv.indexOf("--acceptance-report");
@@ -146,7 +146,7 @@ const criteria = acceptanceReport.criteria.map((item) => ({
   evidence: "scripts/direct-git-acceptance.mjs",
   reason: item.ok ? null : item.detail,
 }));
-const acceptanceOk = acceptanceReport.ok === true && criteria.length === 20
+const acceptanceOk = acceptanceReport.ok === true && criteria.length === 25
   && criteria.every((item) => item.status === "covered");
 const releaseReady = gatesOk && acceptanceOk && skillFailures.length === 0;
 

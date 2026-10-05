@@ -128,8 +128,8 @@ than presenting stale notes as current.
 ## Publish changes
 
 Publish the notes ref and, when the remote supports it, the retention ref. An ordinary push
-is enough; `reveries push <remote>` only adds a single atomic transaction over HEAD and the
-notes ref.
+is enough; `reveries push <remote>` refreshes retention and adds a single atomic transaction
+over HEAD, the notes ref, and the retention ref.
 
 ```bash
 branch="$(git branch --show-current)"

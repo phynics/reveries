@@ -1,15 +1,10 @@
-import { constants } from "node:fs";
-import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { access, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, isAbsolute, join, relative } from "node:path";
-import { promisify } from "node:util";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 
 import { GitRepository } from "./git.ts";
 
 const BEGIN = "<!-- reveries:begin -->";
 const END = "<!-- reveries:end -->";
-const execFileAsync = promisify(execFile);
 
 const AGENTS_INTRO = `## Reveries
 
@@ -28,8 +23,9 @@ Automatic note delivery is best-effort. When needed, inspect a file directly:
     git notes --ref=refs/notes/reveries show \\
       "$(git rev-parse 'HEAD:path/to/file')"
 
-Publish evidence with an ordinary Git push of \`refs/notes/reveries\`, or use
-\`reveries push <remote>\` for a single atomic push of HEAD and the notes ref.`;
+Publish evidence with an ordinary Git push of \`refs/notes/reveries\` and
+\`refs/reveries/retention\`, or use \`reveries push <remote>\` for a single atomic
+push of HEAD, the notes ref, and the retention ref.`;
 
 function agentsBlock(): string {
   return `${BEGIN}
@@ -70,45 +66,6 @@ async function setOwnedBlock(path: string, block: string): Promise<{ readonly ch
   return { changed: true };
 }
 
-export async function helperInvocationAvailable(helper: HelperInvocation | undefined): Promise<boolean> {
-  if (helper === undefined || helper.command.length === 0 || helper.command.includes("\0")) return false;
-  if (helper.args.some((argument) => argument.includes("\0") || argument.includes("\n"))) return false;
-  if (helper.command.includes("/") || isAbsolute(helper.command)) {
-    try {
-      await access(helper.command, constants.X_OK);
-      for (const argument of helper.args) {
-        if (isAbsolute(argument)) await access(argument, constants.R_OK);
-      }
-      if (helper.verification === "self") {
-        const script = helper.args[0];
-        return await realpath(helper.command) === await realpath(process.execPath)
-          && helper.args.length === 1
-          && script !== undefined
-          && /^(?:cli|main)\.(?:js|ts)$/.test(basename(script));
-      }
-      const result = await execFileAsync(helper.command, [...helper.args, "--version"], {
-        encoding: "utf8",
-        timeout: 5_000,
-      });
-      return /^reveries [0-9]+\.[0-9]+\.[0-9]+$/m.test(result.stdout.trim());
-    } catch {
-      return false;
-    }
-  }
-  return false;
-}
-
-export interface HelperInvocation {
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly verification?: "probe" | "self";
-}
-
-export interface InitializeOptions {
-  /** Retained for callers that still pass one; setup installs no hooks. */
-  readonly helper?: HelperInvocation;
-}
-
 export interface InitializationResult {
   /** Always `prepared`: setup makes no commit and needs no second step. */
   readonly state: "prepared";
@@ -140,7 +97,6 @@ async function withSetupLock<T>(repository: GitRepository, operation: () => Prom
 
 export async function initializeRepository(
   cwd: string,
-  _options: InitializeOptions = {},
 ): Promise<InitializationResult> {
   const repository = await GitRepository.open(cwd);
   return withSetupLock(repository, () => initializeUnlocked(repository));
@@ -178,6 +134,12 @@ async function initializeUnlocked(repository: GitRepository): Promise<Initializa
   return {
     state: "prepared",
     changedFiles,
-    nextCommands: [],
+    // A recommendation the operator may run, never a change setup makes: the
+    // remote name is the operator's choice, and configuring it here would be
+    // the publication policy the lean core removed.
+    nextCommands: [
+      "git fetch <remote> '+refs/notes/reveries:refs/notes/remotes/<remote>/reveries' "
+        + "'+refs/reveries/retention:refs/remotes/<remote>/reveries-retention'",
+    ],
   };
 }

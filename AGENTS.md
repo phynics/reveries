@@ -16,6 +16,7 @@ Automatic note delivery is best-effort. When needed, inspect a file directly:
     git notes --ref=refs/notes/reveries show \
       "$(git rev-parse 'HEAD:path/to/file')"
 
-Publish evidence with an ordinary Git push of `refs/notes/reveries`, or use
-`reveries push <remote>` for a single atomic push of HEAD and the notes ref.
+Publish evidence with an ordinary Git push of `refs/notes/reveries` and
+`refs/reveries/retention`, or use `reveries push <remote>` for a single atomic
+push of HEAD, the notes ref, and the retention ref.
 <!-- reveries:end -->

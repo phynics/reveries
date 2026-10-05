@@ -30,7 +30,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json && node scripts/assert-lean-dist.mjs",
     "test": "node --experimental-transform-types --test test/**/*.test.ts",
     "test:full": "node --experimental-transform-types --test test/**/*.test.ts test/**/*.integration.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

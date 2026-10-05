@@ -20,9 +20,21 @@ Reveries is now a small Git-native evidence system. The authoritative state is G
 - Remove the `summarize`, `check`, `adopt`, `hooks`, `ledger`, `sign`, `authority`, `redact`,
   `transition`, and `receive-check` commands. `doctor` reports integrity only and exits
   non-zero only for damage.
-- Rewrite `scripts/direct-git-acceptance.mjs` to prove the 20 PRD acceptance criteria against
+- Rewrite `scripts/direct-git-acceptance.mjs` to prove the 25 PRD acceptance criteria against
   the built CLI and raw Git, and gate `npm run verify` on it. CI is one workflow on Node 22 and
   the Git 2.39 container.
+- Treat a record type the build does not know as preserved bytes on every path: it no longer
+  blocks `record`, `link`, `retain`, a notes merge, or `doctor`. `doctor` counts legacy records
+  as a notice and stays healthy.
+- Add `reveries migrate`, which converts legacy records whose subject is unambiguous into lean
+  `reverie` or `lineage` evidence and reports the rest. It never deletes legacy bytes.
+- Refresh retention and publish `refs/reveries/retention` from `reveries push`, and refresh it
+  after `reveries sync --pull`.
+- Store an `issue` source reference opaquely: the core no longer validates a tracker grammar.
+- Clean `dist` before every build and fail the build when a removed module (host adapter, hook
+  runner, receive gate, continuity gate, or projection) is present in the published package.
+- Delete the dead signing, retention-bundle, search-index, and supersession-limit surfaces, and
+  remove the `confidential-pointer` source kind from the schemas.
 
 ## 1.0.2 - 2026-08-25
 

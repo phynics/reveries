@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
  * Direct-Git acceptance for the lean Reveries core.
  *
  * Every check drives the built CLI or raw Git in a disposable repository. The
- * point is to prove the 20 PRD acceptance criteria, not to exercise internals:
+ * point is to prove the 25 PRD acceptance criteria, not to exercise internals:
  * a reader with no Reveries installed can recover every decision with
  * `git notes`, and no Git command is ever gated by Reveries.
  */
@@ -477,6 +477,29 @@ const criteria = [
   },
   {
     id: 20,
+    title: "default repository contains no host-specific enforcement configuration",
+    async check(root) {
+      const directory = await createRepository(root, "no-host-config");
+      await writeFile(join(directory, "state.txt"), "first\n", "utf8");
+      await commit(directory, "initial");
+      await mustReveries(directory, "init");
+      // Init writes the notes merge strategy and the instructions block, never
+      // a host, hook, receive, delivery, or policy configuration.
+      const config = await gitValue(directory, "config", "--local", "--list");
+      assert.doesNotMatch(config, /reveries\.(?:host|adapter|receive|hook|delivery|policy)/i);
+      const hooks = (await readdir(join(directory, ".git", "hooks"))).filter((name) => !name.endsWith(".sample"));
+      assert.deepEqual(hooks, []);
+      let workflows = null;
+      try {
+        workflows = await readdir(join(directory, ".github", "workflows"));
+      } catch {
+        workflows = null;
+      }
+      assert.equal(workflows, null);
+    },
+  },
+  {
+    id: 21,
     title: "the writer emits no summaries and no adoption semantics",
     async check(root) {
       const directory = await createRepository(root, "writer");
@@ -489,6 +512,70 @@ const criteria = [
       assert.doesNotMatch(raw, /transition-summary/);
       const doctor = await reveries(directory, "doctor");
       assert.equal(doctor.ok, true, doctor.diagnostics.join("; "));
+    },
+  },
+  {
+    id: 22,
+    title: "adoption-boundary semantics no longer exist",
+    async check(root) {
+      const directory = await createRepository(root, "no-adoption");
+      await writeFile(join(directory, "state.txt"), "first\n", "utf8");
+      await commit(directory, "initial");
+      await mustReveries(directory, "init");
+      // A commit after init needs no adoption record and no summary, and no
+      // initialization record is written into the notes ref.
+      await writeFile(join(directory, "state.txt"), "second\n", "utf8");
+      await commit(directory, "post-init commit");
+      const listed = await git(directory, "notes", "--ref=refs/notes/reveries", "list").catch(() => "");
+      assert.equal(listed.trim(), "");
+      const help = await run(process.execPath, [reveriesCliPath, "help"], directory);
+      assert.doesNotMatch(help, /^\s{2}adopt\b/m);
+    },
+  },
+  {
+    id: 23,
+    title: "core protocol validity is independent of publication state",
+    async check(root) {
+      const directory = await createRepository(root, "no-remote");
+      await writeFile(join(directory, "state.txt"), "first\n", "utf8");
+      await commit(directory, "initial");
+      const recorded = await record(directory, "state.txt", "Valid with no remote at all.");
+      const doctor = await reveries(directory, "doctor");
+      assert.equal(doctor.ok, true, doctor.diagnostics.join("; "));
+      assert.equal(doctor.result.state, "healthy");
+      const shown = await mustReveries(directory, "show", "state.txt");
+      assert.equal(shown.active[0].id, recorded.record.id);
+      assert.equal((await git(directory, "remote")).trim(), "");
+    },
+  },
+  {
+    id: 24,
+    title: "deleted features no longer appear as supported commands in --help",
+    async check(root) {
+      const directory = await createRepository(root, "help-surface");
+      const help = await run(process.execPath, [reveriesCliPath, "help"], directory);
+      const removed = [
+        "adopt", "summarize", "receive-check", "hooks", "ledger", "sign",
+        "authority", "redact", "transition", "quarantine", "mirror", "import",
+      ];
+      for (const command of removed) {
+        assert.doesNotMatch(help, new RegExp(`^\\s{2}${command}\\b`, "m"), `help still lists removed command ${command}`);
+      }
+    },
+  },
+  {
+    id: 25,
+    title: "primary documentation describes only the lean core",
+    async check() {
+      const protocol = await readFile(join(workspace, "protocol", "v1.md"), "utf8");
+      assert.match(protocol, /`reverie`/);
+      assert.match(protocol, /`lineage`/);
+      // Legacy record types appear only as removed/historical compatibility.
+      assert.match(protocol, /Removed record types/);
+      const readme = await readFile(join(workspace, "README.md"), "utf8");
+      assert.match(readme, /evidence format, not a workflow/i);
+      assert.doesNotMatch(readme, /session summary/i);
+      assert.doesNotMatch(readme, /\badoption\b/i);
     },
   },
 ];

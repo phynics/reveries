@@ -138,3 +138,31 @@ test("retention rebuild is byte-stable for the same annotated subject set", asyn
   assert.notEqual(await reveries.repository.notesTip("refs/reveries/retention"), null);
   assert.equal(tip !== null, true);
 });
+
+test("a legacy record is preserved, never damage, and never blocks a write", async () => {
+  const directory = await createRepository();
+  const reveries = await Reveries.open(directory);
+  const recorded = await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
+  const note = await reveries.repository.readNoteFromRef("refs/notes/reveries", recorded.object);
+  const legacy = '{"v":1,"type":"session-summary","id":"ss:legacy","summary":"old"}\n';
+  await reveries.repository.run(
+    ["notes", "--ref=refs/notes/reveries", "add", "-f", "-F", "-", String(recorded.object)],
+    { input: `${note ?? ""}${legacy}` },
+  );
+
+  const doctor = await reveries.doctor();
+  assert.equal(doctor.ok, true, doctor.diagnostics.join("; "));
+  assert.equal(doctor.state, "healthy");
+  assert.match(doctor.notices.join(" "), /use a type this build does not know/);
+
+  // The bytes this build does not interpret must not block a later write.
+  await reveries.recordNew({
+    path: "state.txt",
+    revision: "HEAD",
+    semantic: { ...semantic, decision: "A second decision." },
+    metadata,
+  });
+  const after = await reveries.repository.readNoteFromRef("refs/notes/reveries", recorded.object);
+  assert.match(after ?? "", /session-summary/);
+  assert.match(after ?? "", /A second decision\./);
+});

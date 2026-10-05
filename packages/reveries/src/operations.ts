@@ -8,7 +8,6 @@ import {
   createEvidenceSnapshot,
   createLineage,
   createReverie,
-  lineageId,
   lineagePayload,
   NOTES_REF,
   objectId,
@@ -24,7 +23,6 @@ import {
   type EvidenceSnapshot,
   type LineageEndpoint,
   type LineageId,
-  type LineageInput,
   type LineageKind,
   type LineageRecord,
   type NoteRecord,
@@ -43,7 +41,6 @@ import {
   GitRepository,
   cloneEvidenceGrade,
   hashBlobContent,
-  matchTrackingRefRemote,
   RETENTION_REF,
   type CompletenessGrade,
   type NoteListEntry,
@@ -135,11 +132,6 @@ export interface LinkResult {
 export interface ShowInput {
   readonly target: string;
   readonly revision?: "HEAD" | "index" | string;
-  /**
-   * Include soft-redacted facts in normal display. Default false: redacted
-   * facts stay in history and snapshot bytes but leave records/active.
-   */
-  readonly includeRedacted?: boolean;
 }
 
 export interface ShowResult {
@@ -190,6 +182,29 @@ export interface RetentionResult extends RetentionStatus {
   readonly changed: boolean;
 }
 
+/**
+ * What `reveries migrate` converted and what it left as historical legacy bytes.
+ * A non-zero `unconverted` is a valid outcome: legacy narration whose subject is
+ * not an exact object stays readable and is never reinterpreted.
+ */
+export interface MigrationReport {
+  readonly notesScanned: number;
+  /** Records already in the lean `reverie` or `lineage` form. */
+  readonly lean: number;
+  /** `reveries-init` records, kept as configuration and not converted. */
+  readonly configurationRecords: number;
+  readonly convertedReveries: number;
+  readonly convertedLineages: number;
+  /** Legacy records or entries with no unambiguous exact-object subject. */
+  readonly unconverted: number;
+  /** Lines that are not valid JSON, left untouched. */
+  readonly skipped: number;
+  readonly changed: boolean;
+}
+
+/** The result of one legacy-to-lean conversion attempt. */
+type ConversionOutcome = "converted" | "existing" | "unconvertible";
+
 export interface SearchInput {
   readonly query?: string;
   readonly source?: string;
@@ -202,11 +217,6 @@ export interface SearchInput {
    * fetch either way; only explicit sync/fetch commands touch the network.
    */
   readonly allowIncomplete?: boolean;
-  /**
-   * Include soft-redacted facts in search hits. Default false: redacted
-   * facts stay in history and snapshot bytes but leave search results.
-   */
-  readonly includeRedacted?: boolean;
 }
 
 export interface SearchHit {
@@ -274,12 +284,7 @@ class NotesRefValidationError extends Error {
   }
 }
 
-/**
- * The staged gate has no commit note to read, so it cannot see a durable
- * lineage edge or a retirement. Rather than inventing a transient green, the
- * diagnostic names the route that does close the obligation and the gates where
- * that evidence exists.
- */
+/** One rename or copy candidate from Git's raw diff, with its similarity score. */
 type SimilarityCandidate = {
   readonly from: { readonly path: string; readonly subject: SubjectId };
   readonly to: { readonly path: string; readonly subject: SubjectId };
@@ -378,7 +383,8 @@ export interface SnapshotStats {
   readonly notesRead: number;
   readonly bytesRead: number;
   readonly notesParsed: number;
-  readonly indexHit: boolean;
+  /** Record lines skipped because their type is unknown to this build. */
+  readonly legacyRecords: number;
 }
 
 export interface EvidenceSnapshotView {
@@ -407,16 +413,11 @@ function emptySnapshotView(limits: Readonly<ResourceLimits>): EvidenceSnapshotVi
     diagnostics: [],
     diagnosticsTruncated: false,
     limits,
-    stats: { notesListed: 0, notesRead: 0, bytesRead: 0, notesParsed: 0, indexHit: false },
+    stats: { notesListed: 0, notesRead: 0, bytesRead: 0, notesParsed: 0, legacyRecords: 0 },
   };
 }
 
 export class Reveries {
-  /**
-   * Injected signing material (RVR-009). Both are optional: a repository that
-   * never signs needs neither, and the ports let a caller substitute a Git SSH
-   * backend for the default in-process ed25519 one without changing any caller.
-   */
   private constructor(
     /**
      * Evidence reads run through this suppressed handle: no read may lazily
@@ -425,10 +426,10 @@ export class Reveries {
      */
     readonly repository: GitRepository,
     /**
-     * Explicit network operations (fetch, push, ls-remote) and only those
-     * use the live handle. RVR-016 note: the notes-mutation retry/replay
-     * loop stays on `repository` (suppressed) and publishes through the
-     * lock-free `withNotesWrite` compare-and-swap via `mutateNotes`.
+     * Explicit network operations (fetch, push, ls-remote) and only those use
+     * the live handle. The notes-mutation retry/replay loop stays on
+     * `repository` (suppressed) and publishes through the lock-free
+     * `withNotesWrite` compare-and-swap via `mutateNotes`.
      */
     private readonly liveRepository: GitRepository,
   ) {}
@@ -977,8 +978,8 @@ export class Reveries {
    * Load every note under one evidence tip with exactly one parse per note.
    * Bodies travel through the size-gated batch reader, so oversized input is
    * rejected before any body loads. The view carries parsed records, per-note
-   * projections, the global ID map, source backlinks, and init discovery, so
-   * validation, search, and retention share it instead of rescanning notes.
+   * projections, and the global ID map, so validation, search, and retention
+   * share it instead of rescanning notes.
    */
   async loadEvidenceSnapshot(options: SnapshotLoadOptions = {}): Promise<EvidenceSnapshotView> {
     const ref = options.ref ?? NOTES_REF;
@@ -987,21 +988,19 @@ export class Reveries {
     if (tip === null) return emptySnapshotView(limits);
     const listed = await this.repository.listNotes(ref);
     const bodies = await this.repository.readNotesBatch(listed, { limits: options.limits });
-    return this.buildSnapshotView(tip, listed, bodies, limits, false);
+    return this.buildSnapshotView(tip, listed, bodies, limits);
   }
 
   /**
-   * Load the snapshot through the disposable file index. A hit parses the same
-   * bodies once from the cache; a miss, a deletion, or corruption rebuilds
-   * from Git and rewrites the index. The index is never authority: every view
-   * derives from note bodies either way.
+   * Build a view from already-loaded note bodies. Every view derives from note
+   * bodies; there is no index and no cached state, so deleting anything the
+   * reader wrote has zero semantic effect.
    */
   private async buildSnapshotView(
     tip: ObjectId,
     listed: readonly NoteListEntry[],
     bodies: ReadonlyMap<ObjectId, string | null>,
     limits: Readonly<ResourceLimits>,
-    indexHit: boolean,
   ): Promise<EvidenceSnapshotView> {
     const format = await this.repository.objectFormat();
     const details = await this.repository.batchObjectDetails(listed.map((item) => item.object));
@@ -1010,6 +1009,7 @@ export class Reveries {
     let diagnosticsTruncated = false;
     let bytesRead = 0;
     let notesRead = 0;
+    let legacyRecords = 0;
     const pushDiagnostic = (diagnostic: Diagnostic): void => {
       if (diagnostics.length >= limits.maxDiagnostics) {
         diagnosticsTruncated = true;
@@ -1026,8 +1026,10 @@ export class Reveries {
       notesRead += 1;
       bytesRead += Buffer.byteLength(body, "utf8");
       let records: NoteRecord[];
+      let unknown = 0;
       try {
-        const parsed = parseNote(body, "strict", { limits });
+        const parsed = parseNote(body, "strict", { limits, ignoreUnknown: true });
+        unknown = parsed.unknown;
         records = validateNote(parsed, { limits });
         for (const record of records) {
           if (record.type === "lineage") {
@@ -1056,6 +1058,7 @@ export class Reveries {
         });
         continue;
       }
+      legacyRecords += unknown;
       const projection = projectActiveReveries(
         records.filter((record): record is ReverieRecord => record.type === "reverie"),
       );
@@ -1103,7 +1106,7 @@ export class Reveries {
         notesRead,
         bytesRead,
         notesParsed: notesRead,
-        indexHit,
+        legacyRecords,
       },
     };
   }
@@ -1202,9 +1205,10 @@ export class Reveries {
           if (!(await hasReverie(source.ref))) throw new Error(`Referenced reverie does not exist: ${source.ref}`);
         } else if (source.kind === "git-email") {
           if (!/^[^\s@]+@[^\s@]+$/.test(source.ref)) throw new Error(`Invalid Git email source: ${source.ref}`);
-        } else if (!/^(?:github|gitlab|linear|jira|generic):\S+$/.test(source.ref)) {
-          throw new Error(`Invalid issue source: ${source.ref}`);
         }
+        // An `issue` source is an opaque external reference: the core stores
+        // kind, reference, relation, and an optional timestamp and does not
+        // validate a tracker's grammar. Hosted systems stay outside the core.
       }
     }
   }
@@ -1244,10 +1248,6 @@ export class Reveries {
       ? promisor ? "promisor-object-missing" : shallow ? "shallow-boundary" : "unknown"
       : cloneEvidenceGrade({ shallow, promisor });
     return new IncompleteEvidenceError({ grade, reasons, authoritative: false });
-  }
-
-  async cachedSearch(input: SearchInput): Promise<readonly SearchHit[]> {
-    return this.searchWithView(await this.loadEvidenceSnapshot({}), input);
   }
 
   private async searchWithView(view: EvidenceSnapshotView, input: SearchInput): Promise<readonly SearchHit[]> {
@@ -1295,23 +1295,15 @@ export class Reveries {
   }
 
   /**
-   * Fetch a remote's notes and decide what may happen to canonical state.
-   *
-   * The role decides the outcome before anything is merged (RVR-017). Only the
-   * primary, and any remote that declared no role at all, may promote into
-   * `refs/notes/reveries`. A mirror, an import-only remote, and anything else
-   * non-primary runs the identical full-snapshot validation and is then
-   * *quarantined*: the evidence is preserved and inspectable at a quarantine ref
-   * while the canonical ref is left exactly as it was. An archive is not a
-   * synchronization source and is refused before any fetch.
-   */
-  /**
-   * Fetch a remote's notes and merge them into the canonical ref.
+   * Fetch a remote's notes, merge them into the canonical ref, and refresh the
+   * retention ref.
    *
    * The union is a plain `cat_sort_uniq` merge, so it is deterministic and
-   * idempotent. There is no quarantine and no promotion gate: a reader
-   * discovers a conflicting duplicate ID from `reveries doctor`, which never
-   * blocks the union.
+   * idempotent. There is no quarantine and no promotion gate: a record type
+   * this build does not know is preserved, and a conflicting duplicate ID is
+   * refused and reported by `reveries doctor`. Retention is a deterministic
+   * function of the merged evidence, so it is rebuilt locally rather than
+   * fetched; a failure to rebuild is a diagnostic, never silent.
    */
   async syncPull(remote: string): Promise<SyncResult> {
     const fetched = await this.liveRepository.fetchNotes(remote);
@@ -1335,9 +1327,21 @@ export class Reveries {
         state: "fetched",
       };
     }
-    return { ok: true, diagnostics: [], state: "fetched" };
+    const diagnostics: string[] = [];
+    try {
+      await this.retain();
+    } catch (error: unknown) {
+      diagnostics.push(`Retention was not refreshed after the merge: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { ok: diagnostics.length === 0, diagnostics, state: "fetched" };
   }
 
+  /**
+   * Refresh retention, then publish HEAD, the notes ref, and the retention ref
+   * in one atomic transaction. Refreshing first keeps the published anchor a
+   * function of the notes being published. A plain `git push` of the same refs
+   * is equally valid; this command only adds the single transaction.
+   */
   async push(remote: string): Promise<CheckResult> {
     const branchResult = await this.repository.run(
       ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -1347,16 +1351,25 @@ export class Reveries {
     if (branchResult.exitCode !== 0 || branch.length === 0) {
       return { ok: false, diagnostics: ["Publishing requires an attached branch"] };
     }
+    try {
+      await this.retain();
+    } catch (error: unknown) {
+      return { ok: false, diagnostics: [`Retention was not refreshed before publication: ${error instanceof Error ? error.message : String(error)}`] };
+    }
     const branchRef = `refs/heads/${branch}`;
     const branchRemote = await this.liveRepository.remoteObject(remote, branchRef);
     const notesTip = await this.repository.notesTip();
     const notesRemote = notesTip === null ? null : await this.liveRepository.remoteObject(remote, NOTES_REF);
+    const retentionTip = await this.repository.notesTip(RETENTION_REF);
+    const retentionRemote = retentionTip === null ? null : await this.liveRepository.remoteObject(remote, RETENTION_REF);
     try {
       await this.liveRepository.pushAtomically(remote, {
         branchRef,
         expectedBranch: branchRemote,
         includeNotes: notesTip !== null,
         ...(notesTip === null ? {} : { expectedNotes: notesRemote }),
+        includeRetention: retentionTip !== null,
+        ...(retentionTip === null ? {} : { expectedRetention: retentionRemote }),
       });
     } catch (error: unknown) {
       return { ok: false, diagnostics: [error instanceof Error ? error.message : String(error)] };
@@ -1471,15 +1484,300 @@ export class Reveries {
     return { ...(await this.retentionStatus(policy)), changed: true };
   }
 
+  /**
+   * Convert legacy records into lean `reverie` and `lineage` evidence where the
+   * subject is unambiguous, and report what cannot be converted.
+   *
+   * The migration never deletes bytes: a legacy record stays in its note and is
+   * preserved by the tolerant reader. It only appends new lean records, so it is
+   * idempotent and safe to rerun. A `session-summary` attached to a commit has no
+   * exact content subject, so its narration stays historical and is reported as
+   * unconverted rather than reinterpreted onto a commit or a tree it never named.
+   */
+  async migrate(): Promise<MigrationReport> {
+    const view = await this.loadEvidenceSnapshot({});
+    const existingReverieIds = new Set<string>([...view.byId.keys()].map(String));
+    const existingLineageIds = new Set<string>();
+    for (const list of view.lineages.values()) {
+      for (const edge of list) existingLineageIds.add(String(edge.id));
+    }
+    const listed = await this.repository.listNotes(NOTES_REF);
+    const bodies = await this.repository.readNotesBatch(listed, {});
+    const hashObject = (bytes: Uint8Array): ObjectId => this.repository.hashObjectSync(bytes);
+    const report = {
+      notesScanned: 0,
+      lean: 0,
+      configurationRecords: 0,
+      convertedReveries: 0,
+      convertedLineages: 0,
+      unconverted: 0,
+      skipped: 0,
+      changed: false,
+    };
+    for (const entry of listed) {
+      const body = bodies.get(entry.object);
+      if (body === null || body === undefined) continue;
+      report.notesScanned += 1;
+      const objectType = await this.repository.objectType(entry.object);
+      for (const line of body.split("\n")) {
+        if (line.length === 0) continue;
+        let raw: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(line);
+          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+          raw = parsed as Record<string, unknown>;
+        } catch {
+          report.skipped += 1;
+          continue;
+        }
+        const type = raw.type;
+        if (type === "reverie" || type === "lineage") {
+          report.lean += 1;
+          continue;
+        }
+        if (type === "reveries-init") {
+          report.configurationRecords += 1;
+          continue;
+        }
+        if (type === "session-summary") {
+          const entries = Array.isArray(raw.entries) ? raw.entries : [];
+          if (objectType === "blob" || objectType === "tree") {
+            for (const item of entries) {
+              const outcome = await this.convertEntryToReverie(entry.object, item, raw, hashObject, existingReverieIds);
+              if (outcome === "converted") {
+                report.convertedReveries += 1;
+                report.changed = true;
+              } else if (outcome === "unconvertible") {
+                report.unconverted += 1;
+              }
+              // A retirement inside a content-attached summary has no commit
+              // context, so it stays historical.
+              report.unconverted += this.retirementCount(item);
+            }
+          } else if (objectType === "commit") {
+            // A commit-attached summary names no exact content subject for its
+            // narration, but each retirement names a predecessor subject and the
+            // commit names the change, so the retirement maps to a retire edge.
+            for (const item of entries) {
+              report.unconverted += 1;
+              const retired = await this.convertRetirements(commitId(entry.object), item, raw, hashObject, existingLineageIds);
+              report.convertedLineages += retired.converted;
+              report.unconverted += retired.unconverted;
+              if (retired.converted > 0) report.changed = true;
+            }
+          } else {
+            report.unconverted += entries.length;
+          }
+          continue;
+        }
+        if (type === "transition-summary") {
+          if (objectType === "tree") {
+            const outcome = await this.convertTransitionToReverie(entry.object, raw, hashObject, existingReverieIds);
+            if (outcome === "converted") {
+              report.convertedReveries += 1;
+              report.changed = true;
+            } else if (outcome === "unconvertible") {
+              report.unconverted += 1;
+            }
+          } else {
+            report.unconverted += 1;
+          }
+          continue;
+        }
+        report.unconverted += 1;
+      }
+    }
+    return report;
+  }
+
+  /**
+   * Convert a legacy entry's `retirements[]` into `retire` lineage edges. Each
+   * retirement names a predecessor subject (`from_blob`) and the summary names
+   * the commit, so the edge is unambiguous when the subject resolves to exactly
+   * one path at the commit's first parent. Anything else stays historical.
+   */
+  private async convertRetirements(
+    commit: CommitId,
+    entry: unknown,
+    legacy: Record<string, unknown>,
+    hashObject: (bytes: Uint8Array) => ObjectId,
+    existing: Set<string>,
+  ): Promise<{ readonly converted: number; readonly unconverted: number }> {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return { converted: 0, unconverted: 0 };
+    }
+    const value = entry as Record<string, unknown>;
+    const retirements = Array.isArray(value.retirements) ? value.retirements : [];
+    if (retirements.length === 0) return { converted: 0, unconverted: 0 };
+    const metadata = this.legacyMetadata(legacy);
+    let parent: CommitId;
+    try {
+      parent = await this.repository.resolveCommit(`${commit}~1`);
+    } catch {
+      return { converted: 0, unconverted: retirements.length };
+    }
+    let converted = 0;
+    let unconverted = 0;
+    for (const item of retirements) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        unconverted += 1;
+        continue;
+      }
+      const retirement = item as Record<string, unknown>;
+      const from = retirement.from_blob;
+      const reason = retirement.reason;
+      if (typeof from !== "string" || typeof reason !== "string" || reason.trim().length === 0 || metadata === null) {
+        unconverted += 1;
+        continue;
+      }
+      let paths: readonly string[];
+      try {
+        paths = await this.repository.pathsForSubject(objectId(from), parent);
+      } catch {
+        paths = [];
+      }
+      if (paths.length !== 1) {
+        unconverted += 1;
+        continue;
+      }
+      const record = createLineage(
+        {
+          v: 1,
+          kind: "retire",
+          parent,
+          commit,
+          from: [{ path: paths[0] as string, subject: objectId(from) }],
+          to: [],
+          transition: null,
+          driving_event: typeof value.driving_event === "string" ? value.driving_event : reason,
+          decision: reason,
+          impact: typeof value.impact === "string" ? value.impact : reason,
+          recurrence_control: typeof value.recurrence_control === "string" ? value.recurrence_control : null,
+          alternatives: this.legacyStrings(value.alternatives),
+          sources: this.legacySources(value.sources),
+        },
+        metadata,
+        hashObject,
+      );
+      if (existing.has(String(record.id))) {
+        continue;
+      }
+      await this.appendRecord(objectId(from), record);
+      existing.add(String(record.id));
+      converted += 1;
+    }
+    return { converted, unconverted };
+  }
+
+  private retirementCount(entry: unknown): number {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return 0;
+    const retirements = (entry as Record<string, unknown>).retirements;
+    return Array.isArray(retirements) ? retirements.length : 0;
+  }
+
+  /** Append one `reverie` from a legacy causal entry. */
+  private async convertEntryToReverie(
+    object: ObjectId,
+    entry: unknown,
+    legacy: Record<string, unknown>,
+    hashObject: (bytes: Uint8Array) => ObjectId,
+    existing: Set<string>,
+  ): Promise<ConversionOutcome> {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return "unconvertible";
+    const value = entry as Record<string, unknown>;
+    const semantic = this.legacySemantic(value, legacy);
+    if (semantic === null) return "unconvertible";
+    const metadata = this.legacyMetadata(legacy);
+    if (metadata === null) return "unconvertible";
+    const record = createReverie(semantic, metadata, hashObject);
+    if (existing.has(String(record.id))) return "existing";
+    await this.appendRecord(object, record);
+    existing.add(String(record.id));
+    return "converted";
+  }
+
+  /** Append one `reverie` from a legacy transition-summary. */
+  private async convertTransitionToReverie(
+    object: ObjectId,
+    legacy: Record<string, unknown>,
+    hashObject: (bytes: Uint8Array) => ObjectId,
+    existing: Set<string>,
+  ): Promise<ConversionOutcome> {
+    const semantic = this.legacySemantic(legacy, legacy);
+    if (semantic === null) return "unconvertible";
+    const metadata = this.legacyMetadata(legacy);
+    if (metadata === null) return "unconvertible";
+    const record = createReverie(semantic, metadata, hashObject);
+    if (existing.has(String(record.id))) return "existing";
+    await this.appendRecord(object, record);
+    existing.add(String(record.id));
+    return "converted";
+  }
+
+  /** Map the causal fields a legacy record shares with a lean reverie. */
+  private legacySemantic(
+    value: Record<string, unknown>,
+    legacy: Record<string, unknown>,
+  ): ReverieInput | null {
+    const driving = value.driving_event ?? legacy.driving_event;
+    const decision = value.decision ?? legacy.decision;
+    const impact = value.impact ?? legacy.impact;
+    if (typeof driving !== "string" || typeof decision !== "string" || typeof impact !== "string") return null;
+    const recurrence = value.recurrence_control ?? legacy.recurrence_control;
+    return {
+      v: 1,
+      driving_event: driving,
+      decision,
+      impact,
+      recurrence_control: typeof recurrence === "string" ? recurrence : null,
+      alternatives: this.legacyStrings(value.alternatives ?? legacy.alternatives),
+      sources: this.legacySources(value.sources ?? legacy.sources),
+      supersedes: [],
+    };
+  }
+
+  private legacyMetadata(legacy: Record<string, unknown>): ReverieMetadata | null {
+    const author = legacy.author_email;
+    const created = legacy.created_at;
+    if (typeof author !== "string" || typeof created !== "string") return null;
+    return {
+      author_email: author,
+      session: typeof legacy.session === "string" ? legacy.session : null,
+      created_at: created,
+    };
+  }
+
+  private legacyStrings(value: unknown): string[] {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  }
+
+  private legacySources(value: unknown): Source[] {
+    if (!Array.isArray(value)) return [];
+    const sources: Source[] = [];
+    for (const item of value) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+      const source = item as Record<string, unknown>;
+      if (typeof source.relation !== "string" || typeof source.kind !== "string" || typeof source.ref !== "string") continue;
+      sources.push({
+        relation: source.relation as Source["relation"],
+        kind: source.kind as Source["kind"],
+        ref: source.ref,
+        ...(typeof source.at === "string" ? { at: commitId(source.at) } : {}),
+      });
+    }
+    return sources;
+  }
+
   // ---------------------------------------------------------------------------
-  // Ledger envelope (RVR-005)
+  // Integrity reporting
   // ---------------------------------------------------------------------------
 
   /**
-   * Verify a ledger checkpoint against its own manifest, tree, and parents.
-   * Fails closed: any structural disagreement is a diagnostic, never a warning.
-   * A notes tip that merely leads the envelope is staleness, reported by
-   * `ledgerStatus`, not a verification failure.
+   * Report the integrity of the notes ref and the retention ref. Exits
+   * non-zero only for damage: a malformed note, a record whose ID does not
+   * match its semantic content, or a retained object that no longer resolves.
+   * A record type this build does not know is preserved bytes, reported as a
+   * notice, never damage.
    */
   async doctor(): Promise<DoctorResult> {
     const diagnostics: string[] = [];
@@ -1549,7 +1847,14 @@ export class Reveries {
       // A temp-ref listing failure is not a diagnosis.
     }
     try {
-      await this.validateNotesRef(NOTES_REF);
+      const view = await this.loadEvidenceSnapshot({ ref: NOTES_REF });
+      await this.validateNotesSnapshot(view);
+      if (view.stats.legacyRecords > 0) {
+        notices.push(
+          `${view.stats.legacyRecords} note record(s) use a type this build does not know; `
+          + "they are preserved and ignored, not damage. Run reveries migrate to convert what maps.",
+        );
+      }
     } catch (error: unknown) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }
@@ -1587,7 +1892,7 @@ export class Reveries {
     };
   }
 
-  private async appendRecord(object: ObjectId, record: ReverieRecord): Promise<void> {
+  private async appendRecord(object: ObjectId, record: NoteRecord): Promise<void> {
     await this.mutateNotes(async (notes) => {
       await notes.append(object, canonicalRecord(record));
     });
@@ -1695,7 +2000,7 @@ export class Reveries {
     if (note === null) {
       return { records: [], projection: projectActiveReveries([]) };
     }
-    const parsed = parseNote(note, "strict", { verifyIds: false });
+    const parsed = parseNote(note, "strict", { verifyIds: false, ignoreUnknown: true });
     const records = validateNote(parsed, { verifyIds: false });
     for (const record of records) {
       if (record.type === "lineage") {

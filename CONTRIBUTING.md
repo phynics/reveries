@@ -11,11 +11,11 @@ npm ci
 npm run build
 npm run typecheck
 npm run test:full
-npm run verify          # build + typecheck + full test + 20 PRD acceptance criteria
+npm run verify          # build + typecheck + full test + 25 PRD acceptance criteria
 ```
 
 `npm run verify` is the release gate. It runs `scripts/direct-git-acceptance.mjs`, which drives
-the 20 PRD acceptance criteria against the built CLI and raw Git in disposable repositories.
+the 25 PRD acceptance criteria against the built CLI and raw Git in disposable repositories.
 `scripts/evaluate-local.mjs` maps every criterion to its passing step. CI runs the same gate on
 Node 22 and, in a container, on Git 2.39.
 

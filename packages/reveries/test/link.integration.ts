@@ -161,9 +161,14 @@ test("the CLI exposes link and points the removed lineage record form at it", as
 test("link suggest prints a runnable link command and never asserts evidence", async () => {
   const directory = await createRepository();
   const reveries = await Reveries.open(directory);
+  await writeFile(join(directory, "state.txt"), "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n", "utf8");
+  await git(directory, "add", "state.txt");
+  await git(directory, "commit", "-m", "expand");
   await reveries.recordNew({ path: "state.txt", revision: "HEAD", semantic, metadata });
   await git(directory, "mv", "state.txt", "moved.txt");
-  await git(directory, "commit", "-m", "rename");
+  await writeFile(join(directory, "moved.txt"), "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\n", "utf8");
+  await git(directory, "add", "-A");
+  await git(directory, "commit", "-m", "rename and edit");
 
   const suggestions = await reveries.suggestLineage({ revision: "HEAD" });
   for (const suggestion of suggestions.suggestions) {
@@ -180,6 +185,7 @@ test("link suggest prints a runnable link command and never asserts evidence", a
   assert.equal(await runCli(["link", "suggest", "HEAD", "--json"], io), 0);
   const parsed = JSON.parse(out) as { command: string; result: { suggestions: Array<{ record: string; confirmed: boolean }> } };
   assert.equal(parsed.command, "link suggest");
+  assert.ok(parsed.result.suggestions.length > 0, "a rename with an edit must yield a candidate");
   for (const suggestion of parsed.result.suggestions) {
     assert.equal(suggestion.confirmed, false);
     assert.match(suggestion.record, /^reveries link /);

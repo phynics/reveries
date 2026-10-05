@@ -65,6 +65,14 @@ boundary, the receive gate, hosted workflows, merge bots, and host adapters. Eac
 decided when a commit, a push, or a merge was allowed. That decision belongs to the operator and
 to ordinary Git, not to an evidence store.
 
+## Legacy bytes and migration
+
+A record type this build does not know is preserved bytes, not damage. The ref-wide read and
+write path skips it, so an earlier version's evidence never blocks a mutation, a notes merge, or
+`doctor`; `doctor` counts it as a notice. `reveries migrate` converts the legacy records whose
+subject is unambiguous into lean `reverie` or `lineage` evidence and reports the rest, without
+deleting any bytes.
+
 ## Tradeoffs accepted
 
 - We accept explicit protocol serializers in exchange for byte-exact output.

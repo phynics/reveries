@@ -9,7 +9,6 @@ import { afterEach, test } from "node:test";
 import {
   GitRepository,
   NOTES_REF,
-  RETENTION_BUNDLE_REFS,
   RETENTION_REF,
 } from "../src/git.ts";
 import { blobId, type ObjectId } from "../src/protocol.ts";
@@ -260,13 +259,6 @@ test("retention removal requires the expected current tip", async () => {
 
   await repository.deleteRetentionRef(first);
   assert.equal(await repository.notesTip(RETENTION_REF), null);
-});
-
-test("retention bundle refs name notes and retention", async () => {
-  assert.deepEqual(RETENTION_BUNDLE_REFS, [
-    "refs/notes/reveries",
-    "refs/reveries/retention",
-  ]);
 });
 
 test("fetching an unpublished remote notes ref reports absence without failing", async () => {

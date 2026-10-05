@@ -14,12 +14,9 @@ export type ReverieId = Brand<`rv:${string}`, "reverie-id">;
 export type LineageId = Brand<`lg:${string}`, "lineage-id">;
 
 /**
- * Heads a correction or resolution edge may name: reveries and the new
- * immutable fact kinds. Transition facts keep their RVR-004 identity and
- * fail-closed duplicate handling; they are never superseded, only redacted.
- * Occurrence and lineage records are nodes here (RVR-014): they carry no
- * outgoing edges of their own, so reusing this graph keeps them correctable
- * and conflict-visible instead of inventing a parallel supersession graph.
+ * How a source reference relates to the decision. The core stores the relation,
+ * the kind, an opaque reference, and an optional timestamp; it does not model
+ * the referenced system.
  */
 export type SourceRelation =
   | "caused-by"
@@ -117,7 +114,8 @@ export type LineageSemantic = {
   commit: CommitId;
   from: LineageEndpoint[];
   to: LineageEndpoint[];
-  /** The RVR-004 tree transition this relation belongs to, when one exists. */
+  /** The reserved transition slot, always null in the lean core. Kept because
+   * the lineage identity hashes it; see `protocol/v1.md`. */
   transition: TransitionId | null;
   driving_event: string;
   decision: string;
@@ -136,9 +134,8 @@ export type LineageSemantic = {
  * supersession, or a causal retirement. This is what keeps an edge from
  * becoming a back door around per-decision continuity.
  *
- * It rides the note of `commit`, beside that commit's session summary, so an
- * edge is bound to the exact parent→commit change it describes and travels
- * with publication of that commit's evidence.
+ * It rides the note of every endpoint subject, so an edge is discoverable from
+ * either end and travels with publication of that evidence.
  */
 export type LineageRecord = LineageSemantic & ReverieMetadata & {
   type: "lineage";
@@ -147,13 +144,6 @@ export type LineageRecord = LineageSemantic & ReverieMetadata & {
 
 export type LineageInput = LineageSemantic;
 
-/**
- * Signed payload domains (RVR-009). The domain is inside the signed payload, so
- * a signature produced for a fact record can never be replayed as a checkpoint
- * signature or vice versa. Both are fixed strings: a caller may not invent a
- * domain, because a self-chosen domain would let a signer assert a scope this
- * protocol never agreed to.
- */
 /** The lean core defines exactly two record types. */
 export type NoteRecord = ReverieRecord | LineageRecord;
 
@@ -179,6 +169,12 @@ export type ParsedNote = {
   records: NoteRecord[];
   diagnostics: Diagnostic[];
   truncated: boolean;
+  /**
+   * Record lines skipped because their type is unknown to this build. They are
+   * preserved bytes from an earlier or future version, never damage: a reader
+   * reports the count but does not reject the note.
+   */
+  unknown: number;
 };
 
 export type ResourceLimits = {
@@ -190,21 +186,9 @@ export type ResourceLimits = {
   maxAlternatives: number;
   maxSources: number;
   maxSupersedes: number;
-  maxReveries: number;
-  maxRetirements: number;
-  maxEntries: number;
-  maxParents: number;
   maxGraphVisits: number;
   maxDiagnostics: number;
-  maxCorrections: number;
-  maxResolutions: number;
-  maxRedactions: number;
-  maxResolves: number;
-  maxSignatures: number;
-  maxSignaturesPerTarget: number;
-  /** RVR-014: occurrence records on one note. */
-  maxOccurrences: number;
-  /** RVR-014: `from`/`to` endpoints on one lineage edge. */
+  /** `from`/`to` endpoints on one lineage edge. */
   maxLineageRefs: number;
 };
 
@@ -217,19 +201,8 @@ export const DEFAULT_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxAlternatives: 32,
   maxSources: 64,
   maxSupersedes: 64,
-  maxReveries: 64,
-  maxRetirements: 64,
-  maxEntries: 64,
-  maxParents: 64,
   maxGraphVisits: 131_072,
   maxDiagnostics: 32,
-  maxCorrections: 64,
-  maxResolutions: 64,
-  maxRedactions: 64,
-  maxResolves: 64,
-  maxSignatures: 64,
-  maxSignaturesPerTarget: 16,
-  maxOccurrences: 64,
   maxLineageRefs: 64,
 });
 
@@ -326,7 +299,6 @@ const RELATIONS = new Set<SourceRelation>([
 ]);
 const KINDS = new Set<SourceKind>(["commit", "blob", "tree", "path", "note", "git-email", "issue"]);
 const EMAIL = /^[^\s@]+@[^\s@]+$/;
-const ISSUE = /^(?:github:[^\s#]+\/[^\s#]+#\d+|gitlab:[^\s#]+\/[^\s#]+#\d+|linear:[A-Z][A-Z0-9]*-\d+|jira:[A-Z][A-Z0-9]*-\d+|generic:[^\s:]+:[^\s:]+)$/;
 
 export function objectId(value: string): ObjectId {
   if (!HEX_OBJECT_ID.test(value)) throw new Error(`Invalid Git object ID: ${value}`);
@@ -351,7 +323,7 @@ export function lineageId(value: string): LineageId {
   return value as LineageId;
 }
 
-/** Parse the distinct wire syntax for an opaque confidential-evidence locator. */
+/** Parse the region descriptor for an exact source region. */
 function trimText(value: string, field: string): string {
   const trimmed = value.trim();
   if (!trimmed) throw new Error(`${field} must be a nonempty string`);
@@ -637,10 +609,9 @@ export function createLineage(
 }
 
 /**
- * The exact bytes hashed for a signature identity: the whole attestation
- * except its own ID. Including the signature bytes is deliberate, so two
- * different signers over the same target are two distinct records rather than
- * one record with ambiguous content.
+ * The canonical key order for one record. The `id` is the content hash of the
+ * semantic payload, not of these bytes, so metadata such as `author_email`,
+ * `session`, and `created_at` never changes an identity.
  */
 function canonicalRecordValue(record: NoteRecord): Record<string, unknown> {
   if (record.type === "reverie") {
@@ -716,7 +687,9 @@ function validateSource(source: unknown, limits: Readonly<ResourceLimits> = DEFA
   if (value.kind === "commit" || value.kind === "blob" || value.kind === "tree") objectId(value.ref);
   else if (value.kind === "note") reverieId(value.ref);
   else if (value.kind === "git-email") validateEmail(value.ref, "source.ref", limits);
-  else if (value.kind === "issue" && !ISSUE.test(value.ref)) throw new Error("invalid issue source reference");
+  // An `issue` source is an opaque external reference (kind, ref, relation,
+  // optional timestamp). The core does not know GitHub, Linear, or Jira and
+  // must not validate a tracker's grammar; a nonempty ref is the whole rule.
 }
 
 function validateLineage(
@@ -781,13 +754,21 @@ export type ValidateOptions = {
   verifyIds?: boolean;
   limits?: Partial<ResourceLimits>;
   /**
-   * How to treat unions that are structurally valid but forked: conflicting
-   * duplicate fact IDs or concurrent session summaries. `reject` (default)
-   * fails closed so sync and mutation paths keep quarantine behavior;
-   * `project` keeps every record so the projection can surface the fork.
-   * Malformed bytes and limit violations always throw.
+   * How to treat unions that are structurally valid but forked: a conflicting
+   * duplicate ID or a forked supersession. `reject` (the default) fails closed
+   * so sync and mutation paths never accept damaged evidence; `project` keeps
+   * every record so the projection can surface the conflict. Malformed bytes
+   * and limit violations always throw.
    */
   forkPolicy?: ForkPolicy;
+  /**
+   * When true, a record whose type this build does not know is skipped and
+   * preserved instead of rejected, in strict mode as well as tolerant mode.
+   * This is the ref-wide read and write path: legacy bytes from an earlier
+   * version must never block a mutation, a merge, or `doctor`. Malformed bytes
+   * and invalid known records still fail.
+   */
+  ignoreUnknown?: boolean;
 };
 
 /**
@@ -854,11 +835,12 @@ export function parseNote(
   const limits = resolveLimits(options.limits);
   assertNoteSize(utf8Length(text), limits);
   let truncated = false;
+  let unknown = 0;
   const pushDiagnostic = (diagnostic: Diagnostic): void => {
     if (diagnostics.length < limits.maxDiagnostics) diagnostics.push(diagnostic);
     else truncated = true;
   };
-  if (text.length === 0) return { records, diagnostics, truncated };
+  if (text.length === 0) return { records, diagnostics, truncated, unknown };
   if (!text.endsWith("\n")) {
     const diagnostic = { message: "note must end with one LF" };
     if (mode === "strict") throw new Error(diagnostic.message);
@@ -888,11 +870,15 @@ export function parseNote(
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("record must be a JSON object");
       const type = (raw as { type?: unknown }).type;
       // Lean readers keep unknown bytes (legacy or future records) untouched
-      // and never interpret them. Tolerant mode skips them silently; strict
-      // mode still refuses a record this build cannot validate.
+      // and never interpret them. They are preserved and counted, never
+      // rejected on the ref-wide path (`ignoreUnknown`); strict mode without
+      // that option still refuses a record this build cannot validate.
       if (typeof type !== "string" || !KNOWN_RECORD_TYPES.has(type)) {
-        if (mode === "strict") throw new Error(`unknown record type: ${String(type)}`);
-        continue;
+        if (options.ignoreUnknown === true || mode === "tolerant") {
+          unknown += 1;
+          continue;
+        }
+        throw new Error(`unknown record type: ${String(type)}`);
       }
       const parsed = asRecord(raw);
       validateRecord(parsed, options.hashObject, limits);
@@ -905,7 +891,7 @@ export function parseNote(
     }
   }
   if (mode === "strict") validateNote(records, { ...options, verifyIds: options.hashObject !== undefined });
-  return { records, diagnostics, truncated };
+  return { records, diagnostics, truncated, unknown };
 }
 
 /**

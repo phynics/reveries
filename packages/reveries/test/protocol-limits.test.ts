@@ -27,9 +27,6 @@ test("default limits define deterministic per-note, per-record, and diagnostic b
   assert.equal(DEFAULT_LIMITS.maxAlternatives, 32);
   assert.equal(DEFAULT_LIMITS.maxSources, 64);
   assert.equal(DEFAULT_LIMITS.maxSupersedes, 64);
-  assert.equal(DEFAULT_LIMITS.maxReveries, 64);
-  assert.equal(DEFAULT_LIMITS.maxRetirements, 64);
-  assert.equal(DEFAULT_LIMITS.maxEntries, 64);
   assert.equal(DEFAULT_LIMITS.maxGraphVisits, 131_072);
   assert.equal(DEFAULT_LIMITS.maxDiagnostics, 32);
   assert.ok(Object.isFrozen(DEFAULT_LIMITS));

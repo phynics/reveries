@@ -27,8 +27,9 @@ reveries doctor
 
 ## What to do next
 
-- Publish evidence with an ordinary `git push` of `refs/notes/reveries`, or use
-  `reveries push <remote>` for one atomic push of HEAD and the notes ref.
+- Publish evidence with an ordinary `git push` of `refs/notes/reveries` and
+  `refs/reveries/retention`, or use `reveries push <remote>` for one atomic push of HEAD, the
+  notes ref, and the retention ref.
 - Run `reveries retain` to anchor annotated subjects under `refs/reveries/retention`, so a
   pruning `git gc` cannot remove evidence for content no longer reachable from a branch.
 - To share evidence, add the fetch refspec

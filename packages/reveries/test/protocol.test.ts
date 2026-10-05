@@ -107,14 +107,29 @@ test("tolerant parsing preserves valid records and reports malformed lines", () 
   assert.match(parsed.diagnostics[0]?.message ?? "", /JSON/i);
 });
 
-test("strict validation rejects malformed source identities", () => {
-  assert.throws(
-    () => make({ sources: [{ relation: "caused-by", kind: "issue", ref: "github:not-an-issue" }] }),
-    /issue source/i,
-  );
+test("strict parsing preserves unknown record types when the ref asks it to", () => {
+  const known = canonicalRecord(make());
+  const legacy = '{"v":1,"type":"session-summary","id":"ss:x","summary":"legacy"}\n';
+  const preserved = parseNote(`${known}${legacy}`, "strict", { ignoreUnknown: true });
+  assert.equal(preserved.records.length, 1);
+  assert.equal(preserved.records[0]?.type, "reverie");
+  assert.equal(preserved.unknown, 1);
+  assert.equal(preserved.diagnostics.length, 0);
+  // Without the option, the same bytes are still refused in strict mode.
+  assert.throws(() => parseNote(`${known}${legacy}`, "strict"), /unknown record type/i);
+});
+
+test("issue sources stay opaque while typed sources are validated", () => {
+  // An issue reference is an opaque external reference, not a tracker grammar.
+  const opaque = make({ sources: [{ relation: "caused-by", kind: "issue", ref: "github:not-an-issue" }] });
+  assert.equal(opaque.sources[0]?.ref, "github:not-an-issue");
   assert.throws(
     () => make({ sources: [{ relation: "requested-by", kind: "git-email", ref: "invented-address" }] }),
     /email/i,
+  );
+  assert.throws(
+    () => make({ sources: [{ relation: "caused-by", kind: "issue", ref: "   " }] }),
+    /nonempty/i,
   );
 });
 

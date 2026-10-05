@@ -64,11 +64,14 @@ Read [lineage.md](references/lineage.md) for choosing a kind and for what stays 
 
 ## Share and preserve
 
-Publish evidence with an ordinary `git push` of `refs/notes/reveries`, or use
-`reveries push <remote>` for one atomic push of HEAD and the notes ref. Two clones combine
-their notes with the `cat_sort_uniq` merge strategy; run `reveries init` once to set it.
+Publish evidence with an ordinary `git push` of `refs/notes/reveries` and
+`refs/reveries/retention`, or use `reveries push <remote>` for one atomic push of HEAD, the
+notes ref, and the retention ref. Two clones combine their notes with the `cat_sort_uniq` merge
+strategy; run `reveries init` once to set it.
 
 Run `reveries retain` to anchor annotated subjects under `refs/reveries/retention`, so an
 aggressive `git gc` cannot prune evidence for content no longer reachable from a branch.
 Run `reveries doctor` to report integrity; it exits non-zero only for damage, never for a
-missing decision or an unbuilt retention ref.
+missing decision or an unbuilt retention ref. A record type the build does not know is
+preserved and counted as a notice, never damage; run `reveries migrate` to convert what maps to
+the lean records.

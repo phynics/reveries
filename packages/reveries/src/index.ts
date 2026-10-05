@@ -5,7 +5,6 @@ export {
   GitRepository,
   hashBlobContent,
   NotesContentionError,
-  NotesLockError,
   NOTES_TXN_REF_PREFIX,
 } from "./git.ts";
 export type {

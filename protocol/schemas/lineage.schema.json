@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://reveries.dev/protocol/v1/schemas/lineage.schema.json",
-  "title": "Reveries V2 lineage edge (RVR-014)",
+  "title": "Reveries V1 lineage edge",
   "description": "An explicit durable pairing between occurrences, bound to one direct parent and one result commit. It states which subjects are related and why, and discharges nothing: every decision on a predecessor still needs its own continuation, supersession, or causal retirement.",
   "type": "object",
   "additionalProperties": false,
@@ -262,8 +262,7 @@
             "path",
             "note",
             "git-email",
-            "issue",
-            "confidential-pointer"
+            "issue"
           ]
         },
         "ref": {
@@ -345,26 +344,6 @@
             "properties": {
               "ref": {
                 "$ref": "#/$defs/objectId"
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "kind": {
-                "const": "confidential-pointer"
-              }
-            },
-            "required": [
-              "kind"
-            ]
-          },
-          "then": {
-            "properties": {
-              "ref": {
-                "type": "string",
-                "pattern": "^vault:v1:[A-Za-z0-9_-]{43}$"
               }
             }
           }

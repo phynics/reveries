@@ -6,27 +6,22 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { initializeRepository, type HelperInvocation } from "./install.ts";
+import { initializeRepository } from "./install.ts";
 import { SUGGESTION_NOTICE, suggestionCommand } from "./lineage.ts";
 import { Reveries } from "./operations.ts";
 import {
   LINEAGE_KINDS,
-  blobId,
   commitId,
   objectId,
-  parseNote,
   reverieId,
   validateNote,
   type LineageKind,
-  type NoteRecord,
-  type ObjectId,
   type ReverieInput,
   type ReverieMetadata,
   type ReverieRecord,
   type Source,
   type SourceKind,
   type SourceRelation,
-  type SubjectId,
 } from "./protocol.ts";
 
 export type ExitCode = 0 | 1 | 2 | 3;
@@ -38,7 +33,6 @@ export interface CliIo {
   readonly stdin: () => Promise<string>;
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
-  readonly helper?: HelperInvocation;
   readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
@@ -77,6 +71,7 @@ Commands:
   search     Search current or historical engineering evidence
   history    Trace a path or reverie through history
   retain     Anchor annotated subjects under refs/reveries/retention
+  migrate    Convert legacy records into lean reverie or lineage evidence
   sync       Inspect or pull a publishing remote's notes
   push       Atomically push HEAD and refs/notes/reveries
 
@@ -185,20 +180,31 @@ active is the default. Only an explicit none policy removes the ref.
 Examples:
   reveries retain
 `,
+  migrate: `Usage: reveries migrate [--json]
+
+Convert legacy records into lean reverie or lineage evidence where the subject
+is unambiguous, and report what stays historical. Legacy bytes are never
+deleted: the migration only appends lean records, so it is idempotent. A
+session-summary attached to a commit names no exact content subject and is
+reported as unconverted rather than reinterpreted.
+Examples:
+  reveries migrate
+`,
   sync: `Usage: reveries sync [<remote>] (--status|--pull) [--json]
 
-Inspect or fetch a publishing remote's notes. Without a remote, use the
-branch upstream or the sole configured publishing remote.
+Inspect or fetch a publishing remote's notes. --pull fetches, merges the notes
+ref, and refreshes refs/reveries/retention. Without a remote, use the branch
+upstream or the sole configured publishing remote.
 Examples:
   reveries sync --status
   reveries sync --pull origin
 `,
   push: `Usage: reveries push [<remote>] [--json]
 
-Atomically publish HEAD and refs/notes/reveries. Without a remote, use the
-branch upstream or the sole configured publishing remote. A plain
-git push refs/notes/reveries is equally valid; this command only adds the
-single atomic ref transaction.
+Refresh retention, then atomically publish HEAD, refs/notes/reveries, and
+refs/reveries/retention. Without a remote, use the branch upstream or the sole
+configured publishing remote. A plain git push of the same refs is equally
+valid; this command only adds the single atomic ref transaction.
 Examples:
   reveries push
   reveries push origin
@@ -206,7 +212,6 @@ Examples:
 };
 
 function defaultIo(): CliIo {
-  const script = process.argv[1];
   return {
     cwd: process.cwd(),
     stdin: async () => {
@@ -218,9 +223,6 @@ function defaultIo(): CliIo {
     },
     stdout: (text) => process.stdout.write(text),
     stderr: (text) => process.stderr.write(text),
-    ...(script === undefined ? {} : {
-      helper: { command: process.execPath, args: [resolve(script)], verification: "self" as const },
-    }),
   };
 }
 
@@ -638,6 +640,14 @@ function humanOutput(
   context: HumanContext,
 ): string {
   const value = asRecord(result);
+  if (command === "init") {
+    const changed = Array.isArray(value?.changedFiles) ? value.changedFiles : [];
+    const next = Array.isArray(value?.nextCommands) ? value.nextCommands : [];
+    const lines = ["Reveries init: prepared."];
+    if (changed.length > 0) lines.push(`  Updated: ${changed.join(", ")}`);
+    for (const command of next) lines.push(`  Recommended fetch: ${String(command)}`);
+    return `${lines.join("\n")}\n`;
+  }
   if (command === "doctor") {
     const lines = [`Reveries doctor: ${stringField(value ?? {}, "state")}.`];
     const retention = asRecord(value?.retention);
@@ -678,11 +688,20 @@ function humanOutput(
     return `${lines.join("\n")}\n`;
   }
   if (command === "link suggest") {
-    const suggestions = Array.isArray(value) ? value : [];
+    const suggestions = Array.isArray(value)
+      ? value
+      : Array.isArray(asRecord(value)?.suggestions)
+        ? (asRecord(value)?.suggestions as unknown[])
+        : [];
     if (suggestions.length === 0) return "No similarity candidates were found.\n";
-    if (context.remote !== undefined) return `${SUGGESTION_NOTICE}\n`;
-    return "Similarity candidates are not evidence. Recording an edge establishes one.\n"
-      + `${suggestions.map((entry) => `  ${asRecord(entry)?.path ?? ""}`).join("\n")}\n`;
+    const lines = suggestions.map((entry) => {
+      const item = asRecord(entry) ?? {};
+      const from = asRecord(item.from) ?? {};
+      const to = asRecord(item.to) ?? {};
+      return `  ${stringField(from, "path", "?")} -> ${stringField(to, "path", "?")} `
+        + `(${stringField(item, "kind", "derive")}, score ${String(item.score ?? "?")})`;
+    });
+    return `${SUGGESTION_NOTICE}\n${lines.join("\n")}\n`;
   }
   if (command === "search") {
     const hits = Array.isArray(result) ? result : [];
@@ -714,6 +733,12 @@ function humanOutput(
   }
   if (command === "sync") {
     return `${context.remote ?? "remote"}: ${stringField(value ?? {}, "state")}\n`;
+  }
+  if (command === "migrate") {
+    return `Migration: ${stringField(value ?? {}, "convertedReveries")} reverie(s) and `
+      + `${stringField(value ?? {}, "convertedLineages")} lineage edge(s) converted; `
+      + `${stringField(value ?? {}, "unconverted")} legacy record(s) stay historical; `
+      + `${stringField(value ?? {}, "lean")} already lean.\n`;
   }
   if (command === "push") {
     return value?.ok === true
@@ -814,7 +839,7 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
     if (command === "init") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);
       if (parsed.positionals.length > 0) throw new UsageError(`init takes no arguments`);
-      const result = await initializeRepository(io.cwd, io.helper === undefined ? {} : { helper: io.helper });
+      const result = await initializeRepository(io.cwd);
       emit(io, json, command, result);
       return 0;
     }
@@ -886,7 +911,14 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
           staged: parsed.flags.has("--staged"),
           ...(parsed.positionals[0] === undefined ? {} : { revision: parsed.positionals[0] }),
         });
-        emit(io, json, "link suggest", result, [], {});
+        const enriched = {
+          ...result,
+          suggestions: result.suggestions.map((suggestion) => ({
+            ...suggestion,
+            record: suggestionCommand(suggestion, result.commit ?? "HEAD"),
+          })),
+        };
+        emit(io, json, "link suggest", enriched, [], {});
         return 0;
       }
       if (command === "lineage" && action !== "suggest") {
@@ -993,6 +1025,13 @@ export async function runCli(argv: readonly string[], io: CliIo = defaultIo()): 
       const result = await reveries.retain();
       emit(io, json, command, result, result.missing.length === 0 ? [] : result.missing);
       return result.missing.length === 0 ? 0 : 1;
+    }
+    if (command === "migrate") {
+      const parsed = parseArguments(argv.slice(1), [], ["--json"]);
+      if (parsed.positionals.length > 0) throw new UsageError("migrate takes no arguments");
+      const result = await reveries.migrate();
+      emit(io, json, command, result);
+      return 0;
     }
     if (command === "doctor") {
       const parsed = parseArguments(argv.slice(1), [], ["--json"]);

@@ -260,6 +260,7 @@ test("push defaults to the sole configured publisher without an upstream", async
     encoding: "utf8",
   })).stdout;
   assert.match(refs, /refs\/notes\/reveries/);
+  assert.match(refs, /refs\/reveries\/retention/);
   assert.match(refs, /refs\/heads\/main/);
 });
 
@@ -361,7 +362,7 @@ test("help snapshot lists only the lean command surface", async () => {
   const commands = [...help.matchAll(/^ {2}(\S+)\s{2,}\S/gm)].map((match) => match[1] ?? "");
   assert.deepEqual(
     [...commands].sort(),
-    ["doctor", "help", "history", "init", "link", "push", "record", "retain", "search", "show", "sync"].sort(),
+    ["doctor", "help", "history", "init", "link", "migrate", "push", "record", "retain", "search", "show", "sync"].sort(),
   );
 
   // Every command the lean core removed must be absent from the index and must

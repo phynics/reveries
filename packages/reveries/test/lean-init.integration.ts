@@ -47,6 +47,9 @@ test("init prepares the notes merge strategy and nothing else", async () => {
 
   assert.equal(result.state, "prepared");
   assert.equal(await git(directory, "config", "notes.reveries.mergeStrategy"), "cat_sort_uniq");
+  // Setup recommends the fetch refspec but never configures a remote itself.
+  assert.match(result.nextCommands.join(" "), /refs\/notes\/reveries/);
+  assert.match(result.nextCommands.join(" "), /refs\/reveries\/retention/);
 });
 
 test("init writes the Reveries block into AGENTS.md and keeps surrounding text", async () => {

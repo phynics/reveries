@@ -39,7 +39,7 @@ jobs:
       - name: Full test suite
         run: npm run test:full
 
-      - name: PRD acceptance (20 criteria)
+      - name: PRD acceptance (25 criteria)
         run: node scripts/direct-git-acceptance.mjs --out "$RUNNER_TEMP/acceptance.json"
 
       - name: Map acceptance criteria and validate Skills

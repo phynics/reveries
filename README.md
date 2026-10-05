@@ -108,9 +108,10 @@ A reader with no Reveries installed can recover every decision this way. See
 
 ## Share and preserve
 
-Publish evidence with an ordinary `git push` of `refs/notes/reveries`, or use
-`reveries push <remote>` for one atomic push of HEAD and the notes ref. Two clones combine
-their notes with `cat_sort_uniq`; `reveries sync --pull` does the fetch and merge for you.
+Publish evidence with an ordinary `git push` of `refs/notes/reveries` and
+`refs/reveries/retention`, or use `reveries push <remote>` for one atomic push of HEAD, the notes
+ref, and the retention ref. Two clones combine their notes with `cat_sort_uniq`;
+`reveries sync --pull` fetches, merges, and refreshes retention for you.
 
 Run `reveries retain` to anchor annotated subjects under `refs/reveries/retention`, so a
 pruning `git gc` cannot remove evidence for content no longer reachable from a branch. Run
@@ -126,10 +127,11 @@ decision or an unbuilt retention ref.
 | `record` | Create or supersede a decision on a blob, tree, or region. |
 | `link` | Record or suggest explicit lineage between subjects. |
 | `retain` | Rebuild `refs/reveries/retention` from the configured policy. |
+| `migrate` | Convert legacy records into lean `reverie` or `lineage` evidence. |
 | `search` | Search current or historical evidence. |
 | `history` | Trace a path or reverie through history. |
-| `sync` | Inspect or pull a publishing remote's notes. |
-| `push` | Atomically push HEAD and the notes ref. |
+| `sync` | Inspect a remote's notes, or fetch, merge, and refresh retention. |
+| `push` | Refresh retention, then atomically push HEAD, notes, and retention. |
 | `doctor` | Report integrity of the notes and retention refs. |
 
 ## Documentation
