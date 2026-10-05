@@ -126,9 +126,6 @@ async function initializeUnlocked(repository: GitRepository): Promise<Initializa
     { allowExitCodes: [0, 1] },
   );
   if (previousMerge.stdout.trim() !== "cat_sort_uniq") {
-    if (previousMerge.exitCode === 0) {
-      await repository.run(["config", "reveries.previousMergeStrategy", previousMerge.stdout.trim()]);
-    }
     await repository.run(["config", "notes.reveries.mergeStrategy", "cat_sort_uniq"]);
   }
   return {

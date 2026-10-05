@@ -69,6 +69,20 @@ test("init installs no hooks, no publishing configuration, and no trust store", 
   assert.deepEqual(await configValues(directory, "reveries.publishingRemote"), []);
   assert.deepEqual(await configValues(directory, "reveries.directiveEmail"), []);
   assert.deepEqual(await configValues(directory, "reveries.helperCommand"), []);
+  // No key from the removed helper, hook, adoption, or managed-strategy
+  // machinery is created.
+  for (const key of [
+    "reveries.helperArg",
+    "reveries.helperVerification",
+    "reveries.helperFingerprint",
+    "reveries.managedMergeStrategy",
+    "reveries.previousMergeStrategy",
+    "reveries.managed-origin.fetch",
+    "reveries.hook-pre-push.fingerprint",
+    "reveries.hook-post-commit.fingerprint",
+  ]) {
+    assert.deepEqual(await configValues(directory, key), [], `init created stale config ${key}`);
+  }
   const hooks = await execFileAsync("sh", ["-c", "ls .git/hooks/pre-push .git/hooks/post-commit 2>/dev/null || true"], { cwd: directory, encoding: "utf8" });
   assert.equal(hooks.stdout.trim(), "");
 });
